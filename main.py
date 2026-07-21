@@ -6,28 +6,30 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 # ============================================================================
-# 1. CONFIGURAR PYTHONPATH
+# 1. CONFIGURAR PYTHONPATH - CRÍTICO PARA DOCKER
 # ============================================================================
 
 BACKEND_DIR = Path(__file__).parent.absolute()
 
-# Limpiar paths previos
-paths_to_remove = [str(BACKEND_DIR), str(BACKEND_DIR / "AGENTE BI PROD")]
-for p in paths_to_remove:
-    while p in sys.path:
+# Limpiar cualquier instancia previa
+for p in list(sys.path):
+    if p in [str(BACKEND_DIR), str(BACKEND_DIR / "AGENTE BI PROD")]:
         sys.path.remove(p)
 
-# AGENTE BI PROD primero (tiene core/orchestrator.py, agents/, etc.)
+# AGENTE BI PROD primero: contiene core/, agents/, etc.
 AGENTE_BI_PATH = BACKEND_DIR / "AGENTE BI PROD"
 if AGENTE_BI_PATH.exists():
     sys.path.insert(0, str(AGENTE_BI_PATH))
+    print(f"✅ sys.path[0] = {sys.path[0]}")
+else:
+    print(f"❌ No existe AGENTE BI PROD en: {AGENTE_BI_PATH}")
 
-# backend después (tiene routes/, utils/, auth/, etc.)
+# Backend después: routes/, utils/, auth/
 sys.path.insert(1, str(BACKEND_DIR))
-
+print(f"✅ sys.path[1] = {sys.path[1]}")
 
 # ============================================================================
-# 2. CARGAR .ENV ANTES DE CUALQUIER OTRO IMPORT
+# 2. CARGAR .ENV
 # ============================================================================
 
 from dotenv import load_dotenv
@@ -36,11 +38,13 @@ env_file = BACKEND_DIR / ".env"
 if env_file.exists():
     load_dotenv(str(env_file), override=True)
 
-# Setear OPENAI_API_KEY global para todo el agente BI
+# OpenAI API key global para todo el agente BI
 os.environ["OPENAI_API_KEY"] = os.getenv("DEMO_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 
+# Desactivar LangSmith
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
 
-# Verificar variables críticas del MVP
+# Variables críticas del MVP
 required_vars = [
     "ENCRYPTION_KEY",
     "NEXO_SUPABASE_URL",
@@ -65,15 +69,12 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 # ============================================================================
-# 4. IMPORTS FASTAPI Y ROUTERS
+# 4. FASTAPI APP
 # ============================================================================
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
-# ... resto del main.py sin cambios
-
 
 app = FastAPI(
     title="Nexo AI - API",
@@ -94,8 +95,8 @@ ALLOWED_ORIGINS = [
 ]
 
 if os.getenv("ALLOWED_ORIGINS"):
-    extra_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS").split(",") if o.strip()]
-    ALLOWED_ORIGINS.extend(extra_origins)
+    extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS").split(",") if o.strip()]
+    ALLOWED_ORIGINS.extend(extra)
 
 ALLOWED_ORIGINS = list(set(ALLOWED_ORIGINS))
 
@@ -107,13 +108,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Access-Control-Allow-Origin"],
 )
-
-logger.info(f"FRONTEND_URL: {FRONTEND_URL}")
-logger.info(f"ALLOWED_ORIGINS: {ALLOWED_ORIGINS}")
-
-# ============================================================================
-# 4. MIDDLEWARE
-# ============================================================================
 
 @app.middleware("http")
 async def log_requests(request, call_next):
@@ -136,7 +130,7 @@ app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
 app.mount("/visualizations", StaticFiles(directory=str(VIZ_DIR)), name="visualizations")
 
 # ============================================================================
-# 6. ROUTERS - con protección para identificar fallos
+# 6. ROUTERS
 # ============================================================================
 
 def safe_include_router(import_path: str, prefix: str = "", tags: list = None):
@@ -150,9 +144,7 @@ def safe_include_router(import_path: str, prefix: str = "", tags: list = None):
         logger.error(f"❌ Error cargando router {import_path}: {e}")
         traceback.print_exc()
 
-safe_include_router("auth.router.router")
-safe_include_router("routes.chat_routes.router")
-
+# Onboarding MVP (solo estos son críticos para la demo)
 safe_include_router("routes.onboarding.demo.router", "/onboarding/demo", ["onboarding"])
 safe_include_router("routes.onboarding.sessions.router", "/onboarding/sessions", ["onboarding"])
 safe_include_router("routes.onboarding.credentials.router", "/onboarding/sessions", ["onboarding"])
@@ -161,6 +153,10 @@ safe_include_router("routes.onboarding.agents_md.router", "/onboarding/sessions"
 safe_include_router("routes.onboarding.indexer.router", "/onboarding/sessions", ["onboarding"])
 safe_include_router("routes.onboarding.feedback.router", "/onboarding/sessions", ["onboarding"])
 safe_include_router("routes.onboarding.chat.router", "/onboarding/sessions", ["onboarding"])
+
+# Legacy auth/chat deshabilitados temporalmente para MVP
+# safe_include_router("auth.router.router")
+# safe_include_router("routes.chat_routes.router")
 
 # ============================================================================
 # 7. HEALTH
@@ -183,14 +179,9 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 # ============================================================================
-# 9. ENTRY POINT DIRECTO
+# 9. ENTRY POINT
 # ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        app,  # <-- pasamos el objeto app directamente
-        host="0.0.0.0",
-        port=int(os.getenv("NEXO_API_PORT", "8000")),
-        log_level="info"
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
