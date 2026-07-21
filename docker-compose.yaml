@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: nexo-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - ./AGENTE BI PROD/chroma_db:/data/chroma_db:ro
+    env_file:
+      - .env
+    environment:
+      - CHROMA_DIR=/data/chroma_db
+      - AGENTS_DIR=/data/agents
+      - FILES_DIR=/data/files
+      - VIZ_DIR=/data/visualizations
+      - LANGCHAIN_TRACING_V2=false
+    restart: unless-stopped

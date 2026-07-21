@@ -1,0 +1,21 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.git/
+.gitignore
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+Thumbs.db
+node_modules/
+files/*
+!files/.gitkeep
+visualizations/*
+!visualizations/.gitkeep
+AGENTE BI PROD/chroma_db/

@@ -1,0 +1,83 @@
+# ============================================================================
+# NEXO AI - REQUIREMENTS.TXT OPTIMIZADO
+# Versión: 4.0.0
+# ============================================================================
+
+# ============================================================================
+# CORE - FastAPI y servidor
+# ============================================================================
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# ============================================================================
+# OPENAI & LANGCHAIN - Agente SQL
+# ============================================================================
+openai==1.12.0
+langchain==0.1.6
+langchain-openai==0.0.5
+langchain-community==0.0.20
+
+# ============================================================================
+# BASE DE DATOS - PostgreSQL y Supabase
+supabase==1.0.1
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.25
+
+# ============================================================================
+# EXTRACTOR DE FACTURAS - Procesamiento de PDFs
+# ============================================================================
+pdfplumber==0.11.0
+
+# OCR (Opcional - solo si necesitas procesar PDFs escaneados)
+# pytesseract==0.3.10
+# pdf2image==1.17.0
+# Pillow==10.2.0
+
+# ============================================================================
+# EMAIL - Automatización de reportes
+# ============================================================================
+sendgrid==6.11.0
+
+# ============================================================================
+# VISUALIZACIONES - Gráficos y reportes
+# ============================================================================
+matplotlib==3.8.2
+seaborn==0.13.1
+
+# ============================================================================
+# REPORTES PDF - Generación de documentos
+# ============================================================================
+reportlab==4.0.9
+
+# ============================================================================
+# UTILIDADES
+# ============================================================================
+python-dotenv==1.0.0
+requests==2.31.0
+aiofiles==23.2.1
+
+# ============================================================================
+# NOTAS DE INSTALACIÃ"N
+# ============================================================================
+# 
+# InstalaciÃ³n mÃ­nima (solo para probar):
+# pip install fastapi uvicorn python-multipart openai pdfplumber python-dotenv
+#
+# InstalaciÃ³n completa:
+# pip install -r requirements.txt
+#
+# Si tienes errores con psycopg2:
+# pip install psycopg2-binary
+#
+# Si necesitas OCR para PDFs escaneados, descomenta:
+# pytesseract, pdf2image, Pillow
+# Y luego instala Tesseract OCR desde:
+# https://github.com/UB-Mannheim/tesseract/wiki
+# ============================================================================
+
+python-jose[cryptography]
+psycopg2-binary
+python-dotenv
