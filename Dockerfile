@@ -15,11 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-
-# Crear directorio /data y copiar chroma_db
-RUN mkdir -p /data
-RUN cp -r "AGENTE BI PROD/chroma_db" /data/chroma_db || echo "chroma_db no encontrado, se creará en runtime"
-# Variables por defecto para Railway
 ENV CHROMA_DIR=/data/chroma_db
 ENV AGENTS_DIR=/data/agents
 ENV FILES_DIR=/data/files
@@ -27,4 +22,5 @@ ENV VIZ_DIR=/data/visualizations
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Usar el puerto que Railway asigne, fallback a 8000 localmente
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
