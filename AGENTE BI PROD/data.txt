@@ -1,0 +1,118 @@
+# Descripción de Vistas Semánticas (schema: semantic)
+
+## sales_review_day
+
+**Propósito**: Resumen diario de ventas para el día actual y anterior. Incluye ticket promedio por sede.
+**Granularidad**: Una fila por fecha y sede.
+**Métricas**: ventas_totales, transacciones, ticket_promedio.
+**Dimensiones**: fecha, sede, local.
+**Palabras clave**: ventas hoy, ventas ayer, ticket promedio hoy, ticket promedio ayer, sede, local, diario, resumen día.
+**Notas**: 
+- Usar esta vista cuando la pregunta mencione "hoy", "ayer", "ticket promedio" o "resumen del día".
+- La columna `sede` o `local` contiene el nombre exacto de la sucursal. Usar el valor exacto que aparece en la base de datos.
+
+## sales_review_locales_latest
+
+**Propósito**: Ventas del día actual desglosadas por sucursal/local. Compara rendimiento entre sedes en tiempo real.
+**Granularidad**: Una fila por sede/local para el día actual (snapshot latest).
+**Métricas**: ventas_totales, numero_transacciones, ticket_promedio.
+**Dimensiones**: sede, local, nombre_sucursal.
+**Palabras clave**: ventas por local hoy, sucursales, comparativo hoy, sede, local, ranking locales, últimas ventas.
+**Notas**: 
+- Solo contiene el día en curso. No usar para histórico.
+- Filtrar sede/local con el nombre exacto de la columna correspondiente.
+
+## sales_review_day_history
+
+**Propósito**: Histórico completo de ventas diarias consolidadas para análisis de tendencias y estacionalidad.
+**Granularidad**: Una fila por fecha.
+**Métricas**: ventas_totales, transacciones, ticket_promedio.
+**Dimensiones**: fecha.
+**Palabras clave**: histórico ventas, tendencias diarias, ventas por día, evolución diaria, series temporales ventas.
+**Notas**: 
+- Rango histórico completo. Usar filtros de fecha (`BETWEEN`, `>=`, `<=`).
+- No desagrega por sede; usar `sales_review_locales` para desagregación.
+
+## sales_review_locales
+
+**Propósito**: Histórico detallado de ventas diarias por sucursal a lo largo del tiempo.
+**Granularidad**: Una fila por fecha y sede.
+**Métricas**: ventas_totales, transacciones, ticket_promedio.
+**Dimensiones**: fecha, sede, local.
+**Palabras clave**: histórico por sede, ventas diarias local, tendencias por sucursal, evolución local.
+**Notas**: 
+- Ideal para comparar evolución entre sedes.
+- El nombre de sede/local debe coincidir exactamente con el valor almacenado.
+
+## ventas_semana_actual_vs_anterior
+
+**Propósito**: Comparativa de ventas entre la semana actual (en curso) y la semana anterior.
+**Granularidad**: Una fila por período de comparación (semana).
+**Métricas**: ventas_semana_actual, ventas_semana_anterior, variacion_porcentual, transacciones_actual, transacciones_anterior.
+**Dimensiones**: semana, sede (si aplica).
+**Palabras clave**: semana actual, semana pasada, comparativo semanal, variación semana, vs semana anterior.
+**Notas**: 
+- La vista ya calcula la variación porcentual entre periodos.
+- Usar cuando el usuario pida "vs semana pasada", "comparativo semanal".
+
+## sales_producto_daily
+
+**Propósito**: Ventas diarias desglosadas por producto y categoría.
+**Granularidad**: Una fila por fecha, producto y categoría.
+**Métricas**: unidades_vendidas, ventas_totales, mix_productos.
+**Dimensiones**: fecha, producto, categoria, sku.
+**Palabras clave**: productos más vendidos, mix de productos, ventas por producto, categoría, canasta, top productos.
+**Notas**: 
+- Usar para análisis de inventario, planificación de productos y mix de categorías.
+
+## sales_producto_daily_mv
+
+**Propósito**: Versión materializada de ventas por producto con detalle diario completo por sucursal.
+**Granularidad**: Una fila por fecha, producto y sucursal.
+**Métricas**: unidades_vendidas, ventas_totales.
+**Dimensiones**: fecha, producto, sucursal, local.
+**Palabras clave**: materializada, producto sucursal, detalle producto diario, mv producto.
+**Notas**: 
+- Datos completos por producto y sucursal. Útil para reportes pesados de producto.
+- Prefijar tabla como semantic.ventas_producto_diario_mv.
+
+## mart_operacion_hora
+
+**Propósito**: Volumen de transacciones y ventas distribuidas por hora del día en cada sucursal.
+**Granularidad**: Una fila por fecha, hora y sucursal.
+**Métricas**: transacciones, ventas_totales, ticket_promedio.
+**Dimensiones**: fecha, hora, franja_horaria, sede, local.
+**Palabras clave**: hora pico, transacciones por hora, staffing, demanda horaria, franjas, horario.
+**Notas**: 
+- La columna hora puede ser entera (0-23) o tipo time. Verificar tipo en esquema real antes de filtrar.
+
+## categorias_diario
+
+**Propósito**: Participación y performance de ventas por categorías de productos.
+**Granularidad**: Una fila por fecha y categoría.
+**Métricas**: ventas_categoria, participacion_porcentual, unidades_categoria.
+**Dimensiones**: fecha, categoria, tipo_producto.
+**Palabras clave**: categorías, mix categoría, participación, merchandising, tipo producto, rentabilidad categoría.
+**Notas**: 
+- Usar para evaluar rentabilidad por línea de producto.
+
+## cortesias_detalle
+
+**Propósito**: Detalle de productos entregados como cortesías o regalos.
+**Granularidad**: Una fila por cortesía/producto entregado.
+**Métricas**: costo_cortesia, cantidad, impacto_economico.
+**Dimensiones**: fecha, producto, cliente, motivo, sede.
+**Palabras clave**: cortesías, regalos, promociones, costo promoción, detalle cortesía, merma.
+**Notas**: 
+- Incluye impacto económico y costo asociado. Filtrar por fecha y/o sede.
+
+## kpi_fidelizacion_detalle
+
+**Propósito**: Registro de productos canjeados en el programa de fidelización.
+**Granularidad**: Una fila por canje/transacción de fidelización.
+**Métricas**: puntos_canjeados, producto_canjeado, valor_equivalente.
+**Dimensiones**: fecha, cliente, producto_canjeado, programa, sede.
+**Palabras clave**: fidelización, lealtad, canjes, puntos, programa lealtad, retención, kpi fidelización.
+**Notas**: 
+- Medir efectividad del programa y productos populares en canjes.
+- Usar cuando el usuario pregunte por "puntos", "canjes" o "programa de lealtad".
