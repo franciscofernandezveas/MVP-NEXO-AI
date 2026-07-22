@@ -15,7 +15,8 @@ from agents.viz_agent.graph_viz_agent import VIZ_SUBGRAPH
 from agents.viz_agent.render_node import render_plotly_node
 from agents.viz_approval.graph_viz_approval import viz_approval_node
 from agents.research.research_node import make_research_node
-from agents.forecasting_agent.graph_demand_forecaster import run_forecast
+# NOTE: run_forecast se importa lazy dentro de forecaster_node para no cargar
+# el módulo de forecasting (y sus dependencias pesadas) en cada chat.
 from core.llm import LLM
 from core.contracts import SQLContract
 
@@ -168,6 +169,9 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 @traceable(name="Orchestrator: Execute Demand Forecast")
 def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    # Lazy import: solo carga forecasting cuando realmente se usa
+    from agents.forecasting_agent.graph_demand_forecaster import run_forecast
+
     logger.info(f"[Forecaster] Estado recibido. forecast_request={state.get('forecast_request')}")
     logger.info(f"[Forecaster] plan question_type={getattr(state.get('plan'), 'question_type', None)}")
 

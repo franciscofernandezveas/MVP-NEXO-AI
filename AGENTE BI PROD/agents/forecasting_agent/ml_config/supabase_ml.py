@@ -12,23 +12,30 @@ from supabase import create_client, Client
 
 
 # ------------------------------------------------------------------
-# Cargar .env desde la raíz del proyecto
+# Cargar .env desde la raíz del proyecto (opcional, para desarrollo local)
 # ------------------------------------------------------------------
 _ENV_PATH = Path(__file__).resolve().parent.parent.parent.parent / ".env"
-load_dotenv(dotenv_path=_ENV_PATH)
+if _ENV_PATH.exists():
+    load_dotenv(dotenv_path=_ENV_PATH)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ------------------------------------------------------------------
+# Variables de entorno compatibles
+# ------------------------------------------------------------------
+# El MVP usa NEXO_* y DEMO_DATABASE_URL. Mantenemos fallback a los nombres antiguos
+# para compatibilidad con scripts locales.
+SUPABASE_URL = os.environ.get("NEXO_SUPABASE_URL") or os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("NEXO_SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_KEY")
+DATABASE_URL = os.environ.get("DEMO_DATABASE_URL") or os.environ.get("DATABASE_URL")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise EnvironmentError(
-        "Debes configurar SUPABASE_URL y SUPABASE_SERVICE_KEY en el archivo .env"
+        "Debes configurar NEXO_SUPABASE_URL y NEXO_SUPABASE_SERVICE_KEY "
+        "(o SUPABASE_URL y SUPABASE_SERVICE_KEY para desarrollo local)."
     )
 
 if not DATABASE_URL:
     raise EnvironmentError(
-        "Debes configurar DATABASE_URL en el archivo .env"
+        "Debes configurar DEMO_DATABASE_URL (o DATABASE_URL para desarrollo local)."
     )
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
