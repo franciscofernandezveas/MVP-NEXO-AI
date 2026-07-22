@@ -359,7 +359,7 @@ REGLAS ADICIONALES:
 """)
 
     human = HumanMessage(content=f"Pregunta del usuario: {question}")
-    planner_llm = LLM.with_structured_output(PlannerContract, method="json_schema")
+    planner_llm = LLM.with_structured_output(PlannerContract, method="function_calling")
     plan = planner_llm.invoke([system, human])
 
     # ============================================================

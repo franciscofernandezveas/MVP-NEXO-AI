@@ -276,7 +276,11 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-researcher_node = make_research_node(SQL_SUBGRAPH, LLM)
+def researcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Wrapper lazy para el nodo de research."""
+    from agents.research.research_node import make_research_node
+    node = make_research_node(SQL_SUBGRAPH, LLM)
+    return node(state)
 
 
 builder = StateGraph(OrchestratorState)

@@ -59,7 +59,7 @@ def make_research_node(
     - sql_subgraph: tu SQL_SUBGRAPH compilado.
     - llm: modelo LLM (default core.llm.LLM).
     """
-    structured_llm = llm.with_structured_output(ResearchPlan, method="json_schema")
+    structured_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
 
     def research_node(state: Dict[str, Any]) -> Dict[str, Any]:
         question = state["question"]
