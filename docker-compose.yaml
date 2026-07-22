@@ -9,6 +9,7 @@ services:
     volumes:
       - ./data:/data
       - ./AGENTE BI PROD/chroma_db:/data/chroma_db:ro
+
     env_file:
       - .env
     environment:
