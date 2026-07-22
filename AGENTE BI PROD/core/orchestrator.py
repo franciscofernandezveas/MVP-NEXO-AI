@@ -2,7 +2,7 @@ import logging
 from typing import Optional, Any, List, Dict, Annotated
 from typing_extensions import TypedDict
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, AIMessage
@@ -15,15 +15,13 @@ from agents.viz_agent.graph_viz_agent import VIZ_SUBGRAPH
 from agents.viz_agent.render_node import render_plotly_node
 from agents.viz_approval.graph_viz_approval import viz_approval_node
 from agents.research.research_node import make_research_node
-from agents.forecasting_agent.graph_demand_forecaster import run_forecast  # <-- NUEVO
+from agents.forecasting_agent.graph_demand_forecaster import run_forecast
 from core.llm import LLM
 from core.contracts import SQLContract
 
-# NUEVOS IMPORTS: harness de negocio y schema filtrado por shortlist
 from core.harness import build_harness_context, build_harness_context_cached, _normalize_question
 from core.database import get_semantic_schema_for_views
 
-# Import necesario para @traceable
 from langsmith import traceable
 
 logger = logging.getLogger(__name__)
@@ -33,22 +31,20 @@ class OrchestratorState(TypedDict):
     question: str
     messages: Annotated[List[BaseMessage], add_messages]
     plan: Optional[Any]
-    sql_results: List[Any]  # Lista de SQLContract
-    viz_result: Optional[Any]  # VizSpecContract
-    viz_approved: Optional[bool]  # None = no preguntado
+    sql_results: List[Any]
+    viz_result: Optional[Any]
+    viz_approved: Optional[bool]
     viz_rendered: bool
     final_answer: Optional[str]
     iteration_count: int
     last_agent: Optional[str]
-    # NUEVOS CAMPOS: contexto de harness inyectado antes del planner
+    next: Optional[str]  # NUEVO: usado por supervisor para routing condicional
     harness_context: Optional[Dict[str, Any]]
     semantic_context: str
     allowed_views: List[str]
     preferred_view: Optional[str]
     schema_info: str
     research_findings: Optional[str]
-
-    # NUEVOS CAMPOS: forecasting
     forecast_request: Optional[Dict[str, Any]]
     forecast_results: Optional[List[Dict[str, Any]]]
     forecast_error: Optional[str]
@@ -56,10 +52,6 @@ class OrchestratorState(TypedDict):
 
 @traceable(name="Orchestrator: Build Harness Context")
 def build_harness_context_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Construye el BI Context Pack antes de que el supervisor/planner actúen.
-    """
-    # Usa cache si la pregunta es idéntica (normalizada)
     harness = build_harness_context_cached(_normalize_question(state["question"]))
 
     return {
@@ -80,28 +72,21 @@ def build_harness_context_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 @traceable(name="Orchestrator: Execute SQL Tasks")
 def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ejecuta TODAS las tareas del plan secuencialmente.
-    Inyecta el harness (allowed_views, preferred_view, schema filtrado) en cada ejecución.
-    """
     if not state.get("plan"):
         raise ValueError("SQL Agent llamado sin plan previo.")
 
     tasks = state["plan"].tasks
     results: List[SQLContract] = []
 
-    # Contexto semántico global del harness
     harness_ctx = state.get("harness_context", {})
     global_semantic_context = state.get("semantic_context", harness_ctx.get("semantic_context", ""))
 
     for task in tasks:
         payload = task.dict() if hasattr(task, "dict") else dict(task)
 
-        # Vistas candidatas y preferida de la tarea (el Planner ya decidió)
         candidate_views = getattr(task, "candidate_views", None) or state.get("allowed_views", [])
         preferred = getattr(task, "preferred_view", None) or state.get("preferred_view")
 
-        # Schema técnico filtrado: SOLO las columnas de las vistas candidatas de esta tarea
         try:
             schema_info = get_semantic_schema_for_views(candidate_views)
         except Exception:
@@ -132,7 +117,6 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         contract.task_id = getattr(task, "task_id", "1")
-        # Trazabilidad completa
         contract.allowed_views = candidate_views
         contract.preferred_view = preferred
         contract.semantic_context_used = (
@@ -161,7 +145,6 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# Nodo Viz Agent corregido - devuelve el contrato correctamente
 def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
     viz_input = {
         "question": state["question"],
@@ -183,18 +166,13 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# NUEVO: Nodo Forecaster
 @traceable(name="Orchestrator: Execute Demand Forecast")
 def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ejecuta el agente de predicción de demanda.
-    """
     logger.info(f"[Forecaster] Estado recibido. forecast_request={state.get('forecast_request')}")
     logger.info(f"[Forecaster] plan question_type={getattr(state.get('plan'), 'question_type', None)}")
 
     request = state.get("forecast_request")
 
-    # Fallback 1: extraer del plan.filters
     if not request:
         plan = state.get("plan")
         if plan and getattr(plan, "question_type", None) == "demand_forecast":
@@ -217,7 +195,6 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     "fecha_inicio": None,
                 }
 
-    # Fallback 2: extraer directamente de la pregunta
     if not request:
         question = state["question"].lower()
         sedes = ["plaza bolsillo", "merced", "tajamar", "persa victor manuel"]
@@ -266,7 +243,7 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
             producto=request["producto"],
             sede=request["sede"],
             n_dias=int(request.get("n_dias", 7)),
-            fecha_inicio=request.get("fecha_inicio")  # ← corregido
+            fecha_inicio=request.get("fecha_inicio")
         )
 
         forecasts = result.get("forecasts", []) if isinstance(result, dict) else []
@@ -295,16 +272,12 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
-# NUEVO: Nodo Researcher instanciado con el SQL_SUBGRAPH existente
 researcher_node = make_research_node(SQL_SUBGRAPH, LLM)
 
 
-# Configuración del grafo principal
 builder = StateGraph(OrchestratorState)
 
-# NUEVO: nodo de harness como primer paso del flujo
 builder.add_node("build_harness", build_harness_context_node)
-
 builder.add_node("supervisor", supervisor_node)
 builder.add_node("planner", planner_node)
 builder.add_node("sql_agent", sql_agent_wrapper)
@@ -313,13 +286,28 @@ builder.add_node("viz_agent", viz_agent_node)
 builder.add_node("render_plotly", render_plotly_node)
 builder.add_node("viz_approval", viz_approval_node)
 builder.add_node("researcher", researcher_node)
-
-# NUEVO: nodo forecaster
 builder.add_node("forecaster", forecaster_node)
 
-# FLUJO ENTRADA: primero construye el harness, luego delega al supervisor
-builder.add_edge(START, "build_harness")
+# FLUJO ENTRADA
+builder.add_edge("__start__", "build_harness")
 builder.add_edge("build_harness", "supervisor")
+
+# Supervisor decide el siguiente nodo según el campo "next" del estado
+builder.add_conditional_edges(
+    "supervisor",
+    lambda state: state.get("next", "__end__"),
+    {
+        "planner": "planner",
+        "sql_agent": "sql_agent",
+        "analyst": "analyst",
+        "viz_agent": "viz_agent",
+        "render_plotly": "render_plotly",
+        "viz_approval": "viz_approval",
+        "researcher": "researcher",
+        "forecaster": "forecaster",
+        "__end__": "__end__",
+    }
+)
 
 # Flujos de retorno al supervisor
 builder.add_edge("planner", "supervisor")
@@ -329,8 +317,6 @@ builder.add_edge("viz_agent", "supervisor")
 builder.add_edge("render_plotly", "supervisor")
 builder.add_edge("viz_approval", "supervisor")
 builder.add_edge("researcher", "supervisor")
-
-# NUEVO: flujo de forecasting retorna al supervisor
 builder.add_edge("forecaster", "supervisor")
 
 memory = MemorySaver()

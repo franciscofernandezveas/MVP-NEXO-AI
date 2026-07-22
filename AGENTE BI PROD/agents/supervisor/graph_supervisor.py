@@ -1,7 +1,6 @@
 import json
 from typing import Any, Dict, Literal
 from langchain_core.messages import AIMessage
-from langgraph.types import Command
 from core.llm import LLM
 from core.contracts import SupervisorDecision
 from core.config import logger
@@ -12,28 +11,26 @@ MAX_ITERATIONS = 15
 
 
 @traceable(name="Supervisor: Route Next Agent")
-def supervisor_node(state: Dict[str, Any]) -> Command[
-    Literal[
-        "planner", "sql_agent", "analyst", "viz_agent",
-        "render_plotly", "viz_approval", "researcher",
-        "forecaster",
-        "__end__"
-    ]
-]:
+def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     current_iter = state.get("iteration_count", 0)
     next_iter = current_iter + 1
+
+    def make_update(next_node: str, **extra) -> Dict[str, Any]:
+        base = {
+            "next": next_node,
+            "last_agent": "supervisor",
+            "iteration_count": next_iter,
+        }
+        base.update(extra)
+        return base
 
     # 1. Límite de iteraciones
     if current_iter >= MAX_ITERATIONS:
         logger.warning(f"[Supervisor] Límite de iteraciones ({MAX_ITERATIONS}) alcanzado.")
-        return Command(
-            goto="__end__",
-            update={
-                "final_answer": state.get("final_answer") or "No pude completar la consulta tras varios intentos.",
-                "last_agent": "supervisor",
-                "iteration_count": next_iter,
-                "messages": [AIMessage(content=f"[Supervisor] Iteración límite ({MAX_ITERATIONS}) alcanzado. Cerrando.")]
-            }
+        return make_update(
+            "__end__",
+            final_answer=state.get("final_answer") or "No pude completar la consulta tras varios intentos.",
+            messages=[AIMessage(content=f"[Supervisor] Iteración límite ({MAX_ITERATIONS}) alcanzado. Cerrando.")]
         )
 
     # Lectura de estado
@@ -56,26 +53,18 @@ def supervisor_node(state: Dict[str, Any]) -> Command[
 
     if viz_result and not viz_is_valid and not viz_rendered:
         logger.info("[Supervisor] Viz result inválido (sin chart_type o con error). Saltando renderización.")
-        return Command(
-            goto="analyst",
-            update={
-                "viz_rendered": True,
-                "last_agent": "supervisor",
-                "iteration_count": next_iter,
-                "messages": [AIMessage(content="[Supervisor] Spec de visualización inválida, se omite render y se continúa.")]
-            }
+        return make_update(
+            "analyst",
+            viz_rendered=True,
+            messages=[AIMessage(content="[Supervisor] Spec de visualización inválida, se omite render y se continúa.")]
         )
 
     if last_agent == "render_plotly" and not viz_is_valid:
         logger.info("[Supervisor] Prevención de loop post-render fallido. Forzando avance.")
-        return Command(
-            goto="analyst",
-            update={
-                "viz_rendered": True,
-                "last_agent": "supervisor",
-                "iteration_count": next_iter,
-                "messages": [AIMessage(content="[Supervisor] Render previo no aplicable, continuando.")]
-            }
+        return make_update(
+            "analyst",
+            viz_rendered=True,
+            messages=[AIMessage(content="[Supervisor] Render previo no aplicable, continuando.")]
         )
 
     # === RUTAS DE FLUJO ===
@@ -83,60 +72,26 @@ def supervisor_node(state: Dict[str, Any]) -> Command[
     # 1. Sin plan → Planner
     if not plan:
         logger.info("[Supervisor] Ruteando a Planner - no hay plan")
-        return Command(
-            goto="planner",
-            update={
-                "last_agent": "supervisor",
-                "iteration_count": next_iter
-            }
-        )
+        return make_update("planner")
 
     # ------------------------------------------------------------------
     # 2. Ruta de predicción de demanda (PRIORIDAD MÁXIMA)
     # ------------------------------------------------------------------
     if plan and getattr(plan, "question_type", None) == "demand_forecast":
-        # Aún no se ejecuta forecast → ir al forecaster
         if not forecast_results and not forecast_error:
             logger.info("[Supervisor] Ruteando a Forecaster - predicción de demanda solicitada")
-            return Command(
-                goto="forecaster",
-                update={
-                    "last_agent": "supervisor",
-                    "iteration_count": next_iter,
-                }
-            )
+            return make_update("forecaster")
 
-        # Forecast ejecutado con error → al analyst para redactar respuesta de error
         if forecast_error and not final_answer:
             logger.info("[Supervisor] Forecast falló, ruteando a Analyst para explicar el error")
-            return Command(
-                goto="analyst",
-                update={
-                    "last_agent": "supervisor",
-                    "iteration_count": next_iter,
-                }
-            )
+            return make_update("analyst")
 
-        # Forecast ejecutado con resultados → al analyst para redactar la respuesta final
         if forecast_results and not final_answer:
             logger.info("[Supervisor] Forecast completado, ruteando a Analyst para redactar respuesta")
-            return Command(
-                goto="analyst",
-                update={
-                    "last_agent": "supervisor",
-                    "iteration_count": next_iter,
-                }
-            )
+            return make_update("analyst")
 
-        # Si ya hay respuesta final → terminar
         logger.info("[Supervisor] Forecast y respuesta final listos, finalizando")
-        return Command(
-            goto="__end__",
-            update={
-                "last_agent": "supervisor",
-                "iteration_count": next_iter,
-            }
-        )
+        return make_update("__end__")
 
     # ------------------------------------------------------------------
     # 3. Ruta de informe profundo
@@ -147,57 +102,27 @@ def supervisor_node(state: Dict[str, Any]) -> Command[
         and state.get("research_findings") is None
     ):
         logger.info("[Supervisor] Ruteando a Researcher - informe profundo solicitado")
-        return Command(
-            goto="researcher",
-            update={
-                "last_agent": "supervisor",
-                "iteration_count": next_iter,
-            }
-        )
+        return make_update("researcher")
 
     # 4. Con plan pero sin resultados SQL → SQL Agent
     if not sql_results:
         logger.info("[Supervisor] Ruteando a SQL Agent - no hay resultados")
-        return Command(
-            goto="sql_agent",
-            update={
-                "last_agent": "supervisor",
-                "iteration_count": next_iter
-            }
-        )
+        return make_update("sql_agent")
 
     # 5. Plan pide visualización y aún no hemos corrido el viz_agent
     if getattr(plan, "visualization_candidate", False) and viz_result is None:
         logger.info("[Supervisor] Ruteando a Viz Agent - visualización solicitada (sin spec previa)")
-        return Command(
-            goto="viz_agent",
-            update={
-                "last_agent": "supervisor",
-                "iteration_count": next_iter
-            }
-        )
+        return make_update("viz_agent")
 
     # 6. Hay spec VÁLIDA y aún no renderizada → Render Plotly
     if viz_is_valid and not viz_rendered:
         logger.info("[Supervisor] Ruteando a Render Plotly")
-        return Command(
-            goto="render_plotly",
-            update={
-                "last_agent": "supervisor",
-                "iteration_count": next_iter
-            }
-        )
+        return make_update("render_plotly")
 
     # 7. Sin respuesta final → Analyst
     if not final_answer:
         logger.info("[Supervisor] Ruteando a Analyst - no hay respuesta final")
-        return Command(
-            goto="analyst",
-            update={
-                "last_agent": "supervisor",
-                "iteration_count": next_iter
-            }
-        )
+        return make_update("analyst")
 
     # 8. Viz ya resuelto y hay datos → Viz Approval (si aplica)
     if viz_is_valid and viz_rendered and viz_approved is None:
@@ -207,20 +132,8 @@ def supervisor_node(state: Dict[str, Any]) -> Command[
         ]
         if suitable_results:
             logger.info("[Supervisor] Ruteando a Viz Approval")
-            return Command(
-                goto="viz_approval",
-                update={
-                    "last_agent": "supervisor",
-                    "iteration_count": next_iter
-                }
-            )
+            return make_update("viz_approval")
 
     # 9. Todo listo → Fin
     logger.info("[Supervisor] Todo completado, finalizando")
-    return Command(
-        goto="__end__",
-        update={
-            "last_agent": "supervisor",
-            "iteration_count": next_iter
-        }
-    )
+    return make_update("__end__")

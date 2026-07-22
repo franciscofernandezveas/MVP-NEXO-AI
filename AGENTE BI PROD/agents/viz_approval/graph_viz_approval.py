@@ -1,11 +1,13 @@
 from typing import Any, Dict
-from langgraph.types import interrupt
 from langchain_core.messages import AIMessage
 
 
 def viz_approval_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Nodo HITL para aprobar visualización cuando no fue solicitada explícitamente
+    Nodo HITL para aprobar visualización cuando no fue solicitada explícitamente.
+    
+    Nota: langgraph 0.1.19 no soporta interrupt(). 
+    Para el MVP, se auto-rechaza la visualización si no fue solicitada explícitamente.
     """
     # Contar resultados aptos para visualización
     suitable_results = [
@@ -21,21 +23,14 @@ def viz_approval_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "messages": [AIMessage(content="[Viz Approval] No hay datos aptos para visualización")]
         }
 
-    # Preguntar al usuario
-    human_response = interrupt({
-        "type": "visualization_approval",
-        "message": f"Se encontraron {len(suitable_results)} conjunto(s) de datos que pueden ser visualizados. ¿Deseas generar un gráfico?",
-        "options": ["sí", "no"]
-    })
-
+    # MVP: auto-rechazar para evitar bloqueo del flujo
+    # En versiones futuras, implementar HITL real con interrupt() de langgraph >= 1.x
     approved = False
-    if isinstance(human_response, dict):
-        approved = human_response.get("action") == "approve"
-    elif isinstance(human_response, str):
-        approved = human_response.lower() in ("approve", "yes", "si", "s", "true", "y", "sí")
+    logger = __import__("logging").getLogger(__name__)
+    logger.info("[Viz Approval] Auto-rechazo en MVP (HITL no disponible en langgraph 0.1.19)")
 
     return {
         "viz_approved": approved,
         "last_agent": "viz_approval",
-        "messages": [AIMessage(content=f"[HITL] Usuario {'APROBÓ' if approved else 'RECHAZÓ'} visualización")]
+        "messages": [AIMessage(content="[Viz Approval] Visualización no aprobada automáticamente en MVP")]
     }
