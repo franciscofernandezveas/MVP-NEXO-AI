@@ -66,25 +66,24 @@ def _node_message(node: str) -> str:
 
 
 async def _publish_chart(session_id: str, base_url: str) -> str | None:
-    backend_dir = Path(__file__).resolve().parent.parent.parent
-    possible_paths = [
-        backend_dir / "AGENTE BI PROD" / "chart.png",
-        backend_dir / "chart.png",
-    ]
+    """Copia el chart generado a un archivo público y devuelve su URL."""
+    backend_dir = Path(os.getenv("BACKEND_DIR", Path(__file__).resolve().parent.parent.parent))
     charts_dir = backend_dir / "files" / "charts"
+    src = charts_dir / "chart.png"
+
     charts_dir.mkdir(parents=True, exist_ok=True)
 
-    for src in possible_paths:
-        if src.exists() and src.stat().st_size > 0:
-            try:
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                safe_id = "".join(c for c in session_id if c.isalnum())[:20]
-                fname = f"chart_{safe_id}_{ts}_{uuid4().hex[:4]}.png"
-                dest = charts_dir / fname
-                shutil.copy2(str(src), str(dest))
-                return f"{base_url}/files/charts/{fname}"
-            except Exception:
-                traceback.print_exc()
+    if src.exists() and src.stat().st_size > 0:
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_id = "".join(c for c in session_id if c.isalnum())[:20]
+            fname = f"chart_{safe_id}_{ts}_{uuid4().hex[:4]}.png"
+            dest = charts_dir / fname
+            shutil.copy2(str(src), str(dest))
+            public_url = os.getenv("BACKEND_PUBLIC_URL", base_url).rstrip('/')
+            return f"{public_url}/files/charts/{fname}"
+        except Exception:
+            traceback.print_exc()
     return None
 
 
@@ -95,7 +94,8 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
     if BI_ORCHESTRATOR is None:
         raise HTTPException(status_code=503, detail="Agente BI no disponible")
 
-    base_url = str(request.base_url).rstrip('/')
+    # ✅ Usar BACKEND_PUBLIC_URL si existe, sino request.base_url
+    base_url = os.getenv("BACKEND_PUBLIC_URL", str(request.base_url)).rstrip('/')
     lock = get_session_lock(session_id)
 
     async def event_generator():

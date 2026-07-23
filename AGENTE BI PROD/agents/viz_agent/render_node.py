@@ -1,7 +1,9 @@
+import os
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
+from pathlib import Path
 from typing import Dict, Any
 from langchain_core.messages import AIMessage
 import logging
@@ -79,19 +81,26 @@ def render_plotly_node(state: Dict[str, Any]) -> Dict[str, Any]:
             showlegend=True if color_column else False
         )
 
+        # ✅ Guardar en ruta conocida: {BACKEND_DIR}/files/charts/
+        backend_dir = Path(os.getenv("BACKEND_DIR", Path(__file__).resolve().parent.parent.parent.parent))
+        charts_dir = backend_dir / "files" / "charts"
+        charts_dir.mkdir(parents=True, exist_ok=True)
+
+        chart_html_path = charts_dir / "chart.html"
+        chart_png_path = charts_dir / "chart.png"
+
         # Guardar como HTML
-        html_str = fig.to_html(include_plotlyjs='cdn')
-        with open("chart.html", "w", encoding="utf-8") as f:
-            f.write(html_str)
+        with open(str(chart_html_path), "w", encoding="utf-8") as f:
+            f.write(fig.to_html(include_plotlyjs='cdn'))
 
         # Guardar como imagen PNG
-        pio.write_image(fig, "chart.png", format="png", width=1000, height=600, scale=2)
+        pio.write_image(fig, str(chart_png_path), format="png", width=1000, height=600, scale=2)
         
-        logger.info("[Render] Gráfico guardado como chart.html y chart.png")
+        logger.info(f"[Render] Gráfico guardado en {charts_dir}")
         return {
             "viz_rendered": True,
             "last_agent": "render_plotly",
-            "messages": [AIMessage(content="[Render] Gráfico guardado como chart.html y chart.png")]
+            "messages": [AIMessage(content=f"[Render] Gráfico guardado en {charts_dir}")]
         }
         
     except Exception as e:
