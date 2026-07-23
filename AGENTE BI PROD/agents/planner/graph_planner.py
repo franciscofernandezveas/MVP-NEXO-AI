@@ -5,7 +5,7 @@ import re
 from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from core.llm import LLM
-from core.contracts import PlannerContract
+from core.contracts import PlannerContract, SQLPayload
 from core.harness import BusinessMemory
 
 logger = logging.getLogger(__name__)
@@ -230,6 +230,32 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     ambiguity_notes = harness.get("ambiguity_notes", [])
     question = state["question"]
 
+    logger.info(f"[Planner] allowed_views={allowed_views}")
+    logger.info(f"[Planner] ambiguity_notes={ambiguity_notes}")
+    logger.info(f"[Planner] preferred_view={harness.get('preferred_view')}")
+
+    if not allowed_views:
+        logger.error("[Planner] ERROR CRÍTICO: allowed_views está vacío. El harness no cargó vistas.")
+        plan = PlannerContract(
+            intent="unknown",
+            goal="",
+            question_type="unknown",
+            metrics=[],
+            dimensions=[],
+            filters="",
+            tasks=[],
+            confidence=0.0,
+            needs_followup=True,
+            followup_reason="No hay vistas de datos disponibles para responder la pregunta. Revisa AGENTS.md y el catálogo semántico."
+        )
+        return {
+            "plan": plan,
+            "last_agent": "planner",
+            "messages": state.get("messages", []) + [
+                AIMessage(content="[Planner] Error: no hay vistas de datos disponibles.")
+            ]
+        }
+
     # ================================================================
     # PRIORIDAD MÁXIMA: Detección de demand forecast
     # ================================================================
@@ -403,6 +429,31 @@ REGLAS ADICIONALES:
                     task.candidate_views = list(task.candidate_views or []) + [fallback]
             else:
                 validation_errors.extend([f"Tarea {task.task_id}: {err}" for err in task_errors])
+
+    # ============================================================
+    # FALLBACK: Si no se generaron tareas, crear una tarea genérica
+    # ============================================================
+    if not plan.tasks and plan.question_type not in ("demand_forecast", "unknown"):
+        logger.warning(f"[Planner] LLM no generó tareas. Creando tarea fallback.")
+        if allowed_views:
+            default_view = allowed_views[0]
+            plan.tasks = [
+                SQLPayload(
+                    task_id="1",
+                    task=f"Responder a la pregunta: {question}",
+                    metrics=[],
+                    dimensions=[],
+                    filters_description="",
+                    execution_strategy="single_view",
+                    candidate_views=list(allowed_views),
+                    preferred_view=default_view
+                )
+            ]
+            plan.needs_followup = False
+            logger.info(f"[Planner] Tarea fallback creada con vista: {default_view}")
+        else:
+            plan.needs_followup = True
+            plan.followup_reason = "No hay vistas disponibles para responder la pregunta."
 
     if validation_errors:
         plan.needs_followup = True

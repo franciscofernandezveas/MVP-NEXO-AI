@@ -5,9 +5,16 @@ from typing import Any, Dict, List
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from core.llm import LLM
-
-# Import necesario para @traceable
 from langsmith import traceable
+
+
+def _get_attr(obj: Any, attr: str, default: Any = None) -> Any:
+    """Lee atributo o clave, soportando objetos Pydantic y dicts."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(attr, default)
+    return getattr(obj, attr, default)
 
 
 def _build_sql_context(results: list, question: str) -> str:
@@ -18,13 +25,13 @@ def _build_sql_context(results: list, question: str) -> str:
     tasks_context = []
     for contract in results:
         task_ctx = f"""
---- TAREA {contract.task_id} ---
-Estrategia: {getattr(contract, 'execution_strategy', 'N/A')}
-Vista usada: {getattr(contract, 'preferred_view', 'N/A')}
-SQL ejecutado: {contract.generated_sql}
-Filas: {contract.row_count}
-Columnas: {contract.columns}
-Datos: {json.dumps(contract.rows, indent=2, ensure_ascii=False, default=str)}
+--- TAREA {_get_attr(contract, 'task_id', '?')} ---
+Estrategia: {_get_attr(contract, 'execution_strategy', 'N/A')}
+Vista usada: {_get_attr(contract, 'preferred_view', 'N/A')}
+SQL ejecutado: {_get_attr(contract, 'generated_sql', '')}
+Filas: {_get_attr(contract, 'row_count', 0)}
+Columnas: {_get_attr(contract, 'columns', [])}
+Datos: {json.dumps(_get_attr(contract, 'rows', []), indent=2, ensure_ascii=False, default=str)}
 """
         tasks_context.append(task_ctx)
 
@@ -131,9 +138,12 @@ Eres un Analista de Negocio Senior de una cadena de cafeterías. Te especializas
     # ------------------------------------------------------------------
     # 2. Detección de errores persistentes en SQL
     # ------------------------------------------------------------------
-    errors = [r for r in results if r.status == "error"]
+    errors = [r for r in results if _get_attr(r, "status") == "error"]
     if errors and not research_findings:
-        err_msgs = "; ".join([f"Tarea {e.task_id}: {e.error_message}" for e in errors])
+        err_msgs = "; ".join([
+            f"Tarea {_get_attr(e, 'task_id', '?')}: {_get_attr(e, 'error_message', '')}"
+            for e in errors
+        ])
         return {
             "final_answer": f"Encontré problemas técnicos en algunas consultas: {err_msgs}",
             "last_agent": "analyst",

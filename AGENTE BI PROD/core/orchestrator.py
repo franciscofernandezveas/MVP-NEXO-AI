@@ -15,8 +15,7 @@ from agents.viz_agent.graph_viz_agent import VIZ_SUBGRAPH
 from agents.viz_agent.render_node import render_plotly_node
 from agents.viz_approval.graph_viz_approval import viz_approval_node
 from agents.research.research_node import make_research_node
-# NOTE: run_forecast se importa lazy dentro de forecaster_node para no cargar
-# el módulo de forecasting (y sus dependencias pesadas) en cada chat.
+# NOTE: run_forecast se importa lazy dentro de forecaster_node
 from core.llm import LLM
 from core.contracts import SQLContract
 
@@ -39,7 +38,7 @@ class OrchestratorState(TypedDict):
     final_answer: Optional[str]
     iteration_count: int
     last_agent: Optional[str]
-    next: Optional[str]  # NUEVO: usado por supervisor para routing condicional
+    next: Optional[str]  # usado por supervisor para routing condicional
     harness_context: Optional[Dict[str, Any]]
     semantic_context: str
     allowed_views: List[str]
@@ -73,16 +72,41 @@ def build_harness_context_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 @traceable(name="Orchestrator: Execute SQL Tasks")
 def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
+    logger.info(f"[SQL Agent Wrapper] Iniciando. Plan presente: {state.get('plan') is not None}")
+
     if not state.get("plan"):
-        raise ValueError("SQL Agent llamado sin plan previo.")
+        logger.warning("[SQL Agent Wrapper] No hay plan. Devolviendo error.")
+        return {
+            "sql_results": [SQLContract(
+                status="error",
+                error_message="SQL Agent llamado sin plan previo.",
+                can_answer=True
+            )],
+            "last_agent": "sql_agent",
+            "messages": [AIMessage(content="[SQL Agent] Error: sin plan previo")]
+        }
 
     tasks = state["plan"].tasks
-    results: List[SQLContract] = []
+    logger.info(f"[SQL Agent Wrapper] Tareas en plan: {len(tasks) if tasks else 0}")
 
+    if not tasks:
+        logger.warning("[SQL Agent Wrapper] Plan sin tareas. Devolviendo error.")
+        return {
+            "sql_results": [SQLContract(
+                status="error",
+                error_message="El plan no contiene tareas SQL.",
+                can_answer=True
+            )],
+            "last_agent": "sql_agent",
+            "messages": [AIMessage(content="[SQL Agent] Plan sin tareas SQL.")]
+        }
+
+    results: List[SQLContract] = []
     harness_ctx = state.get("harness_context", {})
     global_semantic_context = state.get("semantic_context", harness_ctx.get("semantic_context", ""))
 
-    for task in tasks:
+    for idx, task in enumerate(tasks):
+        logger.info(f"[SQL Agent Wrapper] Ejecutando tarea {idx + 1}/{len(tasks)}")
         payload = task.dict() if hasattr(task, "dict") else dict(task)
 
         candidate_views = getattr(task, "candidate_views", None) or state.get("allowed_views", [])
@@ -90,7 +114,8 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
 
         try:
             schema_info = get_semantic_schema_for_views(candidate_views)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[SQL Agent Wrapper] Error obteniendo schema: {e}")
             schema_info = state.get("schema_info", "")
 
         sub_input = {
@@ -108,16 +133,29 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
             "attempts": 0
         }
 
-        sub_result = SQL_SUBGRAPH.invoke(sub_input)
-        contract = sub_result.get("contract")
-        if contract is None:
+        try:
+            logger.info(f"[SQL Agent Wrapper] Invocando SQL_SUBGRAPH para tarea {idx + 1}")
+            sub_result = SQL_SUBGRAPH.invoke(sub_input)
+            logger.info(f"[SQL Agent Wrapper] Subgrafo devolvió keys: {list(sub_result.keys()) if isinstance(sub_result, dict) else 'NO ES DICT'}")
+            contract = sub_result.get("contract")
+            logger.info(f"[SQL Agent Wrapper] Contract: {contract}")
+
+            if contract is None:
+                logger.warning("[SQL Agent Wrapper] Subgrafo no devolvió contract. Creando error.")
+                contract = SQLContract(
+                    status="error",
+                    error_message="Subgrafo SQL no devolvió contrato",
+                    needs_followup=True
+                )
+        except Exception as e:
+            logger.error(f"[SQL Agent Wrapper] Excepción en subgrafo: {e}", exc_info=True)
             contract = SQLContract(
                 status="error",
-                error_message="Subgrafo SQL no devolvió contrato",
+                error_message=f"Excepción en subgrafo SQL: {str(e)}",
                 needs_followup=True
             )
 
-        contract.task_id = getattr(task, "task_id", "1")
+        contract.task_id = getattr(task, "task_id", idx + 1)
         contract.allowed_views = candidate_views
         contract.preferred_view = preferred
         contract.semantic_context_used = (
@@ -127,12 +165,19 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
         )
 
         results.append(contract)
+        logger.info(f"[SQL Agent Wrapper] Tarea {idx + 1} finalizada: status={contract.status} can_answer={contract.can_answer} rows={contract.row_count}")
 
     all_success = all(
         r.status in ("success", "partial") and r.can_answer
         for r in results
     )
-    summary = " | ".join([f"T{r.task_id}:{r.status}({r.row_count})" for r in results])
+    summary = " | ".join([
+        f"T{r.task_id}:{r.status}({r.row_count})"
+        for r in results
+    ])
+
+    logger.info(f"[SQL Agent Wrapper] Resumen: OK={all_success} | {summary}")
+    logger.info(f"[SQL Agent Wrapper] sql_results tiene {len(results)} items")
 
     return {
         "sql_results": results,
@@ -277,7 +322,10 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def researcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Wrapper lazy para el nodo de research."""
+    """
+    Wrapper lazy para el nodo de research.
+    Solo carga el research_node cuando realmente se usa.
+    """
     from agents.research.research_node import make_research_node
     node = make_research_node(SQL_SUBGRAPH, LLM)
     return node(state)
