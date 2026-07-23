@@ -50,6 +50,9 @@ def _extract_forecast_params(question: str) -> Dict[str, Any]:
             f"Extrae los parámetros para predecir demanda de la siguiente pregunta. "
             f"Si no hay fecha de inicio, devuelve null.\n\nPregunta: {question}"
         )
+        # langchain-openai 0.1.8 puede devolver dict
+        if isinstance(result, dict):
+            result = _ForecastParamsInternal(**result)
         return result.model_dump()
     except Exception as e:
         logger.warning(f"[Planner] Falló extracción estructurada de forecast: {e}")
@@ -386,7 +389,13 @@ REGLAS ADICIONALES:
 
     human = HumanMessage(content=f"Pregunta del usuario: {question}")
     planner_llm = LLM.with_structured_output(PlannerContract, method="function_calling")
-    plan = planner_llm.invoke([system, human])
+    plan_raw = planner_llm.invoke([system, human])
+
+    # langchain-openai 0.1.8 con function_calling puede devolver dict
+    if isinstance(plan_raw, dict):
+        plan = PlannerContract(**plan_raw)
+    else:
+        plan = plan_raw
 
     # ============================================================
     # VALIDACIÓN DE INTEGRIDAD POST-LLM
