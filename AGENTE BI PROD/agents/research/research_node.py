@@ -17,12 +17,37 @@ def _normalize_view_name(view: Optional[str]) -> Optional[str]:
     return view
 
 
-def _validate_tasks(tasks: List[SQLPayload], allowed_views: List[str]) -> List[str]:
+def _ensure_sql_payload(task: Any) -> SQLPayload:
+    """Convierte una tarea a SQLPayload si llegó como dict."""
+    if isinstance(task, dict):
+        return SQLPayload(**task)
+    return task
+
+
+def _ensure_research_plan(plan: Any) -> ResearchPlan:
+    """Convierte el plan a ResearchPlan si llegó como dict."""
+    if isinstance(plan, dict):
+        # Asegurar que tasks también se conviertan a SQLPayload
+        raw_tasks = plan.get("tasks", [])
+        normalized_tasks = []
+        for t in raw_tasks:
+            if isinstance(t, dict):
+                # Manejar claves que puedan tener guiones bajos variantes
+                normalized_tasks.append(SQLPayload(**t))
+            else:
+                normalized_tasks.append(t)
+        plan["tasks"] = normalized_tasks
+        return ResearchPlan(**plan)
+    return plan
+
+
+def _validate_tasks(tasks: List[Any], allowed_views: List[str]) -> List[str]:
     """Asegura que candidate_views/preferred_view estén dentro de allowed_views."""
     warnings = []
     allowed_set = set(allowed_views)
 
-    for task in tasks:
+    for raw_task in tasks:
+        task = _ensure_sql_payload(raw_task)
         task.preferred_view = _normalize_view_name(task.preferred_view)
 
         # Fallback de preferred_view si quedó fuera del shortlist
@@ -54,11 +79,6 @@ def make_research_node(
     sql_subgraph: StateGraph,
     llm=LLM,
 ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Fabrica un nodo 'researcher' que explora la base de datos interna.
-    - sql_subgraph: tu SQL_SUBGRAPH compilado.
-    - llm: modelo LLM (default core.llm.LLM).
-    """
     structured_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
 
     def research_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -69,9 +89,6 @@ def make_research_node(
         semantic_context = state.get("semantic_context", harness.get("semantic_context", ""))
         existing_sql_results = state.get("sql_results", []) or []
 
-        # ------------------------------------------------------------------
-        # 1. Generar plan de investigación con múltiples queries
-        # ------------------------------------------------------------------
         system_prompt = f"""
 Eres un Researcher BI senior. El usuario pide un informe profundo o análisis completo del negocio.
 
@@ -91,10 +108,11 @@ REGLAS:
 """
 
         try:
-            plan: ResearchPlan = structured_llm.invoke([
+            raw_plan = structured_llm.invoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=f"Solicitud de informe: {question}")
             ])
+            plan = _ensure_research_plan(raw_plan)
         except Exception:
             logger.exception("Error generando ResearchPlan")
             return {
@@ -110,12 +128,11 @@ REGLAS:
         if warnings:
             logger.warning("[Researcher] Warnings de validación: %s", warnings)
 
-        # ------------------------------------------------------------------
-        # 2. Ejecutar cada query a través del SQL_SUBGRAPH existente
-        # ------------------------------------------------------------------
         task_results: List[SQLContract] = []
 
-        for task in plan.tasks:
+        for raw_task in plan.tasks:
+            task = _ensure_sql_payload(raw_task)
+
             candidate_views = getattr(task, "candidate_views", []) or allowed_views
             preferred = getattr(task, "preferred_view", None) or preferred_view
 
@@ -124,9 +141,11 @@ REGLAS:
             except Exception:
                 schema_info = ""
 
+            payload_dict = task.dict() if hasattr(task, "dict") else dict(task)
+
             sub_input = {
                 "question": question,
-                "payload": task.dict() if hasattr(task, "dict") else dict(task),
+                "payload": payload_dict,
                 "messages": [],
                 "schema_info": schema_info,
                 "semantic_context": semantic_context,
@@ -163,9 +182,6 @@ REGLAS:
 
         combined_sql_results = existing_sql_results + task_results
 
-        # ------------------------------------------------------------------
-        # 3. Sintetizar un informe Markdown con todos los hallazgos
-        # ------------------------------------------------------------------
         result_summaries = []
         for c in task_results:
             sample_rows = c.rows[:5] if c.rows else []
