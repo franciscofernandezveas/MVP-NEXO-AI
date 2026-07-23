@@ -81,9 +81,9 @@ def render_plotly_node(state: Dict[str, Any]) -> Dict[str, Any]:
             showlegend=True if color_column else False
         )
 
-        # ✅ Guardar en ruta conocida: {BACKEND_DIR}/files/charts/
-        backend_dir = Path(os.getenv("BACKEND_DIR", Path(__file__).resolve().parent.parent.parent.parent))
-        charts_dir = backend_dir / "files" / "charts"
+        # ✅ Guardar siempre en {FILES_DIR}/charts/
+        files_dir = Path(os.getenv("FILES_DIR", "/app/files")).resolve()
+        charts_dir = files_dir / "charts"
         charts_dir.mkdir(parents=True, exist_ok=True)
 
         chart_html_path = charts_dir / "chart.html"
@@ -96,7 +96,7 @@ def render_plotly_node(state: Dict[str, Any]) -> Dict[str, Any]:
         # Guardar como imagen PNG
         pio.write_image(fig, str(chart_png_path), format="png", width=1000, height=600, scale=2)
         
-        logger.info(f"[Render] Gráfico guardado en {charts_dir}")
+        logger.info(f"[Render] Gráfico guardado en {charts_dir} | PNG: {chart_png_path} ({chart_png_path.stat().st_size} bytes)")
         return {
             "viz_rendered": True,
             "last_agent": "render_plotly",

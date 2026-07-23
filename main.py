@@ -120,8 +120,9 @@ async def log_requests(request, call_next):
 # 5. ARCHIVOS ESTÁTICOS
 # ============================================================================
 
-FILES_DIR = Path(os.getenv("FILES_DIR", str(BACKEND_DIR / "files")))
-VIZ_DIR = Path(os.getenv("VIZ_DIR", str(BACKEND_DIR / "visualizations")))
+FILES_DIR = Path(os.getenv("FILES_DIR", str(BACKEND_DIR / "files"))).resolve()
+VIZ_DIR = Path(os.getenv("VIZ_DIR", str(BACKEND_DIR / "visualizations"))).resolve()
+
 
 for d in [FILES_DIR, VIZ_DIR]:
     d.mkdir(parents=True, exist_ok=True)

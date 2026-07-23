@@ -7,7 +7,6 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
-
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -67,11 +66,14 @@ def _node_message(node: str) -> str:
 
 async def _publish_chart(session_id: str, base_url: str) -> str | None:
     """Copia el chart generado a un archivo público y devuelve su URL."""
-    backend_dir = Path(os.getenv("BACKEND_DIR", Path(__file__).resolve().parent.parent.parent))
-    charts_dir = backend_dir / "files" / "charts"
+    files_dir = Path(os.getenv("FILES_DIR", "/app/files"))
+    charts_dir = files_dir / "charts"
     src = charts_dir / "chart.png"
 
     charts_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"[_publish_chart] Buscando chart en: {src}")
+    logger.info(f"[_publish_chart] Existe: {src.exists()} | Tamaño: {src.stat().st_size if src.exists() else 0}")
 
     if src.exists() and src.stat().st_size > 0:
         try:
@@ -80,11 +82,15 @@ async def _publish_chart(session_id: str, base_url: str) -> str | None:
             fname = f"chart_{safe_id}_{ts}_{uuid4().hex[:4]}.png"
             dest = charts_dir / fname
             shutil.copy2(str(src), str(dest))
-            public_url = os.getenv("BACKEND_PUBLIC_URL", base_url).rstrip('/')
-            return f"{public_url}/files/charts/{fname}"
+
+            logger.info(f"[_publish_chart] Copiado a: {dest}")
+            logger.info(f"[_publish_chart] URL pública: {base_url}/files/charts/{fname}")
+
+            return f"{base_url}/files/charts/{fname}"
         except Exception:
             traceback.print_exc()
     return None
+
 
 
 @router.post("/{session_id}/chat")
