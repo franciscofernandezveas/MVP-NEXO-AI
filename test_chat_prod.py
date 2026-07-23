@@ -10,7 +10,7 @@ print("demo/start response:", r.json())
 session_id = r.json()["session_id"]
 
 # 2. Enviar pregunta al chat SSE
-question = "¿Cuáles fueron las ventas del mes?"
+question = "¿Cuáles fueron las ventas del mes de junio de 2026 en Merced"
 print(f"\n➡️  Pregunta: {question}")
 print("=" * 70)
 

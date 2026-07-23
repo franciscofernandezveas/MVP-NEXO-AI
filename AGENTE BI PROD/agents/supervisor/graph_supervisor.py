@@ -7,7 +7,7 @@ from core.config import logger
 
 from langsmith import traceable
 
-MAX_ITERATIONS = 15
+MAX_ITERATIONS = 30
 
 
 @traceable(name="Supervisor: Route Next Agent")
@@ -104,10 +104,24 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("[Supervisor] Ruteando a Researcher - informe profundo solicitado")
         return make_update("researcher")
 
-    # 4. Con plan pero sin resultados SQL → SQL Agent
+        # 4. Con plan pero sin resultados SQL → SQL Agent
     if not sql_results:
+        # Guardia anti-loop: si SQL agent ya se ejecutó y sigue sin resultados,
+        # forzamos al analyst para cerrar el flujo con una respuesta.
+        if last_agent == "sql_agent":
+            logger.warning("[Supervisor] SQL Agent ya ejecutó pero no hay resultados. Forzando analyst.")
+            return make_update(
+                "analyst",
+                messages=[AIMessage(
+                    content="[Supervisor] SQL Agent no devolvió resultados tras intentar. "
+                            "Se genera respuesta explicativa."
+                )]
+            )
+
         logger.info("[Supervisor] Ruteando a SQL Agent - no hay resultados")
         return make_update("sql_agent")
+
+
 
     # 5. Plan pide visualización y aún no hemos corrido el viz_agent
     if getattr(plan, "visualization_candidate", False) and viz_result is None:
