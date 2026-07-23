@@ -1,6 +1,6 @@
 import os
 import logging
-import time as time_module  # Renombrar para evitar conflicto
+import time as time_module
 from functools import lru_cache
 from decimal import Decimal
 from datetime import date, datetime, time
@@ -45,9 +45,35 @@ def serialize_rows(rows: list[dict]) -> list[dict]:
 # URI y Engine
 # ---------------------------------------------------------------------------
 def _get_db_uri() -> str:
-    uri = os.getenv("SUPABASE_DB_URI")
-    if not uri or "host" in uri.lower():
-        raise RuntimeError(f"SUPABASE_DB_URI no configurada correctamente: {uri}")
+    """
+    Soporta múltiples nombres de variable de entorno para compatibilidad.
+    Preferencia: DEMO_DATABASE_URL > SUPABASE_DB_URI > DATABASE_URL
+    """
+    uri = (
+        os.getenv("DEMO_DATABASE_URL")
+        or os.getenv("SUPABASE_DB_URI")
+        or os.getenv("DATABASE_URL")
+    )
+
+    if not uri:
+        raise RuntimeError(
+            "No está configurada ninguna URL de base de datos. "
+            "Configura DEMO_DATABASE_URL, SUPABASE_DB_URI o DATABASE_URL en Railway."
+        )
+
+    # El placeholder "..." significa que la variable no fue reemplazada
+    if uri.strip() == "...":
+        raise RuntimeError(
+            "La URL de base de datos está como placeholder '...'. "
+            "Reemplázala por la URI real de conexión a Postgres."
+        )
+
+    # Validación básica de esquema
+    if not uri.startswith(("postgresql://", "postgres://")):
+        raise RuntimeError(
+            f"La URL de base de datos no parece válida (debe empezar con postgresql://): {uri[:50]}"
+        )
+
     return uri
 
 
@@ -65,11 +91,11 @@ def get_engine() -> Engine:
     engine = create_engine(
         connection_uri,
         poolclass=QueuePool,
-        pool_size=10,          # Conexiones siempre listas
-        max_overflow=20,       # Conexiones extra bajo demanda
-        pool_timeout=5,        # Fallar rápido si no hay conexión
-        pool_pre_ping=True,    # Verificar conexión antes de usar
-        pool_recycle=3600,     # Reciclar conexiones cada 1h
+        pool_size=10,
+        max_overflow=20,
+        pool_timeout=5,
+        pool_pre_ping=True,
+        pool_recycle=3600,
     )
     return engine
 
@@ -95,15 +121,13 @@ SEMANTIC_SCHEMA = "semantic"
 def get_database() -> SQLDatabase:
     """
     Instancia SQLDatabase que SOLO conoce tablas del esquema semantic.
-    Esto previene que el toolkit de LangChain vea tablas de staging.
     """
     engine = get_engine()
-    # Obtenemos SOLO las tablas del esquema semantic para pasarlas a include_tables
-    semantic_tables = get_semantic_table_names()  # devuelve ["semantic.tabla1", ...]
+    semantic_tables = get_semantic_table_names()
     
     db = SQLDatabase(
         engine,
-        sample_rows_in_table_info=2,  # Reducimos para no saturar prompt
+        sample_rows_in_table_info=2,
         include_tables=semantic_tables,
         ignore_tables=[],
     )
@@ -122,24 +146,25 @@ def get_semantic_table_names() -> list[str]:
     tables = inspector.get_table_names(schema=SEMANTIC_SCHEMA)
     views = inspector.get_view_names(schema=SEMANTIC_SCHEMA)
     
-    # Devolvemos nombres calificados para forzar al LLM a usar semantic.
     qualified = [f"{SEMANTIC_SCHEMA}.{t}" for t in tables + views]
     return qualified
 
 
-# Caché con TTL para el esquema (5 minutos)
 _schema_cache = {"value": None, "timestamp": 0}
-_SCHEMA_TTL = 60 * 5  # 5 minutos
+_SCHEMA_TTL = 60 * 5
 
 def get_semantic_schema_info_cached(max_objects: int = 30) -> str:
     """
     Genera un DDL-like del esquema semantic usando caché con TTL.
-    Evita consultas repetidas a information_schema.
     """
-    now = time_module.time()  # Usar time_module en lugar de time
+    now = time_module.time()
     if _schema_cache["value"] is None or now - _schema_cache["timestamp"] > _SCHEMA_TTL:
         logger.debug("Recargando y cacheando schema semantic...")
-        _schema_cache["value"] = get_semantic_schema_info(max_objects)
+        try:
+            _schema_cache["value"] = get_semantic_schema_info(max_objects)
+        except Exception as e:
+            logger.error(f"Error cargando schema: {e}")
+            _schema_cache["value"] = "-- Schema no disponible"
         _schema_cache["timestamp"] = now
         logger.debug("Schema semantic cacheado.")
     return _schema_cache["value"]
@@ -148,7 +173,6 @@ def get_semantic_schema_info_cached(max_objects: int = 30) -> str:
 def get_semantic_schema_info(max_objects: int = 30) -> str:
     """
     Genera un DDL-like del esquema semantic usando SQLAlchemy Inspector.
-    Solo tablas y vistas del esquema semantic.
     """
     engine = get_engine()
     inspector = inspect(engine)
@@ -164,7 +188,6 @@ def get_semantic_schema_info(max_objects: int = 30) -> str:
         cols = inspector.get_columns(obj_name, schema=SEMANTIC_SCHEMA)
         col_defs = []
         for c in cols:
-            # c es dict con 'name', 'type', 'nullable', 'default', etc.
             col_type = str(c["type"])
             nullable = "" if c.get("nullable", True) else " NOT NULL"
             col_defs.append(f"  {c['name']} {col_type}{nullable}")
@@ -175,24 +198,13 @@ def get_semantic_schema_info(max_objects: int = 30) -> str:
     return "\n\n".join(output_lines)
 
 
-# ---------------------------------------------------------------------------
-# NUEVO: Schema filtrado por vistas permitidas (shortlist del harness/planner)
-# ---------------------------------------------------------------------------
 def get_semantic_schema_for_views(allowed_views: List[str]) -> str:
     """
     Genera un DDL-like SOLO para las vistas listadas en allowed_views.
-    Esto reduce el ruido en el prompt del SQL subgraph al mínimo imprescindible.
-    
-    Args:
-        allowed_views: Lista de vistas calificadas, ej. ['semantic.sales_review_day', ...]
-    
-    Returns:
-        String con DDL de solo esas vistas.
     """
     if not allowed_views:
         return "-- No hay vistas permitidas para describir"
     
-    # Limpiar prefijo semantic. si viene incluido
     view_names = []
     for v in allowed_views:
         if isinstance(v, str) and v.startswith(f"{SEMANTIC_SCHEMA}."):
@@ -200,13 +212,17 @@ def get_semantic_schema_for_views(allowed_views: List[str]) -> str:
         elif isinstance(v, str):
             view_names.append(v)
     
-    engine = get_engine()
+    try:
+        engine = get_engine()
+    except Exception as e:
+        logger.error(f"[SchemaForViews] No se pudo obtener engine: {e}")
+        return f"-- Error de conexión al obtener schema filtrado: {e}"
+    
     inspector = inspect(engine)
     views = inspector.get_view_names(schema=SEMANTIC_SCHEMA)
     
     output_lines = []
     for v in view_names:
-        # Seguridad: validar que existe en semantic antes de describir
         if v not in views:
             output_lines.append(f"-- ▼ Vista: {SEMANTIC_SCHEMA}.{v} (NO ENCONTRADA EN SCHEMA)")
             continue
@@ -231,9 +247,6 @@ def get_semantic_schema_for_views(allowed_views: List[str]) -> str:
     return "\n\n".join(output_lines)
 
 
-# ---------------------------------------------------------------------------
-# Ejecución SQL segura con serialización
-# ---------------------------------------------------------------------------
 def execute_sql_query(sql: str) -> tuple[list[dict], list[str], str]:
     engine = get_engine()
     rows: list[dict] = []
@@ -254,7 +267,7 @@ def execute_sql_query(sql: str) -> tuple[list[dict], list[str], str]:
     return rows, columns, error
 
 
-# Legacy wrappers (ya no usados por el SQL Agent, pero los dejamos compatibles)
+# Legacy wrappers
 def get_table_names() -> list[str]:
     return get_semantic_table_names()
 

@@ -150,18 +150,19 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
     
     return True, ""
 
-
 def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
     if state.get("schema_info") and state["schema_info"].strip():
         schema = state["schema_info"]
         logger.debug("[SQL] Usando schema inyectado por orquestador (filtrado)")
     else:
-        logger.debug("[SQL] Fallback a schema global")
-        schema = get_semantic_schema_info_cached(max_objects=30)
+        logger.warning("[SQL] No hay schema_info inyectado. Omitiendo fallback a BD.")
+        schema = "Schema no disponible. Usar catálogo semántico y allowed_views."
     return {
         "schema_info": schema,
         "messages": state.get("messages", []) + [AIMessage(content="[SQL] Schema listo.")]
     }
+
+
 
 
 def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
