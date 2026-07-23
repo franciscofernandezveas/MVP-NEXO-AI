@@ -38,6 +38,7 @@ def _build_initial_state(question: str) -> dict:
         "final_answer": None,
         "iteration_count": 0,
         "last_agent": None,
+        "next": None,
         "harness_context": None,
         "semantic_context": "",
         "allowed_views": [],
@@ -120,7 +121,10 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                         del PENDING_ACTIONS[session_id]
 
                     initial_state = _build_initial_state(question)
-                    config = {"configurable": {"thread_id": session_id}}
+                    config = {
+                        "configurable": {"thread_id": session_id},
+                        "recursion_limit": 50
+                    }
 
                     yield sse_event("start")
 
