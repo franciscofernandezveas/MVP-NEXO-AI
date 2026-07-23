@@ -119,16 +119,45 @@ async def log_requests(request, call_next):
 # ============================================================================
 # 5. ARCHIVOS ESTÁTICOS
 # ============================================================================
+# ============================================================================
+# 5. ARCHIVOS ESTÁTICOS
+# ============================================================================
 
 FILES_DIR = Path(os.getenv("FILES_DIR", str(BACKEND_DIR / "files"))).resolve()
 VIZ_DIR = Path(os.getenv("VIZ_DIR", str(BACKEND_DIR / "visualizations"))).resolve()
 
-
 for d in [FILES_DIR, VIZ_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
+logger.info(f"📁 FILES_DIR: {FILES_DIR}")
+logger.info(f"📁 VIZ_DIR: {VIZ_DIR}")
+
 app.mount("/files", StaticFiles(directory=str(FILES_DIR)), name="files")
 app.mount("/visualizations", StaticFiles(directory=str(VIZ_DIR)), name="visualizations")
+
+
+# ============================================================================
+# 5.5 DEBUG CHARTS
+# ============================================================================
+
+@app.get("/debug/charts")
+def debug_charts():
+    charts_dir = FILES_DIR / "charts"
+    return {
+        "files_dir": str(FILES_DIR),
+        "files_dir_exists": FILES_DIR.exists(),
+        "charts_dir": str(charts_dir),
+        "charts_dir_exists": charts_dir.exists(),
+        "charts": [
+            {
+                "name": p.name,
+                "size": p.stat().st_size,
+                "path": str(p.relative_to(FILES_DIR)),
+            }
+            for p in charts_dir.glob("**/*") if p.is_file()
+        ] if charts_dir.exists() else [],
+    }
+
 
 # ============================================================================
 # 6. ROUTERS

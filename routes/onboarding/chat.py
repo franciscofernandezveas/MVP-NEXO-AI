@@ -4,9 +4,11 @@ import time
 import asyncio
 import shutil
 import traceback
+import logging
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -16,6 +18,8 @@ from core.session_context import session_scope, get_session_lock
 from utils.sse_helpers import sse_event, sse_stream_text, detect_yes_no_response
 
 router = APIRouter()
+
+logger = logging.getLogger("routes.onboarding.chat")
 
 PENDING_ACTIONS: dict = {}
 
@@ -66,14 +70,13 @@ def _node_message(node: str) -> str:
 
 async def _publish_chart(session_id: str, base_url: str) -> str | None:
     """Copia el chart generado a un archivo público y devuelve su URL."""
-    files_dir = Path(os.getenv("FILES_DIR", "/app/files"))
+    files_dir = Path(os.getenv("FILES_DIR", "/app/files")).resolve()
     charts_dir = files_dir / "charts"
     src = charts_dir / "chart.png"
 
     charts_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"[_publish_chart] Buscando chart en: {src}")
-    logger.info(f"[_publish_chart] Existe: {src.exists()} | Tamaño: {src.stat().st_size if src.exists() else 0}")
+    logger.info(f"[_publish_chart] Buscando chart en: {src} | Existe: {src.exists()}")
 
     if src.exists() and src.stat().st_size > 0:
         try:
@@ -82,15 +85,14 @@ async def _publish_chart(session_id: str, base_url: str) -> str | None:
             fname = f"chart_{safe_id}_{ts}_{uuid4().hex[:4]}.png"
             dest = charts_dir / fname
             shutil.copy2(str(src), str(dest))
-
-            logger.info(f"[_publish_chart] Copiado a: {dest}")
-            logger.info(f"[_publish_chart] URL pública: {base_url}/files/charts/{fname}")
-
-            return f"{base_url}/files/charts/{fname}"
+            public_url = os.getenv("BACKEND_PUBLIC_URL", base_url).rstrip('/')
+            chart_url = f"{public_url}/files/charts/{fname}"
+            logger.info(f"[_publish_chart] Chart publicado: {chart_url}")
+            return chart_url
         except Exception:
+            logger.exception("[_publish_chart] Error copiando chart")
             traceback.print_exc()
     return None
-
 
 
 @router.post("/{session_id}/chat")
@@ -100,7 +102,6 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
     if BI_ORCHESTRATOR is None:
         raise HTTPException(status_code=503, detail="Agente BI no disponible")
 
-    # ✅ Usar BACKEND_PUBLIC_URL si existe, sino request.base_url
     base_url = os.getenv("BACKEND_PUBLIC_URL", str(request.base_url)).rstrip('/')
     lock = get_session_lock(session_id)
 
