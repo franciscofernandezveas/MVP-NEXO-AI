@@ -195,12 +195,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=[settings.FRONTEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Access-Control-Allow-Origin"]
 )
+
 
 app.mount("/files", StaticFiles(directory=str(BACKEND_DIR / "files")), name="files")
 if VIZ_DIR.exists():

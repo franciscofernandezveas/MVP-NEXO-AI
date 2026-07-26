@@ -11,6 +11,7 @@ class User(BaseModel):
     email_verified: bool = False
 
 
+# Estos modelos ya no se usan con Supabase Auth, los dejo por si los usas en otro lugar.
 class RegisterRequest(BaseModel):
     email: str
     password: str

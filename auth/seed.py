@@ -1,21 +1,18 @@
-import getpass
 import sys
 
-from .db import create_user_db
-from .security import hash_password
+from .db import get_user_by_email, set_user_role_db
 
 
-def create_admin():
-    email = input("Email admin: ").strip()
-    password = getpass.getpass("Contraseña: ")
-    full_name = input("Nombre completo: ").strip() or None
+def make_admin():
+    email = input("Email del usuario admin: ").strip()
+    user = get_user_by_email(email)
+    if not user:
+        print(f"No existe perfil local para {email}. Inicia sesión primero.")
+        sys.exit(1)
 
-    password_hash = hash_password(password)
-    row = create_user_db(email, password_hash, full_name, role="admin")
-
-    print(f"Usuario admin creado: {row['email']} (id={row['id']}, role={row['role']})")
+    set_user_role_db(user["id"], "admin")
+    print(f"{email} ahora es admin (id={user['id']})")
 
 
 if __name__ == "__main__":
-    # Para ejecutar desde backend/: python -m auth.seed
-    create_admin()
+    make_admin()

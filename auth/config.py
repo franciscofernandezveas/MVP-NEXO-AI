@@ -1,26 +1,32 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Set
 
 
 class AuthSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
-        extra="ignore",  # Ignora variables de entorno que no estén definidas aquí
+        extra="ignore",
     )
 
     DATABASE_URL: str = ""
 
-    JWT_SECRET: str
-    JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    # Supabase
+    SUPABASE_URL: str = ""
+    SUPABASE_ANON_KEY: str = ""
+    SUPABASE_JWT_SECRET: str
+
+    # Emails que serán admin al sincronizarse (separados por coma)
+    ADMIN_EMAILS: str = ""
 
     FRONTEND_URL: str = "http://localhost:3000"
     API_URL: str = "http://localhost:8001"
     SECURE_COOKIES: bool = False
     COOKIE_DOMAIN: str | None = None
     ACCESS_TOKEN_COOKIE_NAME: str = "access_token"
-    REFRESH_TOKEN_COOKIE_NAME: str = "refresh_token"
-    PASSWORD_MIN_LENGTH: int = 8
+
+    @property
+    def admin_email_set(self) -> Set[str]:
+        return {e.strip().lower() for e in self.ADMIN_EMAILS.split(",") if e.strip()}
 
 
 settings = AuthSettings()
