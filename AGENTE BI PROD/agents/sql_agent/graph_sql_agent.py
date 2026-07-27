@@ -1,8 +1,11 @@
 import re
 import json
 import logging
-from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple
+from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple, Set
 from typing_extensions import TypedDict
+
+import sqlparse
+from sqlparse import tokens as T
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
@@ -10,9 +13,14 @@ from langgraph.graph import StateGraph, START, END
 from core.llm import LLM
 from core.database import execute_sql_query
 from core.contracts import SQLContract
-from core.sql_utils import extract_views_used, extract_columns_used
+from core.sql_utils import extract_views_used
+
+# ============================================================
+# NUEVO: Seguridad basada en catálogo semántico (AGENTS.md)
+# ============================================================
 from core.harness import BusinessMemory, is_view_allowed
 
+# Cargar catálogo semántico una sola vez al importar el módulo
 _biz_mem = BusinessMemory.from_file()
 
 logger = logging.getLogger("bi_orchestrator")
@@ -35,18 +43,34 @@ class SQLAgentState(TypedDict):
 
 
 def _normalize(text: str) -> str:
+    """Normaliza texto para comparación flexible de columnas."""
     if not text:
         return ""
-    return text.lower().strip().replace("_", " ").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+    return (
+        text.lower()
+        .strip()
+        .replace("_", " ")
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+    )
 
 
 def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
+    """
+    Construye un catálogo estructurado de vistas permitidas con sus columnas.
+    Incluye métricas y dimensiones/documentación para que el agente no alucine columnas.
+    """
     catalog: Dict[str, Any] = {}
+
     for view_full_name in allowed_views:
         view_name = view_full_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(view_name)
         if not view_info:
             continue
+
         catalog[view_full_name] = {
             "tipo": view_info.tipo,
             "descripcion": view_info.descripcion,
@@ -56,23 +80,34 @@ def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
             "columnas_fecha": view_info.columnas_fecha,
             "notas": view_info.notas,
         }
+
     return catalog
 
 
 def _column_exists_in_view(view_name: str, column_name: str) -> bool:
+    """
+    Verifica si una columna existe en la vista (métrica o columna de fecha/documentada).
+    Soporta coincidencia flexible.
+    """
     clean_view = view_name.replace("semantic.", "").strip()
     view_info = _biz_mem.get_view(clean_view)
     if not view_info:
         return False
 
     requested = _normalize(column_name)
+    if not requested:
+        return False
+
+    # Métricas y columnas documentadas
     available_cols: List[str] = list(view_info.metricas.keys()) + view_info.columnas_fecha
     available_normalized = [_normalize(c) for c in available_cols]
 
+    # Coincidencia exacta o subcadura
     for avail in available_normalized:
-        if requested in avail or avail in requested:
+        if requested == avail or requested in avail or avail in requested:
             return True
 
+    # Mapeos semánticos comunes
     semantic_map = {
         "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku"],
         "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"],
@@ -89,24 +124,82 @@ def _column_exists_in_view(view_name: str, column_name: str) -> bool:
     for variant in variants:
         v = _normalize(variant)
         for avail in available_normalized:
-            if v in avail or avail in v:
+            if v == avail or v in avail or avail in v:
                 return True
 
     return False
 
 
+# ============================================================
+# NUEVO: Extractor real de columnas con sqlparse
+# ============================================================
+SQL_RESERVED_WORDS = {
+    "select", "from", "where", "group", "by", "order", "having", "join",
+    "inner", "left", "right", "full", "outer", "on", "and", "or", "not",
+    "in", "is", "null", "between", "like", "ilike", "limit", "offset",
+    "as", "desc", "asc", "distinct", "all", "union", "except", "intersect",
+    "cast", "case", "when", "then", "else", "end", "sum", "count", "avg",
+    "min", "max", "over", "partition", "row_number", "rank", "dense_rank",
+    "true", "false", "date", "interval", "extract", "to_char", "now", "current_date",
+    # Palabras en español que aparecían como falsos positivos
+    "el", "la", "los", "las", "un", "una", "del", "al", "por", "para",
+    "con", "sin", "sobre", "entre", "desde", "hasta", "cada", "cual",
+    "consulta", "query", "columnas", "columna", "rows", "filas", "vista",
+    "tabla", "contiene", "contienen", "todas", "todos", "requeridas", "requerido",
+    "elegida", "elegido", "utilizando", "usando", "porque", "razon", "razón",
+    "error_message", "reasoning", "reason_for_view_choice", "allowed_views",
+    "preferred_view", "semantic_context_used", "query_confidence", "schema_used",
+    "can_answer", "needs_followup", "warnings", "junio", "julio", "agosto",
+    "diario", "semanal", "mensual", "anual", "desagregado", "total", "ventas",
+    "total_ventas", "calcula", "agrupando", "sumando", "rango", "fechas",
+    "especificado", "especificada", "especificados", "especificadas", "que",
+    "la", "del", "al",
+}
+
+
+def _extract_sql_identifiers(sql: str) -> List[str]:
+    """
+    Extrae identificadores reales de un SQL usando sqlparse.
+    Ignora palabras reservadas, funciones, literales y alias comunes.
+    """
+    identifiers = []
+    parsed = sqlparse.parse(sql)
+    for statement in parsed:
+        for token in statement.flatten():
+            if token.is_whitespace:
+                continue
+            if token.ttype in (T.String.Single, T.String.Symbol, T.Number, T.Number.Integer, T.Number.Float):
+                continue
+            if token.ttype in T.Comment:
+                continue
+            value = token.value.strip('"').strip("'").strip()
+            normalized = _normalize(value)
+            if not normalized:
+                continue
+            if normalized in SQL_RESERVED_WORDS:
+                continue
+            # Ignorar funciones agregadas conocidas (ya están en reserved)
+            if normalized in SQL_RESERVED_WORDS:
+                continue
+            identifiers.append(normalized)
+    return identifiers
+
+
 def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
+    """
+    Valida que todas las columnas usadas en el SQL existan en las vistas documentadas.
+    Devuelve (is_valid, error_message).
+    """
     used_views = extract_views_used(sql)
     if not used_views:
         return True, ""
 
+    all_identifiers = _extract_sql_identifiers(sql)
+
     for view_name in used_views:
-        cols = extract_columns_used(sql)
         invalid_cols = []
-        for col in cols:
+        for col in all_identifiers:
             if not _column_exists_in_view(view_name, col):
-                if col.lower() in ["as", "by", "on", "and", "or", "not", "sum", "count", "avg", "min", "max"]:
-                    continue
                 invalid_cols.append(col)
 
         if invalid_cols:
@@ -122,79 +215,24 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def _build_sql_system_prompt(catalogo_detallado: Dict[str, Any], task_json: str, error_history: str) -> str:
-    catalogo_str = json.dumps(catalogo_detallado, indent=2, ensure_ascii=False)
-
-    prompt_template = """
-Eres un Data Engineer senior experto en PostgreSQL. Generas UNA query SQL SELECT válida para responder una tarea del Planner.
-
-=== CATÁLOGO ESTRUCTURADO DE VISTAS AUTORIZADAS ===
-{catalogo_str}
-
-=== TAREA A RESOLVER (SQLPayload) ===
-{task_json}
-
-=== ERRORES PREVIOS ===
-{error_history}
-
-=== PROTOCOLO OBLIGATORIO DE VALIDACIÓN ===
-1. Extrae las columnas requeridas: task.metrics + task.dimensions + task.filters[*].column.
-2. Para cada columna, verifica que exista con su nombre EXACTO en task.preferred_view (o la primera de task.candidate_views).
-3. Si alguna columna NO existe:
-   - Devuelve status="unrecoverable".
-   - En reason_for_view_choice escribe: "Columna X no existe en semantic.vw_...".
-   - No inventes alias ni columnas alternativas.
-4. Si todas existen, escribe la query.
-
-=== REGLAS ABSOLUTAS ===
-1. Usa ÚNICAMENTE `semantic.<vista>`. Prohibido cualquier otro esquema.
-2. No uses columnas que no estén en el catálogo de arriba.
-3. Para filtros de texto (sede, local, producto, categoria) usa ILIKE o LOWER(col) = LOWER('valor'). Nunca = directo.
-4. Usa task.date_range para el WHERE de fecha. Aplica DATE_TRUNC según grain si es necesario.
-5. Incluye GROUP BY por todas las dimensiones no agregadas.
-6. No uses SELECT *.
-7. No uses LIMIT a menos que se pida TOP N explícitamente.
-8. Prohibido DELETE, DROP, INSERT, UPDATE, TRUNCATE.
-9. Si la tarea es demand_forecast, genera solo la query base de serie histórica. El forecast se hará en el nodo forecaster.
-
-=== FORMATO DE SALIDA (SQLContract) ===
-Devuelve ÚNICAMENTE JSON válido con esta estructura exacta:
-
-{{
-  "task_id": "t1",
-  "status": "success|error|partial|needs_clarification|unrecoverable",
-  "generated_sql": "SELECT ...",
-  "columns": ["col1", "col2"],
-  "rows": [],
-  "row_count": 0,
-  "error_message": null,
-  "schema_used": ["semantic"],
-  "can_answer": true,
-  "reasoning": "Breve explicación técnica",
-  "needs_followup": false,
-  "warnings": [],
-  "allowed_views": ["semantic.vw_..."],
-  "preferred_view": "semantic.vw_...",
-  "semantic_context_used": "Resumen del catálogo usado",
-  "query_confidence": 1.0,
-  "reason_for_view_choice": "Vista X elegida porque contiene todas las columnas requeridas"
-}}
-
-Si la validación falla:
-{{
-  "status": "unrecoverable",
-  "generated_sql": null,
-  "can_answer": false,
-  "query_confidence": 0.0,
-  "reason_for_view_choice": "Columna X no existe en semantic.vw_...",
-  "error_message": "Columna X no existe en semantic.vw_..."
-}}
-"""
-    return prompt_template.format(
-        catalogo_str=catalogo_str,
-        task_json=task_json,
-        error_history=error_history
-    )
+def _sanitize_messages(messages: List[Any]) -> List[Any]:
+    """
+    Elimina/reemplaza respuestas anteriores que sean JSON puro,
+    para evitar que el modelo las imite en el siguiente intento.
+    """
+    cleaned = []
+    for m in messages:
+        if isinstance(m, AIMessage) and isinstance(getattr(m, "content", ""), str):
+            content = m.content.strip()
+            if content.startswith("{") and content.endswith("}"):
+                cleaned.append(
+                    AIMessage(
+                        content="[Respuesta previa inválida: se devolvió JSON en lugar de SQL. Recordar: solo bloque ```sql ... ```]"
+                    )
+                )
+                continue
+        cleaned.append(m)
+    return cleaned
 
 
 def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
@@ -213,8 +251,44 @@ def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
 def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
     preferred = state.get("preferred_view")
     allowed = state.get("allowed_views", [])
-    payload = state.get("payload")
 
+    catalogo_detallado = _build_sql_catalog(allowed)
+
+    system = SystemMessage(content=f"""
+Eres un Data Engineer senior experto en PostgreSQL.
+
+CONTEXTO CRÍTICO:
+- TÚ SOLO puedes acceder al esquema 'semantic.'.
+- PROHIBIDO usar tablas de staging, raw, public o cualquier otro esquema.
+
+REGLAS ABSOLUTAS:
+1. Antes de escribir CUALQUIER query, consulta el CATÁLOGO ESTRUCTURADO DE VISTAS.
+2. SOLO puedes usar columnas que aparezcan en 'metricas' o 'columnas_fecha' de la vista seleccionada.
+3. SI una columna que necesitas NO está en el catálogo, NO la inventes. Escribe exactamente: ERROR_INSALVABLE
+4. Usa ÚNICAMENTE vistas que estén en `allowed_views` o en el catálogo documentado.
+5. Si `preferred_view` existe y tiene todas las columnas necesarias, ÚSALA.
+6. Toda referencia a tabla DEBE ser: semantic.nombre_vista.
+7. Genera UNA query SQL SELECT válida para PostgreSQL.
+8. PROHIBIDO: DELETE, DROP, INSERT, UPDATE, TRUNCATE.
+9. Si hay un error previo de ejecución, CORRÍGELO respetando las columnas VÁLIDAS del catálogo.
+
+REGLA DE SALIDA OBLIGATORIA (LA MÁS IMPORTANTE):
+- Devuelve ÚNICAMENTE un bloque de código SQL: ```sql ... ```
+- NO devuelvas JSON, explicaciones, listas, ni ningún otro texto fuera del bloque SQL.
+- Si no puedes generar SQL válido, escribe exactamente: ERROR_INSALVABLE
+
+REGLA DE INTEGRIDAD DE COLUMNAS:
+- Antes de usar una columna en SELECT, WHERE, GROUP BY, ORDER BY u ON:
+  a) Verifica su nombre exacto en el catálogo.
+  b) Si no existe, NO uses una columna "parecida". Devuelve ERROR_INSALVABLE.
+
+REGLA DE DIMENSIONES DE TEXTO:
+- Para columnas de texto como `nombre_sede`, usa `ILIKE` o `LOWER(column) = LOWER('valor')`.
+
+NO respondas en lenguaje natural. Solo SQL o la marca ERROR_INSALVABLE.
+""")
+
+    payload = state.get("payload")
     if not payload:
         return {
             "generated_sql": "",
@@ -223,49 +297,76 @@ def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
             "messages": state.get("messages", []) + [AIMessage(content="[SQL] Error: falta payload")]
         }
 
-    catalogo_detallado = _build_sql_catalog(allowed)
-
-    task_json = json.dumps(payload, indent=2, ensure_ascii=False)
-    error_history = state.get("error_message") or "Ninguno"
-
-    system_prompt = _build_sql_system_prompt(catalogo_detallado, task_json, error_history)
-    system = SystemMessage(content=system_prompt)
-
     ctx = f"""
 TAREA DEL PAYLOAD:
-{task_json}
+{json.dumps(payload, indent=2, ensure_ascii=False)}
 
 CATÁLOGO ESTRUCTURADO DE VISTAS (USA SOLO ESTAS COLUMNAS):
 {json.dumps(catalogo_detallado, indent=2, ensure_ascii=False)}
 
 VISTA PREFERIDA: {preferred or 'Ninguna'}
-VISTAS PERMITIDAS RECOMENDADAS (allowed_views): {allowed}
+VISTAS PERMITIDAS: {allowed}
 
-CONTEXTO SEMÁNTICO DE NEGOCIO:
+CONTEXTO SEMÁNTICO:
 {state.get('semantic_context', 'No disponible')}
 
-SCHEMA TÉCNICO (solo vistas permitidas):
+SCHEMA TÉCNICO:
 {state.get('schema_info', 'No cargado')}
 
-ERROR PREVIO (si existe):
+ERROR PREVIO:
 {state.get('error_message', 'Ninguno')}
 """
     human = HumanMessage(content=ctx)
 
-    messages = state.get("messages", [])
+    # Sanitizar historial y truncar
+    messages = _sanitize_messages(state.get("messages", []))
     if len(messages) > 4:
         messages = messages[-4:]
         logger.debug("[SQL] Historial truncado a 4 mensajes")
 
     response = LLM.invoke([system] + messages + [human])
-    content = response.content
+    content = response.content.strip()
 
+    # ============================================================
+    # RECHAZAR JSON EXPLÍCITO
+    # ============================================================
+    if content.startswith("{") and content.endswith("}"):
+        logger.warning("[SQL] Modelo devolvió JSON en lugar de SQL: %s", content[:300])
+        return {
+            "generated_sql": "",
+            "error_message": "El modelo devolvió JSON en lugar de SQL. Se requiere solo un bloque ```sql ... ```.",
+            "attempts": state.get("attempts", 0) + 1,
+            "messages": messages + [AIMessage(content="[SQL] Error: respuesta fue JSON, no SQL")]
+        }
+
+    # ============================================================
+    # EXIGIR BLOQUE SQL EXPLÍCITO
+    # ============================================================
     match = re.search(r"```sql\s*(.*?)\s*```", content, re.DOTALL | re.IGNORECASE)
-    sql_extracted = match.group(1).strip() if match else content.strip()
+    if not match:
+        logger.warning("[SQL] No se encontró bloque SQL en la respuesta: %s", content[:300])
+        return {
+            "generated_sql": "",
+            "error_message": "No se encontró bloque SQL ```sql ... ``` en la respuesta del modelo.",
+            "attempts": state.get("attempts", 0) + 1,
+            "messages": messages + [AIMessage(content="[SQL] Error: no se encontró bloque SQL")]
+        }
 
+    sql_extracted = match.group(1).strip()
+
+    # Asegurar que sea un SELECT
+    if not re.search(r'^\s*SELECT\b', sql_extracted, re.IGNORECASE):
+        return {
+            "generated_sql": "",
+            "error_message": f"El bloque SQL no comienza con SELECT: {sql_extracted[:200]}",
+            "attempts": state.get("attempts", 0) + 1,
+            "messages": messages + [AIMessage(content="[SQL] Error: bloque no es SELECT")]
+        }
+
+    # Bloqueo DML/DDL
     sql_upper = sql_extracted.upper()
     forbidden_cmds = ["DELETE", "DROP", "INSERT", "UPDATE", "TRUNCATE"]
-    if any(cmd in sql_upper for cmd in forbidden_cmds):
+    if any(re.search(rf'\b{cmd}\b', sql_upper) for cmd in forbidden_cmds):
         return {
             "generated_sql": "",
             "error_message": "Seguridad: comando DML/DDL detectado.",
@@ -273,6 +374,7 @@ ERROR PREVIO (si existe):
             "messages": messages + [response, AIMessage(content="[SQL] Bloqueado por seguridad")]
         }
 
+    # Detección de insalvable
     if "ERROR_INSALVABLE" in content.upper():
         return {
             "generated_sql": "",
@@ -281,8 +383,8 @@ ERROR PREVIO (si existe):
             "messages": messages + [response, AIMessage(content="[SQL] Insalvable por vistas faltantes")]
         }
 
+    # Validación de vistas permitidas
     used_views = extract_views_used(sql_extracted)
-
     if used_views:
         invalid_views = [v for v in used_views if not is_view_allowed(v, _biz_mem)]
         if invalid_views:
@@ -298,18 +400,9 @@ ERROR PREVIO (si existe):
                 "messages": messages + [response, AIMessage(content=f"[SQL] {err_msg}")]
             }
 
-        allowed_set = {v.lower().replace("semantic.", "") for v in allowed}
-        for v in used_views:
-            clean = v.lower().replace("semantic.", "")
-            if clean not in allowed_set:
-                logger.info(
-                    f"[SQL] Vista '{v}' está en el catálogo pero fuera de allowed_views "
-                    f"recomendadas. Shortlist: {allowed}"
-                )
-    else:
-        if sql_extracted and re.search(r'\bselect\b', sql_extracted, re.IGNORECASE):
-            logger.warning("[SQL] Query SELECT sin vistas semantic. detectadas.")
-
+    # ============================================================
+    # VALIDACIÓN DE COLUMNAS CON sqlparse
+    # ============================================================
     is_valid, column_error = _validate_columns_in_sql(sql_extracted)
     if not is_valid:
         logger.warning(f"[SQL] {column_error}")
@@ -352,31 +445,60 @@ def sql_execute_query(state: SQLAgentState) -> Dict[str, Any]:
 
 
 def _is_recoverable_db_error(error: str) -> bool:
+    """
+    Determina si un error de DB justifica un reintento.
+    Errores de formato del modelo o insalvables NO se reintentan.
+    """
     if not error:
         return False
     e = error.lower()
+
+    # NO recuperable: el modelo devolvió JSON, no encontró bloque SQL, o es insalvable
+    if any(x in e for x in [
+        "json en lugar de sql",
+        "no se encontró bloque sql",
+        "insalvable",
+        "ninguna vista permitida resuelve",
+        "el bloque sql no comienza con select",
+    ]):
+        return False
+
+    # Errores de columna: recoverable si el prompt tiene catálogo
     if "column" in e and "does not exist" in e:
         return True
+
+    # Errores de sintaxis u operadores: recoverable
     if any(x in e for x in ["syntax error", "invalid input syntax", "operator does not exist", "ambiguous column"]):
         return True
-    if any(x in e for x in ["relation", "undefined_table", "does not exist"]) and "column" not in e:
+
+    # Errores de tabla/vista: no recoverable
+    if any(x in e for x in ["relation", "undefined_table"]) and "column" not in e:
         return False
+
     return False
 
 
 def _enrich_error_with_valid_columns(error: str, sql: str) -> str:
+    """
+    Si el error es UndefinedColumn, enriquece el mensaje con las columnas válidas
+    de la vista afectada para que el reintento tenga contexto claro.
+    """
     if not error or "UndefinedColumn" not in error:
         return error
+
     used_views = extract_views_used(sql)
     enrichments = []
+
     for view_name in used_views:
         clean = view_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(clean)
         if view_info:
             available = list(view_info.metricas.keys()) + view_info.columnas_fecha
             enrichments.append(f"\nColumnas VÁLIDAS para {view_name}: {available}")
+
     if enrichments:
         return error + "\n" + "\n".join(enrichments)
+
     return error
 
 
@@ -396,6 +518,7 @@ def sql_validate_and_package(state: SQLAgentState) -> Dict[str, Any]:
     reason = ""
     needs_followup = False
 
+    # Enriquecer error de columna con columnas válidas para el reintento
     if err and "UndefinedColumn" in err:
         err = _enrich_error_with_valid_columns(err, sql)
 
@@ -455,6 +578,8 @@ def sql_route_retry(state: SQLAgentState) -> Literal["generate_query", "validate
     if attempts >= 3:
         return "validate_package"
     if "SECURITY" in err or "Ninguna vista permitida" in err or "ERROR_INSALVABLE" in err:
+        return "validate_package"
+    if "El modelo devolvió JSON" in err or "No se encontró bloque SQL" in err:
         return "validate_package"
     if not _is_recoverable_db_error(err):
         return "validate_package"
