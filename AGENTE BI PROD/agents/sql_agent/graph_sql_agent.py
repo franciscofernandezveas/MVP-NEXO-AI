@@ -1,23 +1,18 @@
 import re
 import json
 import logging
-from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple, Set
+from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple
 from typing_extensions import TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 
 from core.llm import LLM
-from core.database import execute_sql_query, get_semantic_schema_info_cached
+from core.database import execute_sql_query
 from core.contracts import SQLContract
 from core.sql_utils import extract_views_used, extract_columns_used
-
-# ============================================================
-# NUEVO: Seguridad basada en catálogo semántico (AGENTS.md)
-# ============================================================
 from core.harness import BusinessMemory, is_view_allowed
 
-# Cargar catálogo semántico una sola vez al importar el módulo
 _biz_mem = BusinessMemory.from_file()
 
 logger = logging.getLogger("bi_orchestrator")
@@ -40,25 +35,18 @@ class SQLAgentState(TypedDict):
 
 
 def _normalize(text: str) -> str:
-    """Normaliza texto para comparación flexible de columnas."""
     if not text:
         return ""
     return text.lower().strip().replace("_", " ").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
 
 
 def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
-    """
-    Construye un catálogo estructurado de vistas permitidas con sus columnas.
-    Incluye métricas y dimensiones/documentación para que el agente no alucine columnas.
-    """
     catalog: Dict[str, Any] = {}
-    
     for view_full_name in allowed_views:
         view_name = view_full_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(view_name)
         if not view_info:
             continue
-        
         catalog[view_full_name] = {
             "tipo": view_info.tipo,
             "descripcion": view_info.descripcion,
@@ -68,34 +56,23 @@ def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
             "columnas_fecha": view_info.columnas_fecha,
             "notas": view_info.notas,
         }
-    
     return catalog
 
 
 def _column_exists_in_view(view_name: str, column_name: str) -> bool:
-    """
-    Verifica si una columna existe en la vista (métrica o columna de fecha/documentada).
-    Soporta coincidencia flexible.
-    """
     clean_view = view_name.replace("semantic.", "").strip()
     view_info = _biz_mem.get_view(clean_view)
     if not view_info:
         return False
-    
+
     requested = _normalize(column_name)
-    
-    # Métricas y columnas documentadas
     available_cols: List[str] = list(view_info.metricas.keys()) + view_info.columnas_fecha
-    
-    # Normalizar
     available_normalized = [_normalize(c) for c in available_cols]
-    
-    # Coincidencia exacta o subcadena
+
     for avail in available_normalized:
         if requested in avail or avail in requested:
             return True
-    
-    # Mapeos semánticos comunes
+
     semantic_map = {
         "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku"],
         "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"],
@@ -107,37 +84,31 @@ def _column_exists_in_view(view_name: str, column_name: str) -> bool:
         "transacciones": ["transacciones", "total_transacciones", "numero_transacciones"],
         "ticket_promedio": ["ticket_promedio"],
     }
-    
+
     variants = semantic_map.get(requested, [requested])
     for variant in variants:
         v = _normalize(variant)
         for avail in available_normalized:
             if v in avail or avail in v:
                 return True
-    
+
     return False
 
 
 def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
-    """
-    Valida que todas las columnas usadas en el SQL existan en las vistas documentadas.
-    Devuelve (is_valid, error_message).
-    """
     used_views = extract_views_used(sql)
     if not used_views:
         return True, ""
-    
+
     for view_name in used_views:
         cols = extract_columns_used(sql)
         invalid_cols = []
-        
         for col in cols:
             if not _column_exists_in_view(view_name, col):
-                # Ignorar palabras reservadas y alias comunes que no son columnas
                 if col.lower() in ["as", "by", "on", "and", "or", "not", "sum", "count", "avg", "min", "max"]:
                     continue
                 invalid_cols.append(col)
-        
+
         if invalid_cols:
             clean_view = view_name.replace("semantic.", "")
             view_info = _biz_mem.get_view(clean_view)
@@ -147,38 +118,18 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
                 f"{invalid_cols}. Columnas VÁLIDAS: {available}. "
                 f"No intentes 'corregir' usando otra columna."
             )
-    
+
     return True, ""
 
-def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
-    if state.get("schema_info") and state["schema_info"].strip():
-        schema = state["schema_info"]
-        logger.debug("[SQL] Usando schema inyectado por orquestador (filtrado)")
-    else:
-        logger.warning("[SQL] No hay schema_info inyectado. Omitiendo fallback a BD.")
-        schema = "Schema no disponible. Usar catálogo semántico y allowed_views."
-    return {
-        "schema_info": schema,
-        "messages": state.get("messages", []) + [AIMessage(content="[SQL] Schema listo.")]
-    }
 
+def _build_sql_system_prompt(catalogo_detallado: Dict[str, Any], task_json: str, error_history: str) -> str:
+    catalogo_str = json.dumps(catalogo_detallado, indent=2, ensure_ascii=False)
 
-
-
-def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
-    preferred = state.get("preferred_view")
-    allowed = state.get("allowed_views", [])
-    
-    # ============================================================
-    # NUEVO: Catálogo estructurado para el prompt
-    # ============================================================
-    catalogo_detallado = _build_sql_catalog(allowed)
-    
-    system = SystemMessage(content=f"""
+    prompt_template = """
 Eres un Data Engineer senior experto en PostgreSQL. Generas UNA query SQL SELECT válida para responder una tarea del Planner.
 
 === CATÁLOGO ESTRUCTURADO DE VISTAS AUTORIZADAS ===
-{catalogo_detallado}
+{catalogo_str}
 
 === TAREA A RESOLVER (SQLPayload) ===
 {task_json}
@@ -209,7 +160,7 @@ Eres un Data Engineer senior experto en PostgreSQL. Generas UNA query SQL SELECT
 === FORMATO DE SALIDA (SQLContract) ===
 Devuelve ÚNICAMENTE JSON válido con esta estructura exacta:
 
-{
+{{
   "task_id": "t1",
   "status": "success|error|partial|needs_clarification|unrecoverable",
   "generated_sql": "SELECT ...",
@@ -227,22 +178,43 @@ Devuelve ÚNICAMENTE JSON válido con esta estructura exacta:
   "semantic_context_used": "Resumen del catálogo usado",
   "query_confidence": 1.0,
   "reason_for_view_choice": "Vista X elegida porque contiene todas las columnas requeridas"
-}
+}}
 
 Si la validación falla:
-{
+{{
   "status": "unrecoverable",
   "generated_sql": null,
   "can_answer": false,
   "query_confidence": 0.0,
   "reason_for_view_choice": "Columna X no existe en semantic.vw_...",
   "error_message": "Columna X no existe en semantic.vw_..."
-}
+}}
+"""
+    return prompt_template.format(
+        catalogo_str=catalogo_str,
+        task_json=task_json,
+        error_history=error_history
+    )
 
-""")
 
-    
+def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
+    if state.get("schema_info") and state["schema_info"].strip():
+        schema = state["schema_info"]
+        logger.debug("[SQL] Usando schema inyectado por orquestador (filtrado)")
+    else:
+        logger.warning("[SQL] No hay schema_info inyectado. Omitiendo fallback a BD.")
+        schema = "Schema no disponible. Usar catálogo semántico y allowed_views."
+    return {
+        "schema_info": schema,
+        "messages": state.get("messages", []) + [AIMessage(content="[SQL] Schema listo.")]
+    }
+
+
+def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
+    preferred = state.get("preferred_view")
+    allowed = state.get("allowed_views", [])
     payload = state.get("payload")
+
     if not payload:
         return {
             "generated_sql": "",
@@ -251,9 +223,17 @@ Si la validación falla:
             "messages": state.get("messages", []) + [AIMessage(content="[SQL] Error: falta payload")]
         }
 
+    catalogo_detallado = _build_sql_catalog(allowed)
+
+    task_json = json.dumps(payload, indent=2, ensure_ascii=False)
+    error_history = state.get("error_message") or "Ninguno"
+
+    system_prompt = _build_sql_system_prompt(catalogo_detallado, task_json, error_history)
+    system = SystemMessage(content=system_prompt)
+
     ctx = f"""
 TAREA DEL PAYLOAD:
-{json.dumps(payload, indent=2, ensure_ascii=False)}
+{task_json}
 
 CATÁLOGO ESTRUCTURADO DE VISTAS (USA SOLO ESTAS COLUMNAS):
 {json.dumps(catalogo_detallado, indent=2, ensure_ascii=False)}
@@ -271,19 +251,18 @@ ERROR PREVIO (si existe):
 {state.get('error_message', 'Ninguno')}
 """
     human = HumanMessage(content=ctx)
-    
+
     messages = state.get("messages", [])
     if len(messages) > 4:
         messages = messages[-4:]
         logger.debug("[SQL] Historial truncado a 4 mensajes")
-    
+
     response = LLM.invoke([system] + messages + [human])
     content = response.content
 
     match = re.search(r"```sql\s*(.*?)\s*```", content, re.DOTALL | re.IGNORECASE)
     sql_extracted = match.group(1).strip() if match else content.strip()
 
-    # 1. Bloqueo DML/DDL
     sql_upper = sql_extracted.upper()
     forbidden_cmds = ["DELETE", "DROP", "INSERT", "UPDATE", "TRUNCATE"]
     if any(cmd in sql_upper for cmd in forbidden_cmds):
@@ -294,7 +273,6 @@ ERROR PREVIO (si existe):
             "messages": messages + [response, AIMessage(content="[SQL] Bloqueado por seguridad")]
         }
 
-    # 2. Detección de insalvable
     if "ERROR_INSALVABLE" in content.upper():
         return {
             "generated_sql": "",
@@ -303,7 +281,6 @@ ERROR PREVIO (si existe):
             "messages": messages + [response, AIMessage(content="[SQL] Insalvable por vistas faltantes")]
         }
 
-    # 3. Validación de seguridad contra catálogo semántico
     used_views = extract_views_used(sql_extracted)
 
     if used_views:
@@ -321,7 +298,6 @@ ERROR PREVIO (si existe):
                 "messages": messages + [response, AIMessage(content=f"[SQL] {err_msg}")]
             }
 
-        # Advertencia informativa si usa vista fuera de allowed_views
         allowed_set = {v.lower().replace("semantic.", "") for v in allowed}
         for v in used_views:
             clean = v.lower().replace("semantic.", "")
@@ -334,9 +310,6 @@ ERROR PREVIO (si existe):
         if sql_extracted and re.search(r'\bselect\b', sql_extracted, re.IGNORECASE):
             logger.warning("[SQL] Query SELECT sin vistas semantic. detectadas.")
 
-    # ============================================================
-    # NUEVO: Validación de columnas antes de ejecutar
-    # ============================================================
     is_valid, column_error = _validate_columns_in_sql(sql_extracted)
     if not is_valid:
         logger.warning(f"[SQL] {column_error}")
@@ -379,51 +352,31 @@ def sql_execute_query(state: SQLAgentState) -> Dict[str, Any]:
 
 
 def _is_recoverable_db_error(error: str) -> bool:
-    """
-    Determina si un error de DB justifica un reintento.
-    'column does not exist' puede ser recoverable si el agente aprende las columnas válidas.
-    'relation does not exist' NO es recoverable si la tabla no existe.
-    """
     if not error:
         return False
     e = error.lower()
-    
-    # Errores de columna: recoverable si el prompt tiene catálogo (pero limitar intentos)
     if "column" in e and "does not exist" in e:
         return True
-    
-    # Errores de sintaxis u operadores: recoverable
     if any(x in e for x in ["syntax error", "invalid input syntax", "operator does not exist", "ambiguous column"]):
         return True
-    
-    # Errores de tabla/vista: no recoverable (no podemos crear tablas)
     if any(x in e for x in ["relation", "undefined_table", "does not exist"]) and "column" not in e:
         return False
-    
     return False
 
 
 def _enrich_error_with_valid_columns(error: str, sql: str) -> str:
-    """
-    Si el error es UndefinedColumn, enriquece el mensaje con las columnas válidas
-    de la vista afectada para que el reintento tenga contexto claro.
-    """
     if not error or "UndefinedColumn" not in error:
         return error
-    
     used_views = extract_views_used(sql)
     enrichments = []
-    
     for view_name in used_views:
         clean = view_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(clean)
         if view_info:
             available = list(view_info.metricas.keys()) + view_info.columnas_fecha
             enrichments.append(f"\nColumnas VÁLIDAS para {view_name}: {available}")
-    
     if enrichments:
         return error + "\n" + "\n".join(enrichments)
-    
     return error
 
 
@@ -443,7 +396,6 @@ def sql_validate_and_package(state: SQLAgentState) -> Dict[str, Any]:
     reason = ""
     needs_followup = False
 
-    # Enriquecer error de columna con columnas válidas para el reintento
     if err and "UndefinedColumn" in err:
         err = _enrich_error_with_valid_columns(err, sql)
 

@@ -88,35 +88,11 @@ class PlannerContract(BaseModel):
     @model_validator(mode="after")
     def consistency_checks(self):
         if self.question_type == "demand_forecast" and not any(t.execution_strategy == "demand_forecast" for t in self.tasks):
-            raise ValueError("question_type=demand_forecast requiere al menos una tarea con execution_strategy=demand_forecast")
+            # Permitimos demand_forecast sin tareas SQL si es un forecast puro
+            pass
         if self.needs_followup and self.followup_question is None:
             raise ValueError("Si needs_followup=true, debe existir followup_question")
         return self
-
-
-# ------------------------------------------------------------------
-# RESEARCH
-# ------------------------------------------------------------------
-
-class ResearchPlan(BaseModel):
-    """Plan de exploración profunda interna."""
-    goal: str = Field(..., description="Objetivo del informe de investigación")
-    metrics_to_cover: List[str] = Field(default_factory=list)
-    dimensions_to_cover: List[str] = Field(default_factory=list)
-    time_windows: List[str] = Field(default_factory=list)
-    sections: List[str] = Field(default_factory=list)
-    tasks: List[SQLPayload] = Field(...)
-
-
-class ResearchContract(BaseModel):
-    """Resultado del nodo researcher."""
-    status: Literal["success", "partial", "error"]
-    plan: Optional[ResearchPlan] = None
-    task_results: List[SQLContract] = Field(default_factory=list)
-    findings: str = ""
-    metrics_covered: List[str] = Field(default_factory=list)
-    warnings: List[str] = Field(default_factory=list)
-    needs_followup: bool = False
 
 
 # ------------------------------------------------------------------
@@ -153,6 +129,31 @@ class SQLContract(BaseModel):
 
 
 # ------------------------------------------------------------------
+# RESEARCH
+# ------------------------------------------------------------------
+
+class ResearchPlan(BaseModel):
+    """Plan de exploración profunda interna."""
+    goal: str = Field(..., description="Objetivo del informe de investigación")
+    metrics_to_cover: List[str] = Field(default_factory=list)
+    dimensions_to_cover: List[str] = Field(default_factory=list)
+    time_windows: List[str] = Field(default_factory=list)
+    sections: List[str] = Field(default_factory=list)
+    tasks: List[SQLPayload] = Field(...)
+
+
+class ResearchContract(BaseModel):
+    """Resultado del nodo researcher."""
+    status: Literal["success", "partial", "error"]
+    plan: Optional[ResearchPlan] = None
+    task_results: List[SQLContract] = Field(default_factory=list)
+    findings: str = ""
+    metrics_covered: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    needs_followup: bool = False
+
+
+# ------------------------------------------------------------------
 # SUPERVISOR
 # ------------------------------------------------------------------
 
@@ -164,8 +165,8 @@ class SupervisorDecision(BaseModel):
         "render_plotly", "viz_approval", "researcher",
         "forecaster", "FINISH"
     ]
-    feedback_to_planner: Optional[str] = None  # Solo se usa si next_agent == "planner"
-    feedback_to_sql_agent: Optional[str] = None  # Solo se usa si next_agent == "sql_agent"
+    feedback_to_planner: Optional[str] = None
+    feedback_to_sql_agent: Optional[str] = None
 
 
 # ------------------------------------------------------------------
