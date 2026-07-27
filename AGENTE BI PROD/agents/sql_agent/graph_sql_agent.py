@@ -1,7 +1,7 @@
 import re
 import json
 import logging
-from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple
+from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple, Set
 from typing_extensions import TypedDict
 
 import sqlparse
@@ -15,7 +15,6 @@ from core.database import execute_sql_query
 from core.contracts import SQLContract
 from core.sql_utils import extract_views_used
 
-# Seguridad basada en catálogo semántico (AGENTS.md)
 from core.harness import BusinessMemory, is_view_allowed
 
 _biz_mem = BusinessMemory.from_file()
@@ -113,7 +112,7 @@ def _column_exists_in_view(view_name: str, column_name: str) -> bool:
 
 
 # ============================================================
-# PARSER DE IDENTIFICADORES CON sqlparse
+# PARSER DE IDENTIFICADORES CON sqlparse (CORREGIDO)
 # ============================================================
 SQL_RESERVED_WORDS = {
     "select", "from", "where", "group", "by", "order", "having", "join",
@@ -127,7 +126,7 @@ SQL_RESERVED_WORDS = {
     "upper", "lower", "trim", "concat", "substring", "length", "replace",
     "year", "month", "day", "week", "quarter", "to_date", "to_timestamp",
     "boolean", "integer", "bigint", "numeric", "decimal", "float", "double", "text", "varchar",
-    # Palabras en español comunes del prompt/contexto
+    # Español / contexto
     "el", "la", "los", "las", "un", "una", "unos", "unas", "del", "al", "por", "para",
     "con", "sin", "sobre", "entre", "desde", "hasta", "cada", "cual", "como", "más",
     "consulta", "query", "columnas", "columna", "rows", "filas", "vista", "tabla",
@@ -141,25 +140,44 @@ SQL_RESERVED_WORDS = {
 }
 
 
-def _extract_sql_identifiers(sql: str) -> List[str]:
-    """Extrae identificadores reales de un SQL usando sqlparse."""
+def _extract_aliases(sql: str) -> Set[str]:
+    """Extrae alias locales definidos con AS para no validarlos como columnas."""
+    aliases = set()
+    for match in re.finditer(r"\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", sql, re.IGNORECASE):
+        aliases.add(_normalize(match.group(1)))
+    return aliases
+
+
+def _extract_sql_identifiers(sql: str, ignore_names: Set[str]) -> List[str]:
+    """
+    Extrae identificadores reales de un SQL usando sqlparse.
+    Ignora puntuación, operadores, strings, números, comentarios, palabras reservadas,
+    el esquema 'semantic', nombres de vistas y alias locales.
+    """
     identifiers = []
     parsed = sqlparse.parse(sql)
+
     for statement in parsed:
         for token in statement.flatten():
             if token.is_whitespace:
                 continue
-            if token.ttype in (T.String.Single, T.String.Symbol, T.Number, T.Number.Integer, T.Number.Float):
+
+            # Solo nos interesan nombres/identificadores
+            if token.ttype not in T.Name and token.ttype not in T.Literal.String.Symbol:
                 continue
-            if token.ttype in T.Comment:
-                continue
+
             value = token.value.strip('"').strip("'").strip()
             normalized = _normalize(value)
+
             if not normalized:
                 continue
             if normalized in SQL_RESERVED_WORDS:
                 continue
+            if normalized in ignore_names:
+                continue
+
             identifiers.append(normalized)
+
     return identifiers
 
 
@@ -168,27 +186,47 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
     if not used_views:
         return True, ""
 
-    all_identifiers = _extract_sql_identifiers(sql)
+    # Normalizar vistas a semantic.nombre_vista
+    used_views = [
+        v if v.startswith("semantic.") else f"semantic.{v}"
+        for v in used_views
+    ]
 
-    for view_name in used_views:
-        invalid_cols = []
-        seen_invalid = set()
-        for col in all_identifiers:
-            if col in seen_invalid:
-                continue
-            if not _column_exists_in_view(view_name, col):
-                invalid_cols.append(col)
-                seen_invalid.add(col)
+    # Construir conjunto de nombres a ignorar: vistas + esquema
+    ignore_names = SQL_RESERVED_WORDS.copy()
+    ignore_names.add("semantic")
+    for view in used_views:
+        clean = view.replace("semantic.", "").strip()
+        ignore_names.add(clean)
+        ignore_names.add(_normalize(clean))
 
-        if invalid_cols:
-            clean_view = view_name.replace("semantic.", "")
-            view_info = _biz_mem.get_view(clean_view)
-            available = list(view_info.metricas.keys()) + view_info.columnas_fecha if view_info else []
-            return False, (
-                f"ERROR_INSALVABLE: La vista '{view_name}' no contiene las columnas "
-                f"{invalid_cols}. Columnas VÁLIDAS: {available}. "
-                f"No intentes 'corregir' usando otra columna."
-            )
+    # Alias locales (ej: SUM(ventas) AS total_ventas)
+    aliases = _extract_aliases(sql)
+    ignore_names.update(aliases)
+
+    all_identifiers = _extract_sql_identifiers(sql, ignore_names)
+
+    invalid_cols = []
+    seen_invalid = set()
+    for col in all_identifiers:
+        if col in seen_invalid:
+            continue
+        exists_in_any_view = any(_column_exists_in_view(view, col) for view in used_views)
+        if not exists_in_any_view:
+            invalid_cols.append(col)
+            seen_invalid.add(col)
+
+    if invalid_cols:
+        # Reportar las columnas válidas de la primera vista usada
+        first_view = used_views[0]
+        clean_view = first_view.replace("semantic.", "")
+        view_info = _biz_mem.get_view(clean_view)
+        available = list(view_info.metricas.keys()) + view_info.columnas_fecha if view_info else []
+        return False, (
+            f"ERROR_INSALVABLE: La vista '{first_view}' no contiene las columnas "
+            f"{invalid_cols}. Columnas VÁLIDAS: {available}. "
+            f"No intentes 'corregir' usando otra columna."
+        )
 
     return True, ""
 
