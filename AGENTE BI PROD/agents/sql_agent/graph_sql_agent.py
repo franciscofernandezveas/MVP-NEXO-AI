@@ -1,7 +1,7 @@
 import re
 import json
 import logging
-from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple, Set
+from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple
 from typing_extensions import TypedDict
 
 import sqlparse
@@ -15,12 +15,9 @@ from core.database import execute_sql_query
 from core.contracts import SQLContract
 from core.sql_utils import extract_views_used
 
-# ============================================================
-# NUEVO: Seguridad basada en catálogo semántico (AGENTS.md)
-# ============================================================
+# Seguridad basada en catálogo semántico (AGENTS.md)
 from core.harness import BusinessMemory, is_view_allowed
 
-# Cargar catálogo semántico una sola vez al importar el módulo
 _biz_mem = BusinessMemory.from_file()
 
 logger = logging.getLogger("bi_orchestrator")
@@ -43,7 +40,6 @@ class SQLAgentState(TypedDict):
 
 
 def _normalize(text: str) -> str:
-    """Normaliza texto para comparación flexible de columnas."""
     if not text:
         return ""
     return (
@@ -59,18 +55,12 @@ def _normalize(text: str) -> str:
 
 
 def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
-    """
-    Construye un catálogo estructurado de vistas permitidas con sus columnas.
-    Incluye métricas y dimensiones/documentación para que el agente no alucine columnas.
-    """
     catalog: Dict[str, Any] = {}
-
     for view_full_name in allowed_views:
         view_name = view_full_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(view_name)
         if not view_info:
             continue
-
         catalog[view_full_name] = {
             "tipo": view_info.tipo,
             "descripcion": view_info.descripcion,
@@ -80,15 +70,10 @@ def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
             "columnas_fecha": view_info.columnas_fecha,
             "notas": view_info.notas,
         }
-
     return catalog
 
 
 def _column_exists_in_view(view_name: str, column_name: str) -> bool:
-    """
-    Verifica si una columna existe en la vista (métrica o columna de fecha/documentada).
-    Soporta coincidencia flexible.
-    """
     clean_view = view_name.replace("semantic.", "").strip()
     view_info = _biz_mem.get_view(clean_view)
     if not view_info:
@@ -98,16 +83,13 @@ def _column_exists_in_view(view_name: str, column_name: str) -> bool:
     if not requested:
         return False
 
-    # Métricas y columnas documentadas
-    available_cols: List[str] = list(view_info.metricas.keys()) + view_info.columnas_fecha
+    available_cols = list(view_info.metricas.keys()) + view_info.columnas_fecha
     available_normalized = [_normalize(c) for c in available_cols]
 
-    # Coincidencia exacta o subcadura
     for avail in available_normalized:
         if requested == avail or requested in avail or avail in requested:
             return True
 
-    # Mapeos semánticos comunes
     semantic_map = {
         "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku"],
         "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"],
@@ -131,7 +113,7 @@ def _column_exists_in_view(view_name: str, column_name: str) -> bool:
 
 
 # ============================================================
-# NUEVO: Extractor real de columnas con sqlparse
+# PARSER DE IDENTIFICADORES CON sqlparse
 # ============================================================
 SQL_RESERVED_WORDS = {
     "select", "from", "where", "group", "by", "order", "having", "join",
@@ -141,27 +123,26 @@ SQL_RESERVED_WORDS = {
     "cast", "case", "when", "then", "else", "end", "sum", "count", "avg",
     "min", "max", "over", "partition", "row_number", "rank", "dense_rank",
     "true", "false", "date", "interval", "extract", "to_char", "now", "current_date",
-    # Palabras en español que aparecían como falsos positivos
-    "el", "la", "los", "las", "un", "una", "del", "al", "por", "para",
-    "con", "sin", "sobre", "entre", "desde", "hasta", "cada", "cual",
-    "consulta", "query", "columnas", "columna", "rows", "filas", "vista",
-    "tabla", "contiene", "contienen", "todas", "todos", "requeridas", "requerido",
+    "coalesce", "nullif", "greatest", "least", "round", "trunc", "floor", "ceil",
+    "upper", "lower", "trim", "concat", "substring", "length", "replace",
+    "year", "month", "day", "week", "quarter", "to_date", "to_timestamp",
+    "boolean", "integer", "bigint", "numeric", "decimal", "float", "double", "text", "varchar",
+    # Palabras en español comunes del prompt/contexto
+    "el", "la", "los", "las", "un", "una", "unos", "unas", "del", "al", "por", "para",
+    "con", "sin", "sobre", "entre", "desde", "hasta", "cada", "cual", "como", "más",
+    "consulta", "query", "columnas", "columna", "rows", "filas", "vista", "tabla",
+    "contiene", "contienen", "todas", "todos", "requeridas", "requerido",
     "elegida", "elegido", "utilizando", "usando", "porque", "razon", "razón",
-    "error_message", "reasoning", "reason_for_view_choice", "allowed_views",
-    "preferred_view", "semantic_context_used", "query_confidence", "schema_used",
-    "can_answer", "needs_followup", "warnings", "junio", "julio", "agosto",
-    "diario", "semanal", "mensual", "anual", "desagregado", "total", "ventas",
-    "total_ventas", "calcula", "agrupando", "sumando", "rango", "fechas",
-    "especificado", "especificada", "especificados", "especificadas", "que",
-    "la", "del", "al",
+    "junio", "julio", "agosto", "diario", "semanal", "mensual", "anual",
+    "desagregado", "total", "ventas", "total_ventas", "calcula", "agrupando",
+    "sumando", "rango", "fechas", "especificado", "especificada", "que",
+    "este", "esta", "estos", "estas", "ese", "esa", "esos", "esas",
+    "y", "o", "u", "ni", "pero", "aunque", "sino", "además", "también", "tambien",
 }
 
 
 def _extract_sql_identifiers(sql: str) -> List[str]:
-    """
-    Extrae identificadores reales de un SQL usando sqlparse.
-    Ignora palabras reservadas, funciones, literales y alias comunes.
-    """
+    """Extrae identificadores reales de un SQL usando sqlparse."""
     identifiers = []
     parsed = sqlparse.parse(sql)
     for statement in parsed:
@@ -178,18 +159,11 @@ def _extract_sql_identifiers(sql: str) -> List[str]:
                 continue
             if normalized in SQL_RESERVED_WORDS:
                 continue
-            # Ignorar funciones agregadas conocidas (ya están en reserved)
-            if normalized in SQL_RESERVED_WORDS:
-                continue
             identifiers.append(normalized)
     return identifiers
 
 
 def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
-    """
-    Valida que todas las columnas usadas en el SQL existan en las vistas documentadas.
-    Devuelve (is_valid, error_message).
-    """
     used_views = extract_views_used(sql)
     if not used_views:
         return True, ""
@@ -198,9 +172,13 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
 
     for view_name in used_views:
         invalid_cols = []
+        seen_invalid = set()
         for col in all_identifiers:
+            if col in seen_invalid:
+                continue
             if not _column_exists_in_view(view_name, col):
                 invalid_cols.append(col)
+                seen_invalid.add(col)
 
         if invalid_cols:
             clean_view = view_name.replace("semantic.", "")
@@ -216,10 +194,6 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
 
 
 def _sanitize_messages(messages: List[Any]) -> List[Any]:
-    """
-    Elimina/reemplaza respuestas anteriores que sean JSON puro,
-    para evitar que el modelo las imite en el siguiente intento.
-    """
     cleaned = []
     for m in messages:
         if isinstance(m, AIMessage) and isinstance(getattr(m, "content", ""), str):
@@ -251,7 +225,6 @@ def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
 def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
     preferred = state.get("preferred_view")
     allowed = state.get("allowed_views", [])
-
     catalogo_detallado = _build_sql_catalog(allowed)
 
     system = SystemMessage(content=f"""
@@ -318,7 +291,6 @@ ERROR PREVIO:
 """
     human = HumanMessage(content=ctx)
 
-    # Sanitizar historial y truncar
     messages = _sanitize_messages(state.get("messages", []))
     if len(messages) > 4:
         messages = messages[-4:]
@@ -327,9 +299,7 @@ ERROR PREVIO:
     response = LLM.invoke([system] + messages + [human])
     content = response.content.strip()
 
-    # ============================================================
-    # RECHAZAR JSON EXPLÍCITO
-    # ============================================================
+    # Rechazar JSON explícito
     if content.startswith("{") and content.endswith("}"):
         logger.warning("[SQL] Modelo devolvió JSON en lugar de SQL: %s", content[:300])
         return {
@@ -339,9 +309,7 @@ ERROR PREVIO:
             "messages": messages + [AIMessage(content="[SQL] Error: respuesta fue JSON, no SQL")]
         }
 
-    # ============================================================
-    # EXIGIR BLOQUE SQL EXPLÍCITO
-    # ============================================================
+    # Exigir bloque SQL explícito
     match = re.search(r"```sql\s*(.*?)\s*```", content, re.DOTALL | re.IGNORECASE)
     if not match:
         logger.warning("[SQL] No se encontró bloque SQL en la respuesta: %s", content[:300])
@@ -354,7 +322,6 @@ ERROR PREVIO:
 
     sql_extracted = match.group(1).strip()
 
-    # Asegurar que sea un SELECT
     if not re.search(r'^\s*SELECT\b', sql_extracted, re.IGNORECASE):
         return {
             "generated_sql": "",
@@ -400,9 +367,7 @@ ERROR PREVIO:
                 "messages": messages + [response, AIMessage(content=f"[SQL] {err_msg}")]
             }
 
-    # ============================================================
-    # VALIDACIÓN DE COLUMNAS CON sqlparse
-    # ============================================================
+    # Validación de columnas con sqlparse
     is_valid, column_error = _validate_columns_in_sql(sql_extracted)
     if not is_valid:
         logger.warning(f"[SQL] {column_error}")
@@ -445,15 +410,10 @@ def sql_execute_query(state: SQLAgentState) -> Dict[str, Any]:
 
 
 def _is_recoverable_db_error(error: str) -> bool:
-    """
-    Determina si un error de DB justifica un reintento.
-    Errores de formato del modelo o insalvables NO se reintentan.
-    """
     if not error:
         return False
     e = error.lower()
 
-    # NO recuperable: el modelo devolvió JSON, no encontró bloque SQL, o es insalvable
     if any(x in e for x in [
         "json en lugar de sql",
         "no se encontró bloque sql",
@@ -463,15 +423,12 @@ def _is_recoverable_db_error(error: str) -> bool:
     ]):
         return False
 
-    # Errores de columna: recoverable si el prompt tiene catálogo
     if "column" in e and "does not exist" in e:
         return True
 
-    # Errores de sintaxis u operadores: recoverable
     if any(x in e for x in ["syntax error", "invalid input syntax", "operator does not exist", "ambiguous column"]):
         return True
 
-    # Errores de tabla/vista: no recoverable
     if any(x in e for x in ["relation", "undefined_table"]) and "column" not in e:
         return False
 
@@ -479,10 +436,6 @@ def _is_recoverable_db_error(error: str) -> bool:
 
 
 def _enrich_error_with_valid_columns(error: str, sql: str) -> str:
-    """
-    Si el error es UndefinedColumn, enriquece el mensaje con las columnas válidas
-    de la vista afectada para que el reintento tenga contexto claro.
-    """
     if not error or "UndefinedColumn" not in error:
         return error
 
@@ -518,7 +471,6 @@ def sql_validate_and_package(state: SQLAgentState) -> Dict[str, Any]:
     reason = ""
     needs_followup = False
 
-    # Enriquecer error de columna con columnas válidas para el reintento
     if err and "UndefinedColumn" in err:
         err = _enrich_error_with_valid_columns(err, sql)
 
