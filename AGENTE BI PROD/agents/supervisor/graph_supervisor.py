@@ -54,10 +54,10 @@ def _validate_plan_against_catalog(
             return False, f"Tarea {task.task_id}: la vista '{pv}' no existe en el catálogo."
 
         available_cols = set(
-            view_def.get("metricas", [])
-            + view_def.get("dimensiones", [])
-            + view_def.get("columnas_fecha", [])
-            + view_def.get("columnas", [])
+            (view_def.get("metricas") or [])
+            + (view_def.get("dimensiones") or [])
+            + (view_def.get("columnas_fecha") or [])
+            + (view_def.get("columnas") or [])
         )
 
         required_cols = set(
@@ -494,7 +494,7 @@ Devuelve SupervisorDecision con:
             logger.warning("[Supervisor] Guardrail post-LLM: FINISH sin datos ejecutados. Forzando sql_agent.")
             decision = SupervisorDecision(
                 reasoning="FINISH elegido sin datos. Se ejecuta SQL primero.",
-                next_agent": "sql_agent",
+                next_agent="sql_agent",
             )
 
     # Limpiar feedbacks que no corresponden
