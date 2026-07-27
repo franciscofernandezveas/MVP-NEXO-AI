@@ -7,6 +7,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from core.llm import LLM
 from core.contracts import PlannerContract, SQLPayload, FilterClause
 from core.harness import BusinessMemory
+from core.database import get_semantic_schema_for_views, get_semantic_schema_info
 
 logger = logging.getLogger(__name__)
 
@@ -210,10 +211,54 @@ def _find_compatible_view(task, catalog: Dict[str, Any], allowed_views: List[str
     return None
 
 
+# ------------------------------------------------------------------
+# NUEVO: Fuerza preferred_view del harness en las tareas
+# ------------------------------------------------------------------
+def _ensure_preferred_view_from_harness(
+    contract: PlannerContract,
+    preferred_view: Optional[str]
+) -> PlannerContract:
+    """
+    Si el harness indica una vista preferida, fuerza que todas las tareas
+    la consideren como preferred_view (si aplica) y que esté en candidate_views.
+    """
+    if not preferred_view:
+        return contract
+
+    clean_pref = (
+        preferred_view
+        if preferred_view.startswith("semantic.")
+        else f"semantic.{preferred_view}"
+    )
+
+    for task in contract.tasks:
+        # Asegurar que candidate_views incluya la vista preferida del harness
+        if clean_pref not in (task.candidate_views or []):
+            task.candidate_views = list(task.candidate_views or []) + [clean_pref]
+
+        # Si la tarea no tiene preferred_view, usar la del harness
+        if not task.preferred_view:
+            task.preferred_view = clean_pref
+            logger.info(f"[Planner] Asignando preferred_view del harness: {clean_pref}")
+            continue
+
+        # Si la tarea ya tiene otra preferred_view, priorizar la del harness
+        current = task.preferred_view
+        if current != clean_pref:
+            logger.info(
+                f"[Planner] preferred_view existente '{current}' será reemplazada por "
+                f"la del harness '{clean_pref}'"
+            )
+            task.preferred_view = clean_pref
+
+    return contract
+
+
 def _build_planner_system_prompt(
     view_catalog: Dict[str, Any],
     business_memory: Any,
-    preferred_view: Optional[str]
+    preferred_view: Optional[str],
+    schema_info: str
 ) -> str:
     view_catalog_str = json.dumps(view_catalog, indent=2, ensure_ascii=False)
 
@@ -278,9 +323,30 @@ Eres un Planner BI avanzado. Tu trabajo es transformar una pregunta de negocio e
 === CATÁLOGO DE VISTAS PERMITIDAS ===
 {view_catalog_str}
 
+=== SCHEMA TÉCNICO REAL (DDL de PostgreSQL) ===
+{schema_info}
+
 === MEMORIA DE REGLAS DE NEGOCIO ===
 {business_memory_str}
 {preferred_view_instruction}
+
+=== REGLAS DE MAPEO SEMÁNTICO (muy importantes) ===
+- Las métricas y dimensiones que detectes del usuario son CONCEPTUALES.
+- Debes encontrar la columna FÍSICA equivalente en la vista elegida usando el SCHEMA TÉCNICO.
+- Ejemplos de mapeos comunes (no exhaustivos):
+  * "ventas" puede mapear a: ventas, venta_total, total_ventas, monto, ingreso...
+  * "unidades" puede mapear a: unidades, unidades_totales, cantidad...
+  * "sede" puede mapear a: sucursal, nombre_sede, local, tienda...
+  * "producto" puede mapear a: producto, nombre_producto, descripcion...
+  * "fecha" puede mapear a: fecha, fecha_completa, fecha_venta...
+- NO exijas nombres exactos entre vistas. Cada vista puede llamar distinto a una misma métrica.
+- Si el usuario pide "ventas por sede" y la vista elegida tiene `venta_total` + `nombre_sede`, eso es válido.
+
+=== REGLA DE SELECCIÓN DE VISTA ===
+1. Si `preferred_view` del contexto tiene todas las métricas/dimensiones necesarias, úsala como `preferred_view`.
+2. Si no, elige la vista más específica de `allowed_views` que resuelva todo.
+3. La vista debe tener una columna física para CADA métrica y dimensión solicitada.
+4. Si ninguna vista lo tiene todo, marca `needs_followup=true` con una pregunta clara.
 
 === DEFINICIONES ===
 - "ventas_normales": ventas, facturación, ticket, unidades vendidas, revenue, ingresos.
@@ -323,6 +389,7 @@ Devuelve ÚNICAMENTE JSON válido con esta estructura exacta:
 """
     return prompt_template.format(
         view_catalog_str=view_catalog_str,
+        schema_info=schema_info,
         business_memory_str=business_memory_str,
         preferred_view_instruction=preferred_view_instruction,
         preferred_view_rule=f"IMPORTANTE: Si el harness indica preferred_view='{preferred_view}' y esa vista cubre todo, ÚSALA como preferred_view." if preferred_view else "Elige preferred_view según el algoritmo.",
@@ -370,6 +437,23 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 AIMessage(content="[Planner] Error: no hay vistas de datos disponibles.")
             ]
         }
+
+    # ================================================================
+    # Carga schema técnico real
+    # ================================================================
+    schema_info = state.get("schema_info", "")
+    if not schema_info.strip():
+        try:
+            schema_info = get_semantic_schema_for_views(allowed_views)
+            if not schema_info.strip():
+                schema_info = get_semantic_schema_info(max_objects=30)
+        except Exception as e:
+            logger.warning(f"[Planner] Error cargando schema: {e}")
+            try:
+                schema_info = get_semantic_schema_info(max_objects=30)
+            except Exception as e2:
+                logger.warning(f"[Planner] Error schema completo: {e2}")
+                schema_info = "-- Schema no disponible"
 
     # ================================================================
     # PRIORIDAD MÁXIMA: Detección de demand forecast
@@ -472,7 +556,8 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     system_prompt = _build_planner_system_prompt(
         view_catalog,
         business_memory,
-        harness.get("preferred_view")
+        harness.get("preferred_view"),
+        schema_info
     )
 
     system = SystemMessage(content=system_prompt)
@@ -485,6 +570,11 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
         plan = PlannerContract(**plan_raw)
     else:
         plan = plan_raw
+
+    # ============================================================
+    # NUEVO: Forzar preferred_view del harness
+    # ============================================================
+    plan = _ensure_preferred_view_from_harness(plan, harness.get("preferred_view"))
 
     # ============================================================
     # VALIDACIÓN DE INTEGRIDAD POST-LLM

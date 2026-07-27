@@ -87,6 +87,7 @@ class PlannerContract(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def ensure_followup_question(cls, data: Any) -> Any:
+        """Si necesita seguimiento, asegura que exista una pregunta."""
         if isinstance(data, dict):
             needs_followup = data.get("needs_followup", False)
             followup_question = data.get("followup_question")
@@ -98,13 +99,18 @@ class PlannerContract(BaseModel):
         return data
 
     @model_validator(mode="after")
-    def preferred_view_consistency(self):
+    def structural_checks(self):
+        """Solo validaciones estructurales. No validamos nombres de columnas."""
         for task in self.tasks:
-            if task.preferred_view and task.candidate_views and task.preferred_view not in task.candidate_views:
-                # Auto-corrige si la preferida no está en candidatas: añadirla
-                task.candidate_views.append(task.preferred_view)
+            if task.preferred_view and task.candidate_views:
+                clean_pref = (
+                    task.preferred_view
+                    if task.preferred_view.startswith("semantic.")
+                    else f"semantic.{task.preferred_view}"
+                )
+                if clean_pref not in task.candidate_views:
+                    task.candidate_views.append(clean_pref)
         return self
-
 
 
 # ------------------------------------------------------------------
