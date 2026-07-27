@@ -210,7 +210,11 @@ def _find_compatible_view(task, catalog: Dict[str, Any], allowed_views: List[str
     return None
 
 
-def _build_planner_system_prompt(view_catalog: Dict[str, Any], business_memory: Any) -> str:
+def _build_planner_system_prompt(
+    view_catalog: Dict[str, Any],
+    business_memory: Any,
+    preferred_view: Optional[str]
+) -> str:
     view_catalog_str = json.dumps(view_catalog, indent=2, ensure_ascii=False)
 
     business_memory_str = (
@@ -218,12 +222,20 @@ def _build_planner_system_prompt(view_catalog: Dict[str, Any], business_memory: 
         if business_memory else "No hay reglas de negocio adicionales."
     )
 
-    # Ejemplo de salida en string plano para evitar problemas con f-string
+    preferred_view_instruction = ""
+    if preferred_view:
+        preferred_view_instruction = f"""
+=== VISTA PREFERIDA DEL HARNESS ===
+{preferred_view}
+
+REGLA IMPORTANTE: Si la vista preferida de arriba contiene TODAS las columnas requeridas por la pregunta (métricas, dimensiones y filtros), entonces preferred_view DEBE ser {preferred_view} y candidate_views DEBE incluir {preferred_view} como primera opción.
+"""
+
     example_output = json.dumps({
         "intent": "consultar ventas por sede del mes pasado",
         "goal": "Obtener el total de ventas desagregado por sede para abril",
         "question_type": "single_kpi",
-        "metrics": ["monto_total"],
+        "metrics": ["venta_total"],
         "dimensions": ["nombre_sede"],
         "filters": [
             {"column": "nombre_sede", "operator": "ILIKE", "value": "merced", "reasoning": "Filtro por sede específica usando ILIKE"}
@@ -242,7 +254,7 @@ def _build_planner_system_prompt(view_catalog: Dict[str, Any], business_memory: 
             {
                 "task_id": "t1",
                 "task": "Calcular total de ventas por sede para abril 2024",
-                "metrics": ["monto_total"],
+                "metrics": ["venta_total"],
                 "dimensions": ["nombre_sede"],
                 "filters": [{"column": "nombre_sede", "operator": "ILIKE", "value": "merced"}],
                 "date_range": {"start": "2024-04-01", "end": "2024-04-30", "grain": "month", "relative_label": "last_month"},
@@ -268,6 +280,7 @@ Eres un Planner BI avanzado. Tu trabajo es transformar una pregunta de negocio e
 
 === MEMORIA DE REGLAS DE NEGOCIO ===
 {business_memory_str}
+{preferred_view_instruction}
 
 === DEFINICIONES ===
 - "ventas_normales": ventas, facturación, ticket, unidades vendidas, revenue, ingresos.
@@ -283,6 +296,7 @@ Eres un Planner BI avanzado. Tu trabajo es transformar una pregunta de negocio e
    - Si no hay período, asume last_30_days.
 3. Selecciona candidate_views: una vista solo es candidata si contiene EXACTAMENTE todas las columnas de metrics, dimensions y filters.
 4. Elige preferred_view: la primera de candidate_views que cubra todo. preferred_view DEBE estar en candidate_views.
+   {preferred_view_rule}
 5. Determina question_type: single_kpi | multi_kpi | comparison | trend | lookup | deep_research | demand_forecast | unknown.
 6. Descompón en múltiples SQLPayload solo si la pregunta mezcla:
    - KPIs de distinta naturaleza (ventas + canjes),
@@ -310,6 +324,8 @@ Devuelve ÚNICAMENTE JSON válido con esta estructura exacta:
     return prompt_template.format(
         view_catalog_str=view_catalog_str,
         business_memory_str=business_memory_str,
+        preferred_view_instruction=preferred_view_instruction,
+        preferred_view_rule=f"IMPORTANTE: Si el harness indica preferred_view='{preferred_view}' y esa vista cubre todo, ÚSALA como preferred_view." if preferred_view else "Elige preferred_view según el algoritmo.",
         example_output=example_output
     )
 
@@ -327,6 +343,11 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"[Planner] ambiguity_notes={ambiguity_notes}")
     logger.info(f"[Planner] preferred_view={harness.get('preferred_view')}")
 
+    # ================================================================
+    # Catálogo disponible para todo el grafo
+    # ================================================================
+    view_catalog = _build_view_catalog(allowed_views)
+
     if not allowed_views:
         logger.error("[Planner] ERROR CRÍTICO: allowed_views está vacío. El harness no cargó vistas.")
         plan = PlannerContract(
@@ -343,6 +364,7 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {
             "plan": plan,
+            "view_catalog": view_catalog,
             "last_agent": "planner",
             "messages": state.get("messages", []) + [
                 AIMessage(content="[Planner] Error: no hay vistas de datos disponibles.")
@@ -375,6 +397,7 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     followup_reason="Necesito que especifiques el producto y la sede para generar el pronóstico de demanda."
                 ),
                 "forecast_request": None,
+                "view_catalog": view_catalog,
                 "last_agent": "planner",
                 "messages": state.get("messages", []) + [
                     AIMessage(content="[Planner] Pregunta de predicción de demanda detectada. Necesito producto y sede.")
@@ -406,6 +429,7 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "n_dias": n_dias,
                 "fecha_inicio": params.get("fecha_inicio"),
             },
+            "view_catalog": view_catalog,
             "last_agent": "planner",
             "messages": state.get("messages", []) + [
                 AIMessage(
@@ -433,6 +457,7 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
         )
         return {
             "plan": plan,
+            "view_catalog": view_catalog,
             "last_agent": "planner",
             "messages": state.get("messages", []) + [
                 AIMessage(content=f"[Planner] Ambigüedad detectada: {plan.followup_reason}")
@@ -442,10 +467,13 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # ================================================================
     # Planificación normal de consultas SQL
     # ================================================================
-    view_catalog = _build_view_catalog(allowed_views)
     business_memory = harness.get("business_memory", {})
 
-    system_prompt = _build_planner_system_prompt(view_catalog, business_memory)
+    system_prompt = _build_planner_system_prompt(
+        view_catalog,
+        business_memory,
+        harness.get("preferred_view")
+    )
 
     system = SystemMessage(content=system_prompt)
     human = HumanMessage(content=f"Pregunta del usuario: {question}")
@@ -535,6 +563,7 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     return {
         "plan": plan,
+        "view_catalog": view_catalog,
         "last_agent": "planner",
         "messages": state.get("messages", []) + [
             AIMessage(

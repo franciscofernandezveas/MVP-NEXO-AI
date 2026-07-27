@@ -17,20 +17,43 @@ from agents.viz_approval.graph_viz_approval import viz_approval_node
 from agents.research.research_node import make_research_node
 # NOTE: run_forecast se importa lazy dentro de forecaster_node
 from core.llm import LLM
-from core.contracts import SQLContract
+from core.contracts import SQLContract, FilterClause
 
-from core.harness import build_harness_context, build_harness_context_cached, _normalize_question
+from core.harness import build_harness_context, build_harness_context_cached, _normalize_question, BusinessMemory
 from core.database import get_semantic_schema_for_views
 
 from langsmith import traceable
 
 logger = logging.getLogger(__name__)
 
+_biz_mem = BusinessMemory.from_file()
+
+
+def _build_view_catalog(allowed_views: List[str]) -> Dict[str, Any]:
+    """Construye el catálogo semántico para todas las vistas permitidas."""
+    catalog: Dict[str, Any] = {}
+    for view_full_name in allowed_views:
+        view_name = view_full_name.replace("semantic.", "").strip()
+        view_info = _biz_mem.get_view(view_name)
+        if not view_info:
+            continue
+        catalog[view_full_name] = {
+            "tipo": view_info.tipo,
+            "descripcion": view_info.descripcion,
+            "granularidad": view_info.granularidad,
+            "filtro_fecha": view_info.filtro_fecha,
+            "metricas": list(view_info.metricas.keys()),
+            "columnas_fecha": view_info.columnas_fecha,
+            "notas": view_info.notas,
+        }
+    return catalog
+
 
 class OrchestratorState(TypedDict):
     question: str
     messages: Annotated[List[BaseMessage], add_messages]
     plan: Optional[Any]
+    view_catalog: Optional[Dict[str, Any]]  # <-- NUEVO: catálogo semántico para validación
     sql_results: List[Any]
     viz_result: Optional[Any]
     viz_approved: Optional[bool]
@@ -48,22 +71,30 @@ class OrchestratorState(TypedDict):
     forecast_request: Optional[Dict[str, Any]]
     forecast_results: Optional[List[Dict[str, Any]]]
     forecast_error: Optional[str]
+    feedback_to_planner: Optional[str]  # <-- NUEVO: feedback del supervisor al planner
+    feedback_to_sql_agent: Optional[str]  # <-- NUEVO: feedback del supervisor al sql_agent
+    planner_validation_error: Optional[str]  # <-- NUEVO: contexto de error para el analyst
 
 
 @traceable(name="Orchestrator: Build Harness Context")
 def build_harness_context_node(state: Dict[str, Any]) -> Dict[str, Any]:
     harness = build_harness_context_cached(_normalize_question(state["question"]))
+    allowed_views = harness.get("allowed_views", [])
+    
+    # Construir catálogo semántico para que todo el grafo lo use
+    view_catalog = _build_view_catalog(allowed_views)
 
     return {
         "harness_context": harness,
+        "view_catalog": view_catalog,
         "semantic_context": harness.get("semantic_context", ""),
-        "allowed_views": harness.get("allowed_views", []),
+        "allowed_views": allowed_views,
         "preferred_view": harness.get("preferred_view"),
         "schema_info": "",
         "messages": state.get("messages", []) + [
             AIMessage(
                 content=f"[Harness] Preferred: {harness.get('preferred_view')} | "
-                        f"Allowed: {harness.get('allowed_views')} | "
+                        f"Allowed: {allowed_views} | "
                         f"Ambiguity: {harness.get('ambiguity_notes')}"
             )
         ]
@@ -80,7 +111,7 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
             "sql_results": [SQLContract(
                 status="error",
                 error_message="SQL Agent llamado sin plan previo.",
-                can_answer=True
+                can_answer=False
             )],
             "last_agent": "sql_agent",
             "messages": [AIMessage(content="[SQL Agent] Error: sin plan previo")]
@@ -95,7 +126,7 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
             "sql_results": [SQLContract(
                 status="error",
                 error_message="El plan no contiene tareas SQL.",
-                can_answer=True
+                can_answer=False
             )],
             "last_agent": "sql_agent",
             "messages": [AIMessage(content="[SQL Agent] Plan sin tareas SQL.")]
@@ -107,7 +138,7 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
 
     for idx, task in enumerate(tasks):
         logger.info(f"[SQL Agent Wrapper] Ejecutando tarea {idx + 1}/{len(tasks)}")
-        payload = task.dict() if hasattr(task, "dict") else dict(task)
+        payload = task.model_dump() if hasattr(task, "model_dump") else task.dict() if hasattr(task, "dict") else dict(task)
 
         candidate_views = getattr(task, "candidate_views", None) or state.get("allowed_views", [])
         preferred = getattr(task, "preferred_view", None) or state.get("preferred_view")
@@ -192,10 +223,21 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    if not state.get("sql_results"):
+        return {
+            "viz_result": None,
+            "last_agent": "viz_agent",
+            "messages": [AIMessage(content="[Viz Agent] Sin resultados SQL para visualizar")]
+        }
+
+    first_result = state["sql_results"][0]
+    rows = getattr(first_result, "rows", []) if first_result else []
+    columns = getattr(first_result, "columns", []) if first_result else []
+
     viz_input = {
         "question": state["question"],
-        "sql_rows": state["sql_results"][0].rows if state["sql_results"] and len(state["sql_results"]) > 0 else [],
-        "sql_columns": state["sql_results"][0].columns if state["sql_results"] and len(state["sql_results"]) > 0 else [],
+        "sql_rows": rows,
+        "sql_columns": columns,
         "chart_type_hint": getattr(state.get("plan"), "chart_type_hint", "auto"),
         "messages": [],
         "figure_spec": None,
@@ -206,7 +248,7 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     viz_result = VIZ_SUBGRAPH.invoke(viz_input)
     return {
-        "viz_result": viz_result["contract"],
+        "viz_result": viz_result.get("contract") if isinstance(viz_result, dict) else None,
         "last_agent": "viz_agent",
         "messages": [AIMessage(content="[Viz Agent] Especificación de visualización generada")]
     }
@@ -214,7 +256,6 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 @traceable(name="Orchestrator: Execute Demand Forecast")
 def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    # Lazy import: solo carga forecasting cuando realmente se usa
     from agents.forecasting_agent.graph_demand_forecaster import run_forecast
 
     logger.info(f"[Forecaster] Estado recibido. forecast_request={state.get('forecast_request')}")
@@ -222,18 +263,36 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     request = state.get("forecast_request")
 
+    # Fallback: extraer desde plan.filters (ahora List[FilterClause])
     if not request:
         plan = state.get("plan")
         if plan and getattr(plan, "question_type", None) == "demand_forecast":
-            filters = getattr(plan, "filters", "")
+            filters = getattr(plan, "filters", [])
             producto = None
             sede = None
-            for part in filters.split(","):
-                part = part.strip()
-                if part.startswith("producto="):
-                    producto = part.split("=", 1)[1].strip()
-                elif part.startswith("sede="):
-                    sede = part.split("=", 1)[1].strip()
+            
+            if isinstance(filters, list):
+                for f in filters:
+                    if isinstance(f, FilterClause):
+                        col = f.column.lower()
+                        if col in ["producto", "nombre_producto"]:
+                            producto = f.value
+                        elif col in ["sede", "nombre_sede", "sucursal", "local"]:
+                            sede = f.value
+                    elif isinstance(f, dict):
+                        col = f.get("column", "").lower()
+                        if col in ["producto", "nombre_producto"]:
+                            producto = f.get("value")
+                        elif col in ["sede", "nombre_sede", "sucursal", "local"]:
+                            sede = f.get("value")
+            elif isinstance(filters, str):
+                # backwards compatibility
+                for part in filters.split(","):
+                    part = part.strip()
+                    if part.startswith("producto="):
+                        producto = part.split("=", 1)[1].strip()
+                    elif part.startswith("sede="):
+                        sede = part.split("=", 1)[1].strip()
 
             if producto and sede:
                 logger.info(f"[Forecaster] Fallback desde plan: {producto} @ {sede}")
@@ -244,6 +303,7 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     "fecha_inicio": None,
                 }
 
+    # Fallback desde pregunta
     if not request:
         question = state["question"].lower()
         sedes = ["plaza bolsillo", "merced", "tajamar", "persa victor manuel"]
