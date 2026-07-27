@@ -60,7 +60,6 @@ class SQLPayload(BaseModel):
 # ------------------------------------------------------------------
 # PLANNER
 # ------------------------------------------------------------------
-
 class PlannerContract(BaseModel):
     """Contrato del planner con soporte para demand forecast."""
     intent: str
@@ -85,14 +84,27 @@ class PlannerContract(BaseModel):
     followup_reason: Optional[str] = Field(default=None)
     followup_question: Optional[str] = Field(default=None)
 
+    @model_validator(mode="before")
+    @classmethod
+    def ensure_followup_question(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            needs_followup = data.get("needs_followup", False)
+            followup_question = data.get("followup_question")
+            if needs_followup and not followup_question:
+                data["followup_question"] = (
+                    data.get("followup_reason")
+                    or "¿Podrías darme más detalles para responder mejor tu consulta?"
+                )
+        return data
+
     @model_validator(mode="after")
-    def consistency_checks(self):
-        if self.question_type == "demand_forecast" and not any(t.execution_strategy == "demand_forecast" for t in self.tasks):
-            # Permitimos demand_forecast sin tareas SQL si es un forecast puro
-            pass
-        if self.needs_followup and self.followup_question is None:
-            raise ValueError("Si needs_followup=true, debe existir followup_question")
+    def preferred_view_consistency(self):
+        for task in self.tasks:
+            if task.preferred_view and task.candidate_views and task.preferred_view not in task.candidate_views:
+                # Auto-corrige si la preferida no está en candidatas: añadirla
+                task.candidate_views.append(task.preferred_view)
         return self
+
 
 
 # ------------------------------------------------------------------
