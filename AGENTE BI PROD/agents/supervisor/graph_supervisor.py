@@ -4,9 +4,32 @@ from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
 from core.llm import LLM
 from core.contracts import SupervisorDecision, PlannerContract, SQLContract
 from core.config import logger
+from core.harness import BusinessMemory
 from langsmith import traceable
 
 MAX_ITERATIONS = 10
+
+_biz_mem_supervisor = BusinessMemory.from_file()
+
+
+def _build_view_catalog_from_allowed(allowed_views: List[str]) -> Dict[str, Any]:
+    """Construye catálogo semántico fallback si no viene en el estado."""
+    catalog: Dict[str, Any] = {}
+    for view_full_name in allowed_views:
+        view_name = view_full_name.replace("semantic.", "").strip()
+        view_info = _biz_mem_supervisor.get_view(view_name)
+        if not view_info:
+            continue
+        catalog[view_full_name] = {
+            "tipo": view_info.tipo,
+            "descripcion": view_info.descripcion,
+            "granularidad": view_info.granularidad,
+            "filtro_fecha": view_info.filtro_fecha,
+            "metricas": list(view_info.metricas.keys()),
+            "columnas_fecha": view_info.columnas_fecha,
+            "notas": view_info.notas,
+        }
+    return catalog
 
 
 def _validate_plan_against_catalog(
@@ -113,13 +136,12 @@ def _build_state_summary(state: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# FEW-SHOT EXAMPLES PARA EL SUPERVISOR
+# FEW-SHOT EXAMPLES
 # ============================================================
 
 def _build_few_shot_messages() -> List[Any]:
-    """Construye mensajes few-shot de estado -> decisión esperada."""
     return [
-        # Ejemplo 1: Sin plan → planner
+        # 1. Sin plan
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 0
@@ -145,7 +167,7 @@ No hay resultados SQL aún.
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 2: Plan válido, sin resultados SQL → sql_agent
+        # 2. Plan válido, sin SQL
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 1
@@ -171,7 +193,7 @@ No hay resultados SQL aún.
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 3: Plan inválido (columna faltante) → planner con feedback
+        # 3. Plan inválido
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 1
@@ -191,13 +213,13 @@ final_answer presente: false
 No hay resultados SQL aún.
         """.strip()),
         AIMessage(content=json.dumps({
-            "reasoning": "El planner eligió una vista que no contiene la columna 'vendedor' requerida. Se solicita replanificación con feedback específico.",
+            "reasoning": "El planner eligió una vista que no contiene la columna 'vendedor' requerida. Se solicita replanificación.",
             "next_agent": "planner",
-            "feedback_to_planner": "Tarea t1: columna 'vendedor' no está disponible en semantic.vw_ventas_sede. Elige una vista que contenga vendedor o reformula la pregunta para no requerir desglose por vendedor.",
+            "feedback_to_planner": "Tarea t1: columna 'vendedor' no está disponible en semantic.vw_ventas_sede. Elige una vista que contenga vendedor o reformula la pregunta.",
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 4: SQL error corregible → sql_agent con feedback
+        # 4. SQL error corregible
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 2
@@ -224,7 +246,7 @@ final_answer presente: false
             "feedback_to_sql_agent": "Tarea t1: Error 'column \"fecha_venta\" does not exist'. Revisa el catálogo y usa el nombre exacto de la columna de fecha disponible en la vista."
         }, ensure_ascii=False)),
 
-        # Ejemplo 5: SQL insalvable → planner con feedback
+        # 5. SQL insalvable
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 2
@@ -245,13 +267,13 @@ final_answer presente: false
   - tarea t1: Columna nombre_vendedor no existe en semantic.vw_ventas_sede
         """.strip()),
         AIMessage(content=json.dumps({
-            "reasoning": "La tarea requiere una columna que no existe en ninguna vista autorizada. Se debe replanificar para eliminar o sustituir esa dimensión.",
+            "reasoning": "La tarea requiere una columna que no existe. Se debe replanificar.",
             "next_agent": "planner",
-            "feedback_to_planner": "Tarea t1: la columna 'nombre_vendedor' no existe en semantic.vw_ventas_sede ni en las vistas candidatas. No inventes columnas. Reformula la tarea sin desglose por vendedor o solicita aclaración al usuario.",
+            "feedback_to_planner": "Tarea t1: la columna 'nombre_vendedor' no existe en semantic.vw_ventas_sede. No inventes columnas. Reformula la tarea sin desglose por vendedor.",
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 6: SQL necesita aclaración → FINISH
+        # 6. Needs clarification
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 2
@@ -278,7 +300,7 @@ final_answer presente: false
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 7: demand_forecast → forecaster
+        # 7. demand_forecast
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 1
@@ -304,7 +326,7 @@ No hay resultados SQL aún.
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 8: deep_research → researcher
+        # 8. deep_research
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 1
@@ -324,13 +346,13 @@ final_answer presente: false
 No hay resultados SQL aún.
         """.strip()),
         AIMessage(content=json.dumps({
-            "reasoning": "Se solicitó un informe profundo. Se delega al researcher para explorar múltiples métricas.",
+            "reasoning": "Se solicitó un informe profundo. Se delega al researcher.",
             "next_agent": "researcher",
             "feedback_to_planner": None,
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 9: visualización solicitada → viz_agent
+        # 9. visualización
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 3
@@ -357,7 +379,7 @@ final_answer presente: false
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 10: viz válido, no renderizado → render_plotly
+        # 10. render
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 4
@@ -378,13 +400,13 @@ final_answer presente: false
   - tarea t1: Query ejecutada correctamente
         """.strip()),
         AIMessage(content=json.dumps({
-            "reasoning": "Spec de visualización válida (bar chart). Se procede a renderizar con Plotly.",
+            "reasoning": "Spec de visualización válida (bar chart). Se procede a renderizar.",
             "next_agent": "render_plotly",
             "feedback_to_planner": None,
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 11: todo listo → analyst
+        # 11. analyst
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 3
@@ -411,7 +433,7 @@ final_answer presente: false
             "feedback_to_sql_agent": None
         }, ensure_ascii=False)),
 
-        # Ejemplo 12: respuesta lista → FINISH
+        # 12. FINISH
         HumanMessage(content="""
 === ESTADO ACTUAL ===
 iteration_count: 5
@@ -445,7 +467,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     current_iter = state.get("iteration_count", 0)
     next_iter = current_iter + 1
 
-    # 1. Guarda de límite de iteraciones
+    # 1. Límite de iteraciones
     if current_iter >= MAX_ITERATIONS:
         logger.warning(f"[Supervisor] Límite de iteraciones ({MAX_ITERATIONS}) alcanzado.")
         return {
@@ -459,6 +481,12 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     plan = state.get("plan")
     sql_results = state.get("sql_results") or []
     view_catalog = state.get("view_catalog", {})
+    allowed_views = state.get("allowed_views", [])
+
+    # Fallback: construir catálogo si no viene en estado
+    if not view_catalog and allowed_views:
+        logger.info("[Supervisor] view_catalog no encontrado en estado. Construyendo desde allowed_views.")
+        view_catalog = _build_view_catalog_from_allowed(allowed_views)
 
     # 2. Sin plan → Planner
     if not plan:
@@ -490,6 +518,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "next": "analyst",
                 "last_agent": "supervisor",
                 "iteration_count": next_iter,
+                "planner_validation_error": plan_feedback,
                 "messages": [
                     AIMessage(
                         content=f"[Supervisor] Plan sigue siendo inválido: {plan_feedback}. "
@@ -543,7 +572,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "messages": [AIMessage(content=f"[Supervisor] Errores insalvables. Replanificando: {feedback}")],
         }
 
-    # 6. Construir prompt + few-shots y llamar al LLM
+    # 6. Delegar decisión al LLM
     state_summary = _build_state_summary(state)
 
     system_prompt = f"""
@@ -596,13 +625,20 @@ Devuelve SupervisorDecision con:
         HumanMessage(content="Decide el siguiente nodo a ejecutar para el estado actual."),
     ]
 
-    # ============================================================
-    # LLM con temperatura baja para reducir variabilidad
-    # ============================================================
     try:
         llm_low_temp = LLM.bind(temperature=0.0)
         structured_llm = llm_low_temp.with_structured_output(SupervisorDecision, include_raw=False)
-        decision: SupervisorDecision = structured_llm.invoke(messages)
+        decision_raw = structured_llm.invoke(messages)
+
+        # ============================================================
+        # FIX CRÍTICO: langchain puede devolver dict en lugar de objeto
+        # ============================================================
+        if isinstance(decision_raw, dict):
+            logger.info(f"[Supervisor] Decisión recibida como dict: {decision_raw}")
+            decision = SupervisorDecision(**decision_raw)
+        else:
+            decision = decision_raw
+
     except Exception as e:
         logger.error(f"[Supervisor] Error llamando al LLM: {e}")
         decision = SupervisorDecision(
@@ -615,10 +651,12 @@ Devuelve SupervisorDecision con:
         "planner", "sql_agent", "researcher", "forecaster",
         "viz_agent", "render_plotly", "analyst", "FINISH"
     ]
-    if decision.next_agent not in valid_agents:
-        logger.warning(f"[Supervisor] next_agent inválido '{decision.next_agent}'. Forzando analyst.")
+
+    # Si por alguna razón next_agent no existe o es inválido
+    if not hasattr(decision, "next_agent") or decision.next_agent not in valid_agents:
+        logger.warning(f"[Supervisor] next_agent inválido '{getattr(decision, 'next_agent', None)}'. Forzando analyst.")
         decision = SupervisorDecision(
-            reasoning=f"next_agent inválido '{decision.next_agent}' corregido a analyst",
+            reasoning=f"next_agent inválido '{getattr(decision, 'next_agent', None)}' corregido a analyst",
             next_agent="analyst",
         )
 
@@ -672,5 +710,5 @@ Devuelve SupervisorDecision con:
     if decision.feedback_to_sql_agent:
         update["feedback_to_sql_agent"] = decision.feedback_to_sql_agent
 
-    logger.info(f"[Supervisor] Decisión LLM: {decision.next_agent} | {decision.reasoning}")
+    logger.info(f"[Supervisor] Decisión final: {decision.next_agent} | {decision.reasoning}")
     return update
