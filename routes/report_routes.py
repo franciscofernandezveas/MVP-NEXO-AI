@@ -31,7 +31,6 @@ class SimpleUser:
 def validate_token_with_supabase(token: str) -> dict:
     """
     Valida el access_token llamando al endpoint /auth/v1/user de Supabase.
-    Compatible con cualquier algoritmo de firma (HS256, RS256, ES256).
     """
     if not SUPABASE_URL:
         raise RuntimeError("NEXO_SUPABASE_URL no está configurado")
@@ -134,77 +133,8 @@ def fmt_num(val, decimals=0):
     return temp.replace(",", "TEMP").replace(".", ",").replace("TEMP", ".")
 
 
-def compact_hours(hours_str):
-    if not hours_str:
-        return "–"
-    try:
-        nums = sorted({int(x.strip()) for x in str(hours_str).split(",") if x.strip().isdigit()})
-    except ValueError:
-        return str(hours_str)
-    if not nums:
-        return str(hours_str)
-
-    ranges = []
-    start = prev = nums[0]
-    for n in nums[1:]:
-        if n == prev + 1:
-            prev = n
-        else:
-            ranges.append(f"{start}h" if start == prev else f"{start}h-{prev}h")
-            start = prev = n
-    ranges.append(f"{start}h" if start == prev else f"{start}h-{prev}h")
-    return ", ".join(ranges)
-
-
-def compact_hours_clock(hours_str):
-    if not hours_str:
-        return "–"
-    try:
-        nums = sorted({int(x.strip()) for x in str(hours_str).split(",") if x.strip().isdigit()})
-    except ValueError:
-        return str(hours_str)
-    if not nums:
-        return str(hours_str)
-
-    ranges = []
-    start = prev = nums[0]
-    for n in nums[1:]:
-        if n == prev + 1:
-            prev = n
-        else:
-            ranges.append(f"{start:02d}:00" if start == prev else f"{start:02d}:00 - {prev:02d}:00")
-            start = prev = n
-    ranges.append(f"{start:02d}:00" if start == prev else f"{start:02d}:00 - {prev:02d}:00")
-    return ", ".join(ranges)
-
-
-def fmt_hora(h):
-    if h is None:
-        return "–"
-    try:
-        return f"{int(h):02d}:00"
-    except (ValueError, TypeError):
-        return str(h)
-
-
-def action_suggestion(row):
-    conc = row.get("concentracion_top_horas") or 0
-    hv = row.get("horas_valle") or ""
-    valle_count = len([x for x in str(hv).split(",") if x.strip().isdigit()]) if hv else 0
-
-    if conc < 50:
-        return "Revisar estrategia completa de sede"
-    if valle_count >= 4:
-        return "Reforzar demanda en horario extendido"
-    if valle_count >= 2:
-        return "Activar promociones en horarios intermedios"
-    if valle_count == 1:
-        return "Evaluar ajuste de turno específico"
-    return "Mantener estrategia actual"
-
-
 # ═══════════════════════════════════════════════════════════════
-# TABLA GENÉRICA (items 1-3)
+# TABLA GENÉRICA
 # ═══════════════════════════════════════════════════════════════
 
 def format_table(rows, title):
@@ -263,207 +193,6 @@ def format_table(rows, title):
 
 
 # ═══════════════════════════════════════════════════════════════
-# TABLA OPERATIVA (ítem 4)
-# ═══════════════════════════════════════════════════════════════
-
-def format_operational_table(rows, title):
-    if not rows:
-        return f'<div class="section"><h3>{title}</h3><p style="color:#888;font-style:italic;">Sin datos.</p></div>'
-
-    display_cols = [
-        "nombre_sede", "horas_peak", "trans_peak", "ingreso_peak",
-        "horas_valle", "trans_valle", "horas_ticket", "max_ticket",
-        "concentracion_top_horas"
-    ]
-    header_map = {
-        "nombre_sede": "SEDE",
-        "horas_peak": "HORAS PEAK",
-        "trans_peak": "TRANS. PEAK",
-        "ingreso_peak": "INGRESO PEAK",
-        "horas_valle": "HORAS VALLE",
-        "trans_valle": "TRANS. VALLE",
-        "horas_ticket": "HORA TICKET",
-        "max_ticket": "MAX. TICKET",
-        "concentracion_top_horas": "% TOP HORAS"
-    }
-
-    html = f'<div class="section"><h3>{title}</h3><table class="operational-table"><thead><tr>'
-    for k in display_cols:
-        html += f'<th>{header_map.get(k, k)}</th>'
-    html += "</tr></thead><tbody>"
-
-    for row in rows:
-        html += '<tr class="ops-row">'
-        for key in display_cols:
-            val = row.get(key)
-
-            if key == "nombre_sede":
-                html += f'<td><span class="sede-badge">{val}</span></td>'
-
-            elif key in ("horas_peak", "horas_ticket") and val:
-                tag_cls = "tag-peak" if key == "horas_peak" else "tag-ticket"
-                dot = "dot-peak" if key == "horas_peak" else "dot-ticket"
-                hours = [h.strip() for h in str(val).split(",") if h.strip()]
-                tags = "".join([
-                    f'<span class="hour-tag {tag_cls}"><span class="{dot}"></span>{h}h</span>'
-                    for h in hours
-                ])
-                html += f"<td>{tags}</td>"
-
-            elif key == "horas_valle":
-                html += f'<td><span class="valle-text">{compact_hours(val)}</span></td>'
-
-            elif key == "concentracion_top_horas":
-                pct = int(val) if val else 0
-                html += f'<td><span class="pct-pill">{pct}%</span></td>'
-
-            elif key in ("ingreso_peak", "max_ticket"):
-                money = f"${fmt_num(val, 0)}" if val else "–"
-                html += f'<td class="numeric money">{money}</td>'
-
-            elif isinstance(val, (int, float, decimal.Decimal)):
-                html += f'<td class="numeric">{fmt_num(val, 0)}</td>'
-            else:
-                html += f'<td>{val if val is not None else "–"}</td>'
-        html += "</tr>"
-
-    html += "</tbody></table></div>"
-    return html
-
-
-# ═══════════════════════════════════════════════════════════════
-# PANEL DE CONTROL (ítem 5)
-# ═══════════════════════════════════════════════════════════════
-
-def format_control_panel(rows, title):
-    if not rows:
-        return f'<div class="section"><h3>{title}</h3><p style="color:#888;font-style:italic;">Sin datos.</p></div>'
-
-    html = f'<div class="section"><h3>{title}</h3><div class="cards-grid">'
-
-    for row in rows:
-        sede = row.get("nombre_sede", "Sede")
-        hp = row.get("horas_peak")
-        tp = row.get("trans_peak") or 0
-        ip = row.get("ingreso_peak") or 0
-        hv = row.get("horas_valle")
-        tv = row.get("trans_valle") or 0
-        ht = row.get("horas_ticket")
-        mt = row.get("max_ticket") or 0
-        conc = row.get("concentracion_top_horas") or 0
-        iv = row.get("inicio_valle")
-        fv = row.get("fin_valle")
-
-        peak_txt = compact_hours_clock(hp) if hp else "–"
-        valle_txt = compact_hours_clock(hv) if hv else "–"
-        ticket_txt = compact_hours_clock(ht) if ht else "–"
-
-        if iv is None and fv is None:
-            crit_txt = "Sin horas críticas detectadas"
-        else:
-            crit_txt = f"{fmt_hora(iv)} - {fmt_hora(fv)}"
-
-        accion = action_suggestion(row)
-
-        html += f'''
-        <div class="control-card">
-            <div class="card-header">
-                <span class="card-pin">&#128205;</span>
-                <h4>{sede}</h4>
-            </div>
-            <div class="card-body">
-                <div class="metric">
-                    <span class="m-icon">&#128293;</span>
-                    <span class="m-txt">Hora peak: {peak_txt} ({fmt_num(tp, 0)} transacciones, ${fmt_num(ip, 0)})</span>
-                </div>
-                <div class="metric">
-                    <span class="m-icon">&#128308;</span>
-                    <span class="m-txt">Hora valle: {valle_txt} ({fmt_num(tv, 0)} transacciones)</span>
-                </div>
-                <div class="metric">
-                    <span class="m-icon">&#128176;</span>
-                    <span class="m-txt">Mayor ticket: {ticket_txt} (${fmt_num(mt, 0)})</span>
-                </div>
-                <div class="metric">
-                    <span class="m-icon">&#128202;</span>
-                    <span class="m-txt">{conc}% de ventas concentradas en horas peak</span>
-                </div>
-                <div class="metric">
-                    <span class="m-icon">&#9888;</span>
-                    <span class="m-txt">Horas críticas: {crit_txt}</span>
-                </div>
-            </div>
-            <div class="card-action">
-                <span class="action-label">Acción sugerida</span>
-                <p>{accion}</p>
-            </div>
-        </div>
-        '''
-    html += "</div></div>"
-    return html
-
-
-# ═══════════════════════════════════════════════════════════════
-# QUERY OPERATIVA
-# ═══════════════════════════════════════════════════════════════
-
-OPERATIONAL_QUERY = r"""
-WITH ultima_fecha AS (
-    SELECT MAX(fecha) AS fecha FROM semantic.mart_operacion_hora_kpi
-),
-base AS (
-    SELECT * FROM semantic.mart_operacion_hora_kpi
-    WHERE fecha = (SELECT fecha FROM ultima_fecha)
-),
-peak AS (
-    SELECT nombre_sede,
-        STRING_AGG(hora::text, ', ' ORDER BY hora) AS horas_peak,
-        MAX(total_transacciones) AS trans_peak,
-        MAX(ingreso_total) AS ingreso_peak
-    FROM base WHERE rank_demanda = 1 GROUP BY nombre_sede
-),
-valle AS (
-    SELECT nombre_sede,
-        STRING_AGG(hora::text, ', ' ORDER BY hora) AS horas_valle,
-        MIN(total_transacciones) AS trans_valle
-    FROM base WHERE rank_baja_demanda = 1 GROUP BY nombre_sede
-),
-ticket AS (
-    SELECT nombre_sede,
-        STRING_AGG(hora::text, ', ' ORDER BY hora) AS horas_ticket,
-        MAX(ticket_promedio) AS max_ticket
-    FROM base WHERE rank_ticket = 1 GROUP BY nombre_sede
-),
-concentracion AS (
-    SELECT nombre_sede,
-        ROUND(
-            SUM(CASE WHEN rank_demanda <= 3 THEN total_transacciones ELSE 0 END)::numeric
-            / NULLIF(SUM(total_transacciones),0),
-        2) AS concentracion_top_horas
-    FROM base GROUP BY nombre_sede
-),
-horas_valle_rango AS (
-    SELECT nombre_sede, MIN(hora) AS inicio_valle, MAX(hora) AS fin_valle
-    FROM base WHERE demanda_relativa < 0.2 GROUP BY nombre_sede
-),
-sedes AS ( SELECT DISTINCT nombre_sede FROM base )
-SELECT
-    s.nombre_sede,
-    p.horas_peak, p.trans_peak, p.ingreso_peak,
-    v.horas_valle, v.trans_valle,
-    t.horas_ticket, t.max_ticket,
-    c.concentracion_top_horas,
-    hv.inicio_valle, hv.fin_valle
-FROM sedes s
-LEFT JOIN peak p ON s.nombre_sede = p.nombre_sede
-LEFT JOIN valle v ON s.nombre_sede = v.nombre_sede
-LEFT JOIN ticket t ON s.nombre_sede = t.nombre_sede
-LEFT JOIN concentracion c ON s.nombre_sede = c.nombre_sede
-LEFT JOIN horas_valle_rango hv ON s.nombre_sede = hv.nombre_sede;
-"""
-
-
-# ═══════════════════════════════════════════════════════════════
 # CARGA DE DATOS
 # ═══════════════════════════════════════════════════════════════
 
@@ -483,18 +212,10 @@ def load_report_data():
         cursor.execute("SELECT * FROM semantic.sales_week")
         weekly_demand = cursor.fetchall()
 
-        cursor.execute(OPERATIONAL_QUERY)
-        operational_summary = cursor.fetchall()
-
-        for row in operational_summary:
-            raw = row.get("concentracion_top_horas")
-            row["concentracion_top_horas"] = round(float(raw) * 100) if raw is not None else 0
-
         return {
             "sales_summary": sales_summary,
             "sales_by_store": sales_by_store,
             "weekly_demand": weekly_demand,
-            "operational_summary": operational_summary,
         }
     except HTTPException:
         raise
@@ -558,13 +279,6 @@ CSS_STYLES = """
         font-weight: 700;
         letter-spacing: 1px;
         color: #FFF;
-    }
-    .report-header .subtitle {
-        margin: 8px 0 0;
-        font-size: 1.1rem;
-        font-weight: 400;
-        opacity: 0.85;
-        color: #D7CCC8;
     }
     .date-badge {
         display: inline-block;
@@ -634,135 +348,6 @@ CSS_STYLES = """
     .positive { color: #2E7D32; font-weight: 700; }
     .negative { color: #C62828; font-weight: 700; }
 
-    .operational-table th {
-        background: #3E2723;
-        font-size: 0.7rem;
-        padding: 12px 14px;
-        white-space: nowrap;
-    }
-    .operational-table td {
-        padding: 16px 14px;
-        vertical-align: middle;
-        font-size: 0.9rem;
-        border-bottom: 1px solid #EDE0D4;
-    }
-    .ops-row:hover { background: #F5F0EB; }
-
-    .sede-badge {
-        display: inline-block;
-        font-weight: 700;
-        font-size: 0.95rem;
-        color: #3E2723;
-        background: #F5F0EB;
-        padding: 6px 14px;
-        border-radius: 8px;
-        border-left: 4px solid #A67C52;
-    }
-
-    .hour-tag {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        padding: 4px 10px;
-        border-radius: 20px;
-        font-size: 0.78rem;
-        font-weight: 700;
-        margin: 2px;
-        line-height: 1;
-        white-space: nowrap;
-    }
-    .tag-peak { background: #FFF3E0; color: #E65100; border: 1px solid #FFE0B2; }
-    .tag-ticket { background: #E8F5E9; color: #2E7D32; border: 1px solid #C8E6C9; }
-    .dot-peak { width: 6px; height: 6px; border-radius: 50%; display: inline-block; background: #E65100; }
-    .dot-ticket { width: 6px; height: 6px; border-radius: 50%; display: inline-block; background: #2E7D32; }
-
-    .valle-text {
-        font-weight: 600;
-        color: #455A64;
-        font-size: 0.9rem;
-    }
-
-    .pct-pill {
-        display: inline-block;
-        background: #3E2723;
-        color: #FFF;
-        font-weight: 700;
-        font-size: 0.8rem;
-        padding: 4px 10px;
-        border-radius: 12px;
-        min-width: 36px;
-        text-align: center;
-    }
-
-    .cards-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-        gap: 20px;
-    }
-    .control-card {
-        background: #FFF;
-        border: 1px solid #EDE0D4;
-        border-radius: 14px;
-        overflow: hidden;
-        box-shadow: 0 2px 12px rgba(44,24,16,0.06);
-        display: flex;
-        flex-direction: column;
-    }
-    .card-header {
-        background: #F5F0EB;
-        padding: 14px 18px;
-        border-bottom: 1px solid #EDE0D4;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
-    .card-pin { font-size: 1.2rem; line-height: 1; }
-    .card-header h4 {
-        margin: 0;
-        font-size: 1.1rem;
-        color: #3E2723;
-        font-weight: 700;
-    }
-    .card-body { padding: 16px 18px; flex: 1; }
-    .metric {
-        display: flex;
-        align-items: baseline;
-        gap: 8px;
-        margin-bottom: 10px;
-        font-size: 0.93rem;
-        color: #4E342E;
-        line-height: 1.4;
-    }
-    .m-icon {
-        font-size: 1rem;
-        width: 22px;
-        text-align: center;
-        flex-shrink: 0;
-        line-height: 1;
-    }
-    .m-txt { flex: 1; }
-
-    .card-action {
-        background: #FFF8E1;
-        border-top: 1px solid #FFE0B2;
-        padding: 12px 18px;
-    }
-    .action-label {
-        display: block;
-        font-size: 0.7rem;
-        text-transform: uppercase;
-        letter-spacing: 0.6px;
-        font-weight: 700;
-        color: #E65100;
-        margin-bottom: 4px;
-    }
-    .card-action p {
-        margin: 0;
-        font-size: 0.92rem;
-        color: #3E2723;
-        font-weight: 600;
-    }
-
     footer {
         margin-top: 40px;
         text-align: center;
@@ -808,12 +393,10 @@ async def generate_sales_report(user: SimpleUser = Depends(get_current_user)):
 
         {format_table(data["sales_summary"], "1. Resumen Diario Total")}
         {format_table(data["sales_by_store"], "2. Ventas por Sucursal (Hoy)")}
-        {format_table(data["weekly_demand"], "3. Comparacion Semanal")}
-        {format_operational_table(data["operational_summary"], "4. Analisis Operativo por Sede")}
-        {format_control_panel(data["operational_summary"], "5. Panel de Control Ejecutivo")}
+        {format_table(data["weekly_demand"], "3. Comparación Semanal")}
 
         <footer>
-            Generado automaticamente por el sistema de reportes · Portacafe BI
+            Generado automáticamente por el sistema de reportes · Portacafe BI
         </footer>
     </body>
     </html>
