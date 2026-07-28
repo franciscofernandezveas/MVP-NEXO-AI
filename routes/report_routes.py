@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Response, HTTPException, status, Request
+from fastapi import APIRouter, Depends, Response, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import psycopg2
 import psycopg2.extras
@@ -12,12 +12,12 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 logger = logging.getLogger("report_routes")
 security = HTTPBearer(auto_error=False)
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
+SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
 
 # ═══════════════════════════════════════════════════════════════
-# AUTENTICACIÓN PROPIA (no depende del módulo auth legacy)
+# AUTENTICACIÓN SUPABASE AUTH
 # ═══════════════════════════════════════════════════════════════
 
 class SimpleUser:
@@ -36,10 +36,25 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if not SUPABASE_JWT_SECRET:
+        logger.error("SUPABASE_JWT_SECRET no está configurado")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error de configuración del servidor",
+        )
+
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        email = payload.get("sub") or payload.get("email") or "usuario"
-        user_id = payload.get("id") or payload.get("sub")
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
+            options={"verify_aud": False},
+        )
+        if payload.get("type") not in (None, "access"):
+            raise jwt.InvalidTokenError("Tipo de token inválido")
+
+        email = payload.get("email") or payload.get("sub") or "usuario"
+        user_id = payload.get("sub")
         return SimpleUser(email=email, user_id=user_id)
     except jwt.ExpiredSignatureError:
         raise HTTPException(
@@ -59,10 +74,6 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # ═══════════════════════════════════════════════════════════════
 
 def get_db_url() -> str:
-    """
-    Railway / Docker puede tener DATABASE_URL.
-    El backend del MVP usa DEMO_DATABASE_URL o NEXO_SUPABASE_URL.
-    """
     candidates = [
         os.getenv("DATABASE_URL"),
         os.getenv("DEMO_DATABASE_URL"),
@@ -106,7 +117,6 @@ def fmt_num(val, decimals=0):
 
 
 def compact_hours(hours_str):
-    """Para la tabla: 15,16,17,18,20 → 15h-18h, 20h"""
     if not hours_str:
         return "–"
     try:
@@ -129,7 +139,6 @@ def compact_hours(hours_str):
 
 
 def compact_hours_clock(hours_str):
-    """Para el panel narrativo: 15,16,17,18,20 → 15:00 - 18:00, 20:00"""
     if not hours_str:
         return "–"
     try:
@@ -161,7 +170,6 @@ def fmt_hora(h):
 
 
 def action_suggestion(row):
-    """Lógica de negocio para sugerir acciones automáticas."""
     conc = row.get("concentracion_top_horas") or 0
     hv = row.get("horas_valle") or ""
     valle_count = len([x for x in str(hv).split(",") if x.strip().isdigit()]) if hv else 0
@@ -740,7 +748,7 @@ CSS_STYLES = """
     footer {
         margin-top: 40px;
         text-align: center;
-        color: #A1887F;
+        color: '#A1887F';
         font-size: 0.8rem;
     }
 </style>
@@ -748,7 +756,7 @@ CSS_STYLES = """
 
 
 # ═══════════════════════════════════════════════════════════════
-# ENDPOINTS
+# ENDPOINT
 # ═══════════════════════════════════════════════════════════════
 
 @router.post("/sales-report")
