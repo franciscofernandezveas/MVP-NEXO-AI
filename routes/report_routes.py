@@ -4,7 +4,9 @@ import psycopg2
 import psycopg2.extras
 import os
 import decimal
-import jwt
+import json
+import urllib.request
+import urllib.error
 import logging
 from datetime import datetime, timedelta
 
@@ -12,12 +14,12 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 logger = logging.getLogger("report_routes")
 security = HTTPBearer(auto_error=False)
 
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
-SUPABASE_JWT_PUBLIC_KEY = os.getenv("SUPABASE_JWT_PUBLIC_KEY", "")
+SUPABASE_URL = os.getenv("NEXO_SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.getenv("NEXO_SUPABASE_SERVICE_KEY", "")
 
 
 # ═══════════════════════════════════════════════════════════════
-# AUTENTICACIÓN SUPABASE AUTH
+# AUTENTICACIÓN: VALIDACIÓN REMOTA CON SUPABASE AUTH
 # ═══════════════════════════════════════════════════════════════
 
 class SimpleUser:
@@ -26,42 +28,38 @@ class SimpleUser:
         self.id = user_id or email
 
 
-def _decode_with_secret(token: str, secret: str, algorithms: list):
-    return jwt.decode(
-        token,
-        secret,
-        algorithms=algorithms,
-        options={"verify_aud": False},
+def validate_token_with_supabase(token: str) -> dict:
+    """
+    Valida el access_token llamando al endpoint /auth/v1/user de Supabase.
+    Compatible con cualquier algoritmo de firma (HS256, RS256, ES256).
+    """
+    if not SUPABASE_URL:
+        raise RuntimeError("NEXO_SUPABASE_URL no está configurado")
+    if not SUPABASE_SERVICE_KEY:
+        raise RuntimeError("NEXO_SUPABASE_SERVICE_KEY no está configurado")
+
+    url = f"{SUPABASE_URL}/auth/v1/user"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Content-Type": "application/json",
+        },
     )
 
-
-def decode_supabase_token(token: str) -> dict:
-    """
-    Intenta decodificar un JWT de Supabase Auth.
-    Soporta HS256 (con JWT Secret) y RS256 (con JWT Public Key).
-    """
-    # Primero vemos el header sin verificar firma para saber el algoritmo
     try:
-        header = jwt.get_unverified_header(token)
-        logger.info(f"🔐 Token header: {header}")
-    except Exception as e:
-        logger.error(f"❌ No se pudo leer header del token: {e}")
-        raise jwt.InvalidTokenError("Token malformado")
-
-    alg = header.get("alg", "HS256")
-    logger.info(f"🔐 Algoritmo del token: {alg}")
-
-    if alg == "HS256":
-        if not SUPABASE_JWT_SECRET:
-            raise RuntimeError("SUPABASE_JWT_SECRET no está configurado para token HS256")
-        return _decode_with_secret(token, SUPABASE_JWT_SECRET, ["HS256"])
-
-    if alg == "RS256":
-        if not SUPABASE_JWT_PUBLIC_KEY:
-            raise RuntimeError("SUPABASE_JWT_PUBLIC_KEY no está configurado para token RS256")
-        return _decode_with_secret(token, SUPABASE_JWT_PUBLIC_KEY, ["RS256"])
-
-    raise jwt.InvalidTokenError(f"Algoritmo {alg} no soportado")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="ignore")
+        logger.warning(f"Supabase Auth respondió {e.code}: {error_body}")
+        if e.code == 401:
+            raise Exception("Token inválido o expirado")
+        raise Exception(f"Error de autenticación Supabase: {e.code}")
+    except urllib.error.URLError as e:
+        logger.error(f"No se pudo conectar a Supabase Auth: {e.reason}")
+        raise Exception("No se pudo conectar al servicio de autenticación")
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -75,29 +73,17 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         )
 
     try:
-        payload = decode_supabase_token(token)
-        if payload.get("type") not in (None, "access"):
-            raise jwt.InvalidTokenError("Tipo de token inválido")
-
-        email = payload.get("email") or payload.get("sub") or "usuario"
-        user_id = payload.get("sub")
+        user_data = validate_token_with_supabase(token)
+        email = user_data.get("email") or user_data.get("id") or "usuario"
+        user_id = user_data.get("id")
         return SimpleUser(email=email, user_id=user_id)
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expirado",
-        )
-    except RuntimeError as e:
-        logger.error(str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error de configuración del servidor",
-        )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.warning(f"Token inválido: {e}")
+        logger.warning(f"Error validando token: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token inválido",
+            detail="Token inválido o expirado",
         )
 
 
