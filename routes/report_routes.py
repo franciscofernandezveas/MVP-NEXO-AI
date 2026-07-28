@@ -1,15 +1,57 @@
-from fastapi import APIRouter, Depends, Response, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, Response, HTTPException, status, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import psycopg2
 import psycopg2.extras
 import os
 import decimal
+import jwt
 import logging
-from auth import get_current_user, User
 from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 logger = logging.getLogger("report_routes")
+security = HTTPBearer(auto_error=False)
+
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+
+
+# ═══════════════════════════════════════════════════════════════
+# AUTENTICACIÓN PROPIA (no depende del módulo auth legacy)
+# ═══════════════════════════════════════════════════════════════
+
+class SimpleUser:
+    def __init__(self, email: str, user_id: str = None):
+        self.email = email
+        self.id = user_id or email
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials if credentials else None
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token de autenticación requerido",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        email = payload.get("sub") or payload.get("email") or "usuario"
+        user_id = payload.get("id") or payload.get("sub")
+        return SimpleUser(email=email, user_id=user_id)
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token expirado",
+        )
+    except jwt.InvalidTokenError as e:
+        logger.warning(f"Token inválido: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token inválido",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -133,19 +175,6 @@ def action_suggestion(row):
     if valle_count == 1:
         return "Evaluar ajuste de turno específico"
     return "Mantener estrategia actual"
-
-
-def serialize_row(row):
-    """Convierte RealDictRow / Decimal a tipos JSON serializables."""
-    out = {}
-    for k, v in dict(row).items():
-        if isinstance(v, decimal.Decimal):
-            out[k] = float(v)
-        elif isinstance(v, datetime):
-            out[k] = v.isoformat()
-        else:
-            out[k] = v
-    return out
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -436,18 +465,24 @@ def load_report_data():
             row["concentracion_top_horas"] = round(float(raw) * 100) if raw is not None else 0
 
         return {
-            "sales_summary": [serialize_row(r) for r in sales_summary],
-            "sales_by_store": [serialize_row(r) for r in sales_by_store],
-            "weekly_demand": [serialize_row(r) for r in weekly_demand],
-            "operational_summary": [serialize_row(r) for r in operational_summary],
+            "sales_summary": sales_summary,
+            "sales_by_store": sales_by_store,
+            "weekly_demand": weekly_demand,
+            "operational_summary": operational_summary,
         }
     except HTTPException:
         raise
+    except psycopg2.Error as e:
+        logger.error(f"❌ Error de base de datos generando reporte: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al consultar datos del reporte: {str(e)}",
+        )
     except Exception as e:
         logger.error(f"❌ Error generando reporte: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error al consultar datos del reporte: {str(e)}",
+            detail=f"Error al generar el reporte: {str(e)}",
         )
     finally:
         if cursor:
@@ -717,8 +752,18 @@ CSS_STYLES = """
 # ═══════════════════════════════════════════════════════════════
 
 @router.post("/sales-report")
-async def generate_sales_report(user: User = Depends(get_current_user)):
-    data = load_report_data()
+async def generate_sales_report(user: SimpleUser = Depends(get_current_user)):
+    try:
+        data = load_report_data()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error inesperado en reporte: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al generar el reporte: {str(e)}",
+        )
+
     today = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
 
     html_report = f"""
@@ -755,12 +800,3 @@ async def generate_sales_report(user: User = Depends(get_current_user)):
             "Content-Disposition": "attachment; filename=reporte_ventas.html"
         }
     )
-
-
-@router.get("/sales-report-data")
-async def generate_sales_report_data(user: User = Depends(get_current_user)):
-    """
-    Versión JSON del reporte, útil para consumir desde el frontend
-    o para debugging en Railway.
-    """
-    return load_report_data()
