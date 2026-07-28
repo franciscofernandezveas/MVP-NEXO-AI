@@ -13,7 +13,7 @@ logger = logging.getLogger("report_routes")
 security = HTTPBearer(auto_error=False)
 
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+SUPABASE_JWT_PUBLIC_KEY = os.getenv("SUPABASE_JWT_PUBLIC_KEY", "")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -26,6 +26,44 @@ class SimpleUser:
         self.id = user_id or email
 
 
+def _decode_with_secret(token: str, secret: str, algorithms: list):
+    return jwt.decode(
+        token,
+        secret,
+        algorithms=algorithms,
+        options={"verify_aud": False},
+    )
+
+
+def decode_supabase_token(token: str) -> dict:
+    """
+    Intenta decodificar un JWT de Supabase Auth.
+    Soporta HS256 (con JWT Secret) y RS256 (con JWT Public Key).
+    """
+    # Primero vemos el header sin verificar firma para saber el algoritmo
+    try:
+        header = jwt.get_unverified_header(token)
+        logger.info(f"🔐 Token header: {header}")
+    except Exception as e:
+        logger.error(f"❌ No se pudo leer header del token: {e}")
+        raise jwt.InvalidTokenError("Token malformado")
+
+    alg = header.get("alg", "HS256")
+    logger.info(f"🔐 Algoritmo del token: {alg}")
+
+    if alg == "HS256":
+        if not SUPABASE_JWT_SECRET:
+            raise RuntimeError("SUPABASE_JWT_SECRET no está configurado para token HS256")
+        return _decode_with_secret(token, SUPABASE_JWT_SECRET, ["HS256"])
+
+    if alg == "RS256":
+        if not SUPABASE_JWT_PUBLIC_KEY:
+            raise RuntimeError("SUPABASE_JWT_PUBLIC_KEY no está configurado para token RS256")
+        return _decode_with_secret(token, SUPABASE_JWT_PUBLIC_KEY, ["RS256"])
+
+    raise jwt.InvalidTokenError(f"Algoritmo {alg} no soportado")
+
+
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials if credentials else None
 
@@ -36,20 +74,8 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not SUPABASE_JWT_SECRET:
-        logger.error("SUPABASE_JWT_SECRET no está configurado")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error de configuración del servidor",
-        )
-
     try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=[JWT_ALGORITHM],
-            options={"verify_aud": False},
-        )
+        payload = decode_supabase_token(token)
         if payload.get("type") not in (None, "access"):
             raise jwt.InvalidTokenError("Tipo de token inválido")
 
@@ -61,7 +87,13 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token expirado",
         )
-    except jwt.InvalidTokenError as e:
+    except RuntimeError as e:
+        logger.error(str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error de configuración del servidor",
+        )
+    except Exception as e:
         logger.warning(f"Token inválido: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -748,7 +780,7 @@ CSS_STYLES = """
     footer {
         margin-top: 40px;
         text-align: center;
-        color: '#A1887F';
+        color: #A1887F;
         font-size: 0.8rem;
     }
 </style>
