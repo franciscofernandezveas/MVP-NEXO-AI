@@ -72,7 +72,7 @@ logger = logging.getLogger("main")
 # 4. FASTAPI APP
 # ============================================================================
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -92,6 +92,8 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:3001",
     "http://localhost:8000",
     "http://127.0.0.1:8000",
+    # Fallback hardcodeado del frontend desplegado en Vercel
+    "https://frontend-nexo-ai.vercel.app",
 ]
 
 if os.getenv("ALLOWED_ORIGINS"):
@@ -100,18 +102,22 @@ if os.getenv("ALLOWED_ORIGINS"):
 
 ALLOWED_ORIGINS = list(set(ALLOWED_ORIGINS))
 
+logger.info(f"🌐 FRONTEND_URL leído: {FRONTEND_URL}")
+logger.info(f"🌐 ALLOWED_ORIGINS: {ALLOWED_ORIGINS}")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
-    expose_headers=["Access-Control-Allow-Origin"],
+    expose_headers=["Access-Control-Allow-Origin", "Content-Disposition"],
 )
 
 @app.middleware("http")
-async def log_requests(request, call_next):
-    logger.info(f"➡️  {request.method} {request.url.path}")
+async def log_requests(request: Request, call_next):
+    origin = request.headers.get("origin")
+    logger.info(f"➡️  {request.method} {request.url.path} | Origin: {origin}")
     response = await call_next(request)
     logger.info(f"⬅️  {response.status_code} {request.method} {request.url.path}")
     return response
