@@ -119,9 +119,6 @@ async def log_requests(request, call_next):
 # ============================================================================
 # 5. ARCHIVOS ESTÁTICOS
 # ============================================================================
-# ============================================================================
-# 5. ARCHIVOS ESTÁTICOS
-# ============================================================================
 
 FILES_DIR = Path(os.getenv("FILES_DIR", str(BACKEND_DIR / "files"))).resolve()
 VIZ_DIR = Path(os.getenv("VIZ_DIR", str(BACKEND_DIR / "visualizations"))).resolve()
@@ -183,6 +180,9 @@ safe_include_router("routes.onboarding.agents_md.router", "/onboarding/sessions"
 safe_include_router("routes.onboarding.indexer.router", "/onboarding/sessions", ["onboarding"])
 safe_include_router("routes.onboarding.feedback.router", "/onboarding/sessions", ["onboarding"])
 safe_include_router("routes.onboarding.chat.router", "/onboarding/sessions", ["onboarding"])
+
+# Reportes / KPIs
+safe_include_router("routes.report_routes.router", "", ["reports"])
 
 # Legacy auth/chat deshabilitados temporalmente para MVP
 # safe_include_router("auth.router.router")
