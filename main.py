@@ -189,6 +189,7 @@ safe_include_router("routes.onboarding.chat.router", "/onboarding/sessions", ["o
 
 # Reportes / KPIs
 safe_include_router("routes.report_routes.router", "", ["reports"])
+safe_include_router("routes.sales_routes.router", "", ["sales"])  # ✅ NUEVO: módulo de ventas
 
 # Legacy auth/chat deshabilitados temporalmente para MVP
 # safe_include_router("auth.router.router")
