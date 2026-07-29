@@ -188,12 +188,14 @@ safe_include_router("routes.onboarding.indexer.router", "/onboarding/sessions", 
 safe_include_router("routes.onboarding.feedback.router", "/onboarding/sessions", ["onboarding"])
 safe_include_router("routes.onboarding.chat.router", "/onboarding/sessions", ["onboarding"])
 
+# Auth — necesario para /api/auth/me
+safe_include_router("auth.router.router", "/api", ["auth"])
+
 # Reportes / KPIs
 safe_include_router("routes.report_routes.router", "", ["reports"])
 safe_include_router("routes.sales_routes.router", "", ["sales"])  # ✅ Módulo de ventas
 
-# Legacy auth/chat deshabilitados temporalmente para MVP
-# safe_include_router("auth.router.router")
+# Legacy chat deshabilitado temporalmente para MVP
 # safe_include_router("routes.chat_routes.router")
 
 # ============================================================================
