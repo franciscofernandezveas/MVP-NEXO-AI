@@ -1,13 +1,16 @@
 import os
+import re
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# Prioridad: DEMO_DATABASE_URL (usado por el MVP) → DATABASE_URL
+DATABASE_URL = os.getenv("DEMO_DATABASE_URL") or os.getenv("DATABASE_URL", "")
 
-if not DATABASE_URL:
+# Si no hay URL completa, armarla desde variables individuales
+if not DATABASE_URL or "tu-database-url" in DATABASE_URL.lower():
     DB_USER = os.getenv("DB_USER", "")
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
     DB_HOST = os.getenv("DB_HOST", "")
@@ -15,7 +18,7 @@ if not DATABASE_URL:
     DB_PORT = os.getenv("DB_PORT", "6543")
 
     if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_NAME]):
-        raise Exception("❌ Faltan variables de entorno de base de datos")
+        raise Exception("❌ Faltan variables de entorno de base de datos (DATABASE_URL, DEMO_DATABASE_URL o DB_*)")
 
     DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 

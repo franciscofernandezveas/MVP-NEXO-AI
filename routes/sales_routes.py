@@ -66,7 +66,7 @@ class PromedioDemandaHorariaResponseDTO(BaseModel):
 # ROUTER
 # -----------------------------
 
-router = APIRouter(prefix="/api/sales", tags=["sales"])
+router = APIRouter(prefix="/sales", tags=["sales"])
 
 
 # ======================================================================================
