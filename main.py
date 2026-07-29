@@ -188,8 +188,8 @@ safe_include_router("routes.onboarding.indexer.router", "/onboarding/sessions", 
 safe_include_router("routes.onboarding.feedback.router", "/onboarding/sessions", ["onboarding"])
 safe_include_router("routes.onboarding.chat.router", "/onboarding/sessions", ["onboarding"])
 
-# Auth — necesario para /api/auth/me
-safe_include_router("auth.router.router", "/api", ["auth"])
+# Auth — el router ya define su propio prefix "/api/auth"
+safe_include_router("auth.router.router", "", ["auth"])
 
 # Reportes / KPIs
 safe_include_router("routes.report_routes.router", "", ["reports"])
