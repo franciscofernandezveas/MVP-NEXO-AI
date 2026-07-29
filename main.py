@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 import traceback
-import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -106,32 +105,10 @@ ALLOWED_ORIGINS = list(set(ALLOWED_ORIGINS))
 logger.info(f"🌐 FRONTEND_URL leído: {FRONTEND_URL}")
 logger.info(f"🌐 ALLOWED_ORIGINS: {ALLOWED_ORIGINS}")
 
-
-class RegexCORSMiddleware(CORSMiddleware):
-    """
-    Middleware CORS extendido que soporta expresiones regulares para orígenes.
-    Permite los dominios preview dinámicos de Vercel.
-    """
-
-    def __init__(self, app, allow_origins=None, allow_origin_regex=None, **kwargs):
-        super().__init__(app, allow_origins=allow_origins, **kwargs)
-        self.allow_origin_regex = [
-            re.compile(pattern) for pattern in (allow_origin_regex or [])
-        ]
-
-    def is_allowed_origin(self, origin: str) -> bool:
-        if super().is_allowed_origin(origin):
-            return True
-        return any(pattern.match(origin) for pattern in self.allow_origin_regex)
-
-
 app.add_middleware(
-    RegexCORSMiddleware,
+    CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=[
-        r"^https://frontend-nexo-.*\.vercel\.app$",
-        r"^https://frontend-nexo-ai.*\.vercel\.app$",
-    ],
+    allow_origin_regex=r"^https://frontend-nexo-.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
