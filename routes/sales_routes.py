@@ -3,6 +3,14 @@
 from fastapi import APIRouter
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
+# backend/routes/sales_routes.py
+
+from typing import List, Dict, Any, Literal
+from fastapi import HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
+
+from services.sales_service import generate_executive_report_service
 
 from services.sales_service import (
     get_sales_review_today_service,
@@ -310,3 +318,48 @@ async def categorias_detalle_filtrado(
         fecha_inicio=fecha_inicio,
         fecha_fin=fecha_fin
     )
+
+
+
+
+
+class ExecutiveReportRequest(BaseModel):
+    views: List[str] = Field(..., min_items=1, description="Lista de vistas semánticas a incluir")
+    filters: Dict[str, Any] = Field(default_factory=dict, description="Filtros comunes del reporte")
+    format: Literal["html", "csv"] = "html"
+
+
+@router.post("/executive-report")
+async def executive_report(payload: ExecutiveReportRequest):
+    """
+    Genera un reporte ejecutivo combinando múltiples vistas semánticas.
+    Soporta descarga en HTML o CSV.
+    """
+    try:
+        content = await generate_executive_report_service(
+            payload.views,
+            payload.filters,
+            payload.format,
+        )
+
+        if payload.format == "csv":
+            return Response(
+                content=content,
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": "attachment; filename=reporte_ejecutivo.csv"
+                },
+            )
+
+        return Response(
+            content=content,
+            media_type="text/html",
+            headers={
+                "Content-Disposition": "attachment; filename=reporte_ejecutivo.html"
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generando reporte: {str(e)}")

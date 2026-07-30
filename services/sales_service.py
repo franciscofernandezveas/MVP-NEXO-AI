@@ -30,6 +30,7 @@ from repositories.sales_repository import (
     get_demanda_horaria,
     get_promedio_demanda_horaria,
     # Detalle por categoría
+    get_kpi_categorias_diario,
     get_kpi_categorias_productos_sede,
 )
 
@@ -458,6 +459,67 @@ async def get_demanda_semanal_service():
 
 
 # -----------------------------
+# KPI CATEGORÍAS
+# -----------------------------
+@cacheable(lambda categoria=None, fecha_inicio=None, fecha_fin=None:
+           f"kpi_categorias_diario:{categoria or 'all'}:{fecha_inicio or 'min'}:{fecha_fin or 'max'}")
+async def get_kpi_categorias_diario_service(
+    categoria: str = None,
+    fecha_inicio: str = None,
+    fecha_fin: str = None
+):
+    """
+    Servicio para KPIs diarios por categoría.
+    """
+    data = get_kpi_categorias_diario(
+        fecha_inicio=fecha_inicio,
+        fecha_fin=fecha_fin,
+        categoria=categoria
+    ) or []
+
+    return [
+        {
+            "fecha": str(row.get("fecha")) if row.get("fecha") else None,
+            "categoria": row.get("categoria"),
+            "ventas": _to_float(row.get("ventas")),
+            "unidades": _to_float(row.get("unidades")),
+        }
+        for row in data
+    ]
+
+
+@cacheable(lambda categoria=None, sucursal=None, fecha_inicio=None, fecha_fin=None:
+           f"kpi_categorias_productos_sede:{categoria or 'all'}:{sucursal or 'all'}:{fecha_inicio or 'min'}:{fecha_fin or 'max'}")
+async def get_kpi_categorias_productos_sede_service(
+    categoria: str = None,
+    sucursal: str = None,
+    fecha_inicio: str = None,
+    fecha_fin: str = None
+):
+    """
+    Servicio para detalle de productos por categoría y sucursal.
+    """
+    data = get_kpi_categorias_productos_sede(
+        categoria=categoria,
+        sucursal=sucursal,
+        fecha_inicio=fecha_inicio,
+        fecha_fin=fecha_fin
+    ) or []
+
+    return [
+        {
+            "fecha_venta": str(row.get("fecha_venta")) if row.get("fecha_venta") else None,
+            "sucursal": row.get("sucursal"),
+            "categoria": row.get("categoria"),
+            "producto": row.get("producto"),
+            "unidades_totales": _to_int(row.get("unidades_totales")),
+            "ventas_totales": _to_float(row.get("ventas_totales")),
+        }
+        for row in data
+    ]
+
+
+# -----------------------------
 # DETALLE POR CATEGORÍA
 # -----------------------------
 @cacheable(lambda categoria=None, sucursal=None, fecha_inicio=None, fecha_fin=None:
@@ -537,3 +599,219 @@ async def get_rendimiento_categorias_resumen_con_fecha_service(
         }
         for row in data
     ]
+
+
+# -----------------------------
+# REPORTES EJECUTIVOS
+# -----------------------------
+
+def _default_start() -> str:
+    return (datetime.now() - __import__('datetime').timedelta(days=30)).strftime("%Y-%m-%d")
+
+
+def _default_end() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _serialize_cell(value: Any):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return str(value)
+    if value is None:
+        return ""
+    return value
+
+
+def _serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: _serialize_cell(v) for k, v in row.items()}
+
+
+# Dispatcher: cada vista apunta a la función del servicio que ya conoce sus filtros
+VIEW_DISPATCH = {
+    "sales_review_day": lambda f: get_sales_review_today_service(),
+    "sales_review_locales_latest": lambda f: get_sucursal_review_service(),
+    "sales_producto_daily": lambda f: get_sales_producto_daily_service(
+        fecha_inicio=f.get("fecha_inicio") or _default_start(),
+        fecha_fin=f.get("fecha_fin") or _default_end(),
+        sucursal=f.get("sucursal") or None,
+        producto=f.get("producto") or None,
+        categoria=None,
+        categoria_nueva=f.get("categoria") or None,
+        subcategoria_nueva=f.get("subcategoria") or None,
+    ),
+    "sales_review_locales": lambda f: get_ventas_historico_local_service(
+        nombre_sede=f.get("sucursal") or None,
+        fecha_inicio=f.get("fecha_inicio") or None,
+        fecha_fin=f.get("fecha_fin") or None,
+    ),
+    "mart_operacion_hora": lambda f: get_demanda_horaria_service(
+        nombre_sede=f.get("sucursal") or None,
+        fecha=f.get("fecha") or None,
+    ),
+    "promedio_demanda_horaria": lambda f: get_promedio_demanda_horaria_service(
+        nombre_sede=f.get("sucursal") or None,
+        mes=_safe_int(f.get("mes")) or datetime.now().month,
+        anio=_safe_int(f.get("anio")) or datetime.now().year,
+    ),
+    "kpi_categorias_diario": lambda f: get_kpi_categorias_diario_service(
+        categoria=f.get("categoria") or None,
+        fecha_inicio=f.get("fecha_inicio") or None,
+        fecha_fin=f.get("fecha_fin") or None,
+    ),
+    "kpi_categorias_productos_sede": lambda f: get_kpi_categorias_productos_sede_service(
+        categoria=f.get("categoria") or None,
+        sucursal=f.get("sucursal") or None,
+        fecha_inicio=f.get("fecha_inicio") or None,
+        fecha_fin=f.get("fecha_fin") or None,
+    ),
+    "dashboard_participacion_categorias": lambda f: get_rendimiento_categorias_resumen_con_fecha_service(
+        fecha_inicio=f.get("fecha_inicio") or None,
+        fecha_fin=f.get("fecha_fin") or None,
+    ),
+    "kpi_fidelizacion_detalle": lambda f: get_detalle_canjes_completo_service(
+        fecha_inicio=f.get("fecha_inicio") or None,
+        fecha_fin=f.get("fecha_fin") or None,
+        sucursal=f.get("sucursal") or None,
+    ),
+    "kpi_cortesia_detalle": lambda f: get_detalle_cortesias_completo_service(
+        fecha_inicio=f.get("fecha_inicio") or None,
+        fecha_fin=f.get("fecha_fin") or None,
+        sucursal=f.get("sucursal") or None,
+    ),
+    "sales_week": lambda f: get_ventas_semana_actual_vs_anterior_service(),
+    "sales_product_general": lambda f: get_cantidad_historica_ventas_producto_service(),
+}
+
+VIEW_TITLES = {
+    "sales_review_day": "Resumen de Ventas Hoy",
+    "sales_review_locales_latest": "Ventas por Sucursal",
+    "sales_producto_daily": "Ventas por Producto",
+    "sales_review_locales": "Histórico por Local",
+    "mart_operacion_hora": "Demanda Horaria",
+    "promedio_demanda_horaria": "Promedio de Demanda Horaria",
+    "kpi_categorias_diario": "KPI Categorías Diario",
+    "kpi_categorias_productos_sede": "Detalle Categoría / Producto / Sede",
+    "dashboard_participacion_categorias": "Participación por Categoría",
+    "kpi_fidelizacion_detalle": "Detalle Canjes Fidelización",
+    "kpi_cortesia_detalle": "Detalle Cortesías",
+    "sales_week": "Semana Actual vs Anterior",
+    "sales_product_general": "Histórico de Ventas por Producto",
+}
+
+
+async def generate_executive_report_service(
+    views: List[str],
+    filters: Dict[str, Any],
+    format: str = "html"
+) -> str:
+    """
+    Orquesta la consulta de múltiples vistas semánticas y genera
+    un reporte descargable en HTML o CSV.
+    """
+    data_by_view: Dict[str, List[Dict[str, Any]]] = {}
+
+    for view in views:
+        if view not in VIEW_DISPATCH:
+            raise ValueError(f"Vista semántica no soportada: {view}")
+
+        data_by_view[view] = await VIEW_DISPATCH[view](filters)
+
+    if format == "csv":
+        return _render_csv_report(data_by_view)
+
+    return _render_html_report(data_by_view, filters)
+
+
+def _render_html_report(
+    data_by_view: Dict[str, List[Dict[str, Any]]],
+    filters: Dict[str, Any]
+) -> str:
+    html = []
+    html.append("<!DOCTYPE html>")
+    html.append("<html lang='es'>")
+    html.append("<head>")
+    html.append("<meta charset='utf-8'>")
+    html.append("<title>Reporte Ejecutivo</title>")
+    html.append("""
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 32px; background: #f8fafc; color: #1f2937; }
+      .container { max-width: 1200px; margin: 0 auto; background: white; padding: 32px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); }
+      h1 { color: #0f172a; margin-top: 0; }
+      .meta { color: #64748b; font-size: 14px; margin-bottom: 16px; }
+      .filters { background: #f1f5f9; padding: 12px 16px; border-radius: 8px; font-size: 13px; color: #475569; margin-bottom: 24px; }
+      h2 { color: #1e40af; border-bottom: 2px solid #e2e8f0; padding-bottom: 8px; margin-top: 32px; font-size: 18px; }
+      table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+      th { background: #1e3a8a; color: white; padding: 10px; text-align: left; font-weight: 600; }
+      td { padding: 8px 10px; border-bottom: 1px solid #e2e8f0; }
+      tr:nth-child(even) { background: #f8fafc; }
+      .empty { color: #94a3b8; font-style: italic; padding: 12px 0; }
+      .footer { margin-top: 40px; color: #94a3b8; font-size: 12px; text-align: right; }
+    </style>
+    """)
+    html.append("</head>")
+    html.append("<body>")
+    html.append("<div class='container'>")
+    html.append("<h1>Reporte Ejecutivo</h1>")
+    html.append(f"<div class='meta'>Generado el {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>")
+
+    active_filters = {k: v for k, v in filters.items() if v}
+    if active_filters:
+        filters_text = ", ".join(f"<strong>{k}</strong>: {v}" for k, v in active_filters.items())
+        html.append(f"<div class='filters'><strong>Filtros aplicados:</strong> {filters_text}</div>")
+
+    for view, rows in data_by_view.items():
+        html.append(f"<h2>{VIEW_TITLES.get(view, view)}</h2>")
+
+        if not rows:
+            html.append("<p class='empty'>Sin datos para los filtros aplicados.</p>")
+            continue
+
+        keys = list(rows[0].keys())
+        html.append("<table>")
+        html.append("<thead><tr>" + "".join(f"<th>{k}</th>" for k in keys) + "</tr></thead>")
+        html.append("<tbody>")
+        for row in rows:
+            serialized = _serialize_row(row)
+            html.append(
+                "<tr>" + "".join(f"<td>{serialized.get(k, '')}</td>" for k in keys) + "</tr>"
+            )
+        html.append("</tbody></table>")
+
+    html.append(f"<div class='footer'>Generado por QANTYX Lab · {len(data_by_view)} vista(s) incluida(s)</div>")
+    html.append("</div>")
+    html.append("</body>")
+    html.append("</html>")
+
+    return "\n".join(html)
+
+
+def _render_csv_report(data_by_view: Dict[str, List[Dict[str, Any]]]) -> str:
+    import csv
+    import io
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    for view, rows in data_by_view.items():
+        writer.writerow([VIEW_TITLES.get(view, view)])
+        if not rows:
+            writer.writerow(["Sin datos para los filtros aplicados"])
+        else:
+            keys = list(rows[0].keys())
+            writer.writerow(keys)
+            for row in rows:
+                serialized = _serialize_row(row)
+                writer.writerow([serialized.get(k, "") for k in keys])
+        writer.writerow([])
+
+    return output.getvalue()
