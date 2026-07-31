@@ -113,7 +113,7 @@ async def _publish_chart(
 ) -> str | None:
     """
     Copia el chart generado en esta ejecución a un archivo público.
-    Solo publica si hay un chart_type válido en el contrato y el archivo existe.
+    Solo publica si hay un chart_type válido en el contrato y el archivo existe y tiene contenido.
     """
     chart_type = _get(viz_result, "chart_type")
 
@@ -130,7 +130,7 @@ async def _publish_chart(
     logger.info(f"[_publish_chart] Buscando chart en: {src} | Existe: {src.exists()}")
 
     if not src.exists() or src.stat().st_size == 0:
-        logger.warning("[_publish_chart] No existe chart.png generado en esta ejecución")
+        logger.warning("[_publish_chart] No existe chart.png generado en esta ejecución o está vacío")
         return None
 
     try:
@@ -202,9 +202,13 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                     chart_emitted = False
                     final_answer_emitted = False
 
+                    # Último estado conocido del stream
+                    final_state = None
+
                     async for state in BI_ORCHESTRATOR.astream(
                         initial_state, config, stream_mode="values"
                     ):
+                        final_state = state
                         agent = state.get("last_agent")
                         iteration = state.get("iteration_count", 0)
 
@@ -217,15 +221,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                             )
                             last_agent = agent
 
-                        # Emitir chart SOLO si fue renderizado en esta ejecución
-                        if not chart_emitted and state.get("viz_rendered"):
-                            viz_result = state.get("viz_result")
-                            if _get(viz_result, "chart_type"):
-                                chart_url = await _publish_chart(session_id, base_url, viz_result)
-                                if chart_url:
-                                    yield sse_event("chart", url=chart_url, format="png")
-                                    chart_emitted = True
-
+                        # Emitir respuesta final si existe
                         answer = state.get("final_answer")
                         if answer and not final_answer_emitted:
                             final_answer = answer
@@ -233,7 +229,17 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                                 yield chunk
                             final_answer_emitted = True
 
-                    # NUNCA publicar chart residual al final como fallback
+                    # AL FINAL DEL STREAM: publicar chart SOLO si fue renderizado en esta ejecución
+                    if final_state:
+                        viz_rendered = final_state.get("viz_rendered", False)
+                        viz_result = final_state.get("viz_result") or {}
+
+                        if viz_rendered and _get(viz_result, "chart_type"):
+                            chart_url = await _publish_chart(session_id, base_url, viz_result)
+                            if chart_url:
+                                yield sse_event("chart", url=chart_url, format="png")
+                                chart_emitted = True
+
                     if not chart_emitted:
                         logger.info("[Chat] No se generó visualización en esta ejecución; no se publica chart.")
 

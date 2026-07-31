@@ -29,12 +29,15 @@ def _get(obj: Any, attr: str, default: Any = None) -> Any:
 def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     current_iter = state.get("iteration_count", 0)
     next_iter = current_iter + 1
+    render_attempts = state.get("render_attempts", 0)
 
     def make_update(next_node: str, **extra) -> Dict[str, Any]:
+        # Siempre propagamos render_attempts para no perderlo en el estado
         base = {
             "next": next_node,
             "last_agent": "supervisor",
             "iteration_count": next_iter,
+            "render_attempts": render_attempts,
         }
         base.update(extra)
         return base
@@ -60,7 +63,6 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     forecast_error = state.get("forecast_error")
 
     # === ANTI-LOOP: Validación de viz_result ===
-    # FIX: Usar _get() porque viz_result puede ser dict o Pydantic object
     viz_is_valid = False
     if viz_result:
         has_chart_type = _get(viz_result, "chart_type") is not None
@@ -81,6 +83,26 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
             viz_rendered=True,
             messages=[AIMessage(content="[Supervisor] Spec de visualización inválida, se omite render y se continúa.")]
         )
+
+    # === ANTI-LOOP RENDER ===
+    # Si el render anterior falló, limitamos reintentos y forzamos avance
+    if last_agent == "render_plotly":
+        if not viz_rendered:
+            if render_attempts >= 1:
+                logger.warning("[Supervisor] Render ya falló una vez. Forzando avance a analyst.")
+                return make_update(
+                    "analyst",
+                    viz_rendered=True,
+                    messages=[AIMessage(content="[Supervisor] Render no disponible, se omite visualización.")]
+                )
+            logger.info(f"[Supervisor] Reintentando render (intento {render_attempts + 1})")
+            return make_update(
+                "render_plotly",
+                render_attempts=render_attempts + 1,
+                messages=[AIMessage(content="[Supervisor] Reintentando render...")]
+            )
+        else:
+            logger.info("[Supervisor] Render completado exitosamente.")
 
     if last_agent == "render_plotly" and not viz_is_valid:
         logger.info("[Supervisor] Prevención de loop post-render fallido. Forzando avance.")
@@ -142,7 +164,6 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return make_update("sql_agent")
 
     # 5. Plan pide visualización y aún no hemos corrido el viz_agent
-    # FIX: _get() porque plan puede ser dict serializado
     if _get(plan, "visualization_candidate", False) and viz_result is None:
         logger.info("[Supervisor] Ruteando a Viz Agent - visualización solicitada (sin spec previa)")
         return make_update("viz_agent")
@@ -158,7 +179,6 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return make_update("analyst")
 
     # 8. Viz ya resuelto y hay datos → Viz Approval (si aplica)
-    # FIX: _get() en SQL results también
     if viz_is_valid and viz_rendered and viz_approved is None:
         suitable_results = [
             r for r in sql_results

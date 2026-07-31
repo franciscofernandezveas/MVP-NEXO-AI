@@ -68,7 +68,7 @@ def render_plotly_node(state: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning("[Render] No se pudo crear la figura")
             return {"viz_rendered": False, "last_agent": "render_plotly"}
 
-        _apply_layout(fig, title or "Gráfico de datos", chart_type, orientation)
+        _apply_layout(fig, title or "Gráfico de datos", chart_type, orientation, df)
 
         files_dir = Path(os.getenv("FILES_DIR", "/app/files")).resolve()
         charts_dir = files_dir / "charts"
@@ -77,21 +77,32 @@ def render_plotly_node(state: Dict[str, Any]) -> Dict[str, Any]:
         chart_html_path = charts_dir / "chart.html"
         chart_png_path = charts_dir / "chart.png"
 
+        # Siempre guardar HTML primero (no requiere Kaleido)
         with open(str(chart_html_path), "w", encoding="utf-8") as f:
             f.write(fig.to_html(include_plotlyjs="cdn"))
 
-        pio.write_image(fig, str(chart_png_path), format="png", width=1000, height=600, scale=2)
-
-        logger.info(
-            f"[Render] Gráfico {chart_type} guardado en {charts_dir} | "
-            f"PNG: {chart_png_path} ({chart_png_path.stat().st_size} bytes)"
-        )
-
-        return {
-            "viz_rendered": True,
-            "last_agent": "render_plotly",
-            "messages": [AIMessage(content=f"[Render] Gráfico {chart_type} guardado en {charts_dir}")],
-        }
+        # Intentar guardar PNG con Kaleido; si falla, devolver False para que el Supervisor avance
+        try:
+            pio.write_image(fig, str(chart_png_path), format="png", width=1000, height=600, scale=2)
+            logger.info(
+                f"[Render] Gráfico {chart_type} guardado en {charts_dir} | "
+                f"PNG: {chart_png_path} ({chart_png_path.stat().st_size} bytes)"
+            )
+            return {
+                "viz_rendered": True,
+                "last_agent": "render_plotly",
+                "messages": [AIMessage(content=f"[Render] Gráfico {chart_type} guardado en {charts_dir}")],
+            }
+        except Exception as img_err:
+            logger.warning(f"[Render] Kaleido falló generando PNG: {img_err}. Solo HTML disponible.")
+            # Asegurar que no quede un PNG residual
+            if chart_png_path.exists():
+                chart_png_path.unlink()
+            return {
+                "viz_rendered": False,
+                "last_agent": "render_plotly",
+                "messages": [AIMessage(content=f"[Render] No se pudo generar PNG: {img_err}")]
+            }
 
     except Exception as e:
         logger.error(f"[Render] Error renderizando gráfico: {e}", exc_info=True)
@@ -243,6 +254,9 @@ def _create_bar(
     title: str,
     orientation: str,
 ) -> go.Figure:
+    MAX_BARS_H = 30
+    MAX_BARS_V = 20
+
     group_cols = [x_axis]
     if color_column:
         group_cols.append(color_column)
@@ -250,11 +264,18 @@ def _create_bar(
     df_agg = df.groupby(group_cols, as_index=False)[y_axis].sum()
 
     if orientation == "h":
+        if len(df_agg[x_axis].unique()) > MAX_BARS_H:
+            top = df_agg.nlargest(MAX_BARS_H - 1, y_axis)
+            others_sum = df_agg[~df_agg[x_axis].isin(top[x_axis])][y_axis].sum()
+            others_row = pd.DataFrame({x_axis: ["Otros"], y_axis: [others_sum]})
+            df_agg = pd.concat([top, others_row], ignore_index=True)
         fig = px.bar(df_agg, y=x_axis, x=y_axis, color=color_column, title=title, orientation="h")
         fig.update_yaxes(categoryorder="total ascending")
     else:
+        if len(df_agg[x_axis].unique()) > MAX_BARS_V:
+            df_agg = df_agg.nlargest(MAX_BARS_V, y_axis)
         fig = px.bar(df_agg, x=x_axis, y=y_axis, color=color_column, title=title)
-        if len(df_agg[x_axis].unique()) > 20:
+        if len(df_agg[x_axis].unique()) > 10:
             fig.update_xaxes(categoryorder="total descending")
 
     return fig
@@ -344,7 +365,20 @@ def _find_numeric_column(df: pd.DataFrame, exclude: List[str]) -> Optional[str]:
     return None
 
 
-def _apply_layout(fig: go.Figure, title: str, chart_type: str, orientation: str) -> None:
+def _apply_layout(
+    fig: go.Figure,
+    title: str,
+    chart_type: str,
+    orientation: str,
+    df: pd.DataFrame,
+) -> None:
+    base_height = 600
+
+    # Altura dinámica para barras horizontales
+    if chart_type == "bar" and orientation == "h":
+        n_bars = len(fig.data[0].y) if fig.data else len(df)
+        base_height = max(600, min(3000, 30 * n_bars))
+
     fig.update_layout(
         title={
             "text": title,
@@ -357,7 +391,8 @@ def _apply_layout(fig: go.Figure, title: str, chart_type: str, orientation: str)
         plot_bgcolor="#f9fafb",
         hovermode="closest",
         showlegend=chart_type not in ("pie",),
-        margin=dict(l=60, r=40, t=80, b=60),
+        margin=dict(l=80, r=40, t=80, b=60),
+        height=base_height,
     )
 
     if chart_type in ("bar", "line", "scatter"):
@@ -365,4 +400,7 @@ def _apply_layout(fig: go.Figure, title: str, chart_type: str, orientation: str)
         fig.update_xaxes(gridcolor="#e5e7eb", zeroline=False)
 
     if chart_type == "bar" and orientation == "h":
-        fig.update_layout(height=max(600, min(1200, 150 * len(fig.data[0].y))))
+        fig.update_layout(
+            yaxis=dict(tickmode="linear"),
+            xaxis=dict(tickprefix="$" if "venta" in title.lower() or "ingreso" in title.lower() else ""),
+        )
