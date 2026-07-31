@@ -35,7 +35,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Lectura de estado
     plan = state.get("plan")
-    sql_results = state.get("sql_results", [])
+    sql_results = state.get("sql_results")
     viz_result = state.get("viz_result")
     viz_approved = state.get("viz_approved")
     viz_rendered = state.get("viz_rendered", False)
@@ -51,8 +51,31 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         is_success = getattr(viz_result, "status", None) == "success"
         viz_is_valid = has_chart_type and is_success
 
+    if viz_result and not viz_is_valid and not viz_rendered:
+        logger.info("[Supervisor] Viz result inválido (sin chart_type o con error). Saltando renderización.")
+        return make_update(
+            "analyst",
+            viz_rendered=True,
+            messages=[AIMessage(content="[Supervisor] Spec de visualización inválida, se omite render y se continúa.")]
+        )
+
+    if last_agent == "render_plotly" and not viz_is_valid:
+        logger.info("[Supervisor] Prevención de loop post-render fallido. Forzando avance.")
+        return make_update(
+            "analyst",
+            viz_rendered=True,
+            messages=[AIMessage(content="[Supervisor] Render previo no aplicable, continuando.")]
+        )
+
+    # === RUTAS DE FLUJO ===
+
+    # 1. Sin plan → Planner
+    if not plan:
+        logger.info("[Supervisor] Ruteando a Planner - no hay plan")
+        return make_update("planner")
+
     # ------------------------------------------------------------------
-    # Ruta de predicción de demanda (PRIORIDAD MÁXIMA)
+    # 2. Ruta de predicción de demanda (PRIORIDAD MÁXIMA)
     # ------------------------------------------------------------------
     if plan and getattr(plan, "question_type", None) == "demand_forecast":
         if not forecast_results and not forecast_error:
@@ -71,7 +94,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return make_update("__end__")
 
     # ------------------------------------------------------------------
-    # Ruta de informe profundo
+    # 3. Ruta de informe profundo
     # ------------------------------------------------------------------
     if (
         plan
@@ -81,92 +104,50 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("[Supervisor] Ruteando a Researcher - informe profundo solicitado")
         return make_update("researcher")
 
-    # ------------------------------------------------------------------
-    # 1. Sin plan → Planner
-    # ------------------------------------------------------------------
-    if not plan:
-        logger.info("[Supervisor] Ruteando a Planner - no hay plan")
-        return make_update("planner")
-
-    # ------------------------------------------------------------------
-    # 2. Plan requiere seguimiento → terminar con pregunta
-    # ------------------------------------------------------------------
-    if getattr(plan, "needs_followup", False):
-        logger.info("[Supervisor] Plan requiere seguimiento. Finalizando.")
-        return make_update(
-            "__end__",
-            final_answer=getattr(plan, "followup_reason", "Necesito más información para responder."),
-            messages=[AIMessage(content=f"[Supervisor] Seguimiento requerido: {getattr(plan, 'followup_reason', '')}")]
-        )
-
-    # ------------------------------------------------------------------
-    # 3. Con plan pero sin resultados SQL → SQL Agent
-    # ------------------------------------------------------------------
+        # 4. Con plan pero sin resultados SQL → SQL Agent
     if not sql_results:
+        # Guardia anti-loop: si SQL agent ya se ejecutó y sigue sin resultados,
+        # forzamos al analyst para cerrar el flujo con una respuesta.
         if last_agent == "sql_agent":
             logger.warning("[Supervisor] SQL Agent ya ejecutó pero no hay resultados. Forzando analyst.")
             return make_update(
                 "analyst",
                 messages=[AIMessage(
-                    content="[Supervisor] SQL Agent no devolvió resultados tras intentar. Se genera respuesta explicativa."
+                    content="[Supervisor] SQL Agent no devolvió resultados tras intentar. "
+                            "Se genera respuesta explicativa."
                 )]
             )
 
         logger.info("[Supervisor] Ruteando a SQL Agent - no hay resultados")
         return make_update("sql_agent")
 
-    # ------------------------------------------------------------------
-    # 4. Evaluar si hay datos útiles
-    # ------------------------------------------------------------------
-    has_valid_data = any(
-        r.status in ("success", "partial") and len(getattr(r, "rows", [])) > 0
-        for r in sql_results
-    )
 
-    all_sql_failed = all(
-        r.status in ("error", "needs_clarification") or not getattr(r, "can_answer", False)
-        for r in sql_results
-    )
 
-    # ------------------------------------------------------------------
-    # 5. Visualización: solo si hay datos y aún no se intentó
-    # ------------------------------------------------------------------
-    if getattr(plan, "visualization_candidate", False) and viz_result is None and has_valid_data:
-        logger.info("[Supervisor] Ruteando a Viz Agent - visualización solicitada")
+    # 5. Plan pide visualización y aún no hemos corrido el viz_agent
+    if getattr(plan, "visualization_candidate", False) and viz_result is None:
+        logger.info("[Supervisor] Ruteando a Viz Agent - visualización solicitada (sin spec previa)")
         return make_update("viz_agent")
 
-    # Si ya se intentó viz pero falló, marcar como renderizado para avanzar
-    if viz_result is not None and not viz_is_valid and not viz_rendered:
-        logger.info("[Supervisor] Viz result inválido. Saltando renderización y continuando.")
-        return make_update(
-            "analyst",
-            viz_rendered=True,
-            messages=[AIMessage(content="[Supervisor] Spec de visualización inválida, se omite render y se continúa.")]
-        )
-
-    # ------------------------------------------------------------------
-    # 6. Render Plotly
-    # ------------------------------------------------------------------
+    # 6. Hay spec VÁLIDA y aún no renderizada → Render Plotly
     if viz_is_valid and not viz_rendered:
         logger.info("[Supervisor] Ruteando a Render Plotly")
         return make_update("render_plotly")
 
-    # ------------------------------------------------------------------
     # 7. Sin respuesta final → Analyst
-    # ------------------------------------------------------------------
     if not final_answer:
         logger.info("[Supervisor] Ruteando a Analyst - no hay respuesta final")
         return make_update("analyst")
 
-    # ------------------------------------------------------------------
-    # 8. Viz Approval (si aplica)
-    # ------------------------------------------------------------------
+    # 8. Viz ya resuelto y hay datos → Viz Approval (si aplica)
     if viz_is_valid and viz_rendered and viz_approved is None:
-        logger.info("[Supervisor] Ruteando a Viz Approval")
-        return make_update("viz_approval")
+        suitable_results = [
+            r for r in sql_results
+            if getattr(r, "can_answer", False) and len(getattr(r, "rows", [])) > 0
+        ]
+        if suitable_results:
+            logger.info("[Supervisor] Ruteando a Viz Approval")
+            return make_update("viz_approval")
 
-    # ------------------------------------------------------------------
     # 9. Todo listo → Fin
-    # ------------------------------------------------------------------
     logger.info("[Supervisor] Todo completado, finalizando")
     return make_update("__end__")
