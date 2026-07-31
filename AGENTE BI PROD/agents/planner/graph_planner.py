@@ -1,3 +1,5 @@
+# core/graph_planner.py
+# -------------------------------------------------
 from typing import Any, Dict, List, Optional, Set
 import json
 import logging
@@ -7,6 +9,12 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from core.llm import LLM
 from core.contracts import PlannerContract, SQLPayload
 from core.harness import BusinessMemory
+# NUEVO: Integración con semantic_retriever
+from core.semantic_retriever import (
+    obtener_candidatas_detalles,
+    payload_to_column_hints,
+    seleccionar_vista_principal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +23,7 @@ _biz_mem = BusinessMemory.from_file()
 
 
 # ------------------------------------------------------------------
-# NUEVO: Detección de demand forecast
+# Detección de demand forecast
 # ------------------------------------------------------------------
 FORECAST_KEYWORDS = [
     "pronosticar", "predicción", "predice", "forecast",
@@ -39,18 +47,12 @@ def _is_demand_forecast_question(question: str) -> bool:
 
 
 def _extract_forecast_params(question: str) -> Dict[str, Any]:
-    """
-    Extrae producto y sede de la pregunta usando LLM con structured output.
-    Fallback a regex simple si el LLM falla.
-    """
     parser = LLM.with_structured_output(_ForecastParamsInternal)
-
     try:
         result = parser.invoke(
             f"Extrae los parámetros para predecir demanda de la siguiente pregunta. "
             f"Si no hay fecha de inicio, devuelve null.\n\nPregunta: {question}"
         )
-        # langchain-openai 0.1.8 puede devolver dict
         if isinstance(result, dict):
             result = _ForecastParamsInternal(**result)
         return result.model_dump()
@@ -60,31 +62,16 @@ def _extract_forecast_params(question: str) -> Dict[str, Any]:
 
 
 def _fallback_extract_forecast_params(question: str) -> Dict[str, Any]:
-    """
-    Regex simple para extraer producto/sede si el LLM falla.
-    """
     q = question.lower()
-
-    # Sedes conocidas
     sedes = ["plaza bolsillo", "merced", "tajamar", "persa victor manuel"]
-    sede_detectada = None
-    for sede in sedes:
-        if sede in q:
-            sede_detectada = sede.title()
-            break
+    sede_detectada = next((sede.title() for sede in sedes if sede in q), None)
 
-    # Productos comunes
     productos = [
         "americano", "capuccino", "latte", "espresso", "mokaccino",
         "cortado", "flat white", "iced latte", "chai latte", "chocolate caliente"
     ]
-    producto_detectado = None
-    for prod in productos:
-        if prod in q:
-            producto_detectado = prod
-            break
+    producto_detectado = next((prod for prod in productos if prod in q), None)
 
-    # Días
     n_dias = 7
     dias_match = re.search(r"(\d+)\s*días?|(\d+)\s*dias?", q)
     if dias_match:
@@ -103,6 +90,7 @@ def _normalize(text: str) -> str:
 
 
 def _column_exists(view_info, column_name: str) -> bool:
+    """Validación léxica rápida de existencia de columna en una vista."""
     if not view_info:
         return False
 
@@ -158,11 +146,16 @@ def _build_view_catalog(allowed_views: List[str]) -> Dict[str, Any]:
     return catalog
 
 
-def _validate_task_integrity(task, catalog: Dict[str, Any]) -> List[str]:
+def _validate_task_integrity(task, allowed_views: List[str]) -> List[str]:
+    """Validación léxica final: la vista asignada existe y tiene las columnas."""
     errors = []
     preferred = task.preferred_view
     if not preferred:
         errors.append("La tarea no tiene preferred_view asignada.")
+        return errors
+
+    if preferred not in allowed_views:
+        errors.append(f"La vista '{preferred}' no está en allowed_views.")
         return errors
 
     view_name = preferred.replace("semantic.", "").strip()
@@ -171,26 +164,25 @@ def _validate_task_integrity(task, catalog: Dict[str, Any]) -> List[str]:
         errors.append(f"La vista '{preferred}' no está documentada en AGENTS.md.")
         return errors
 
-    required_metrics = getattr(task, "metrics", []) or []
-    for metric in required_metrics:
+    for metric in (getattr(task, "metrics", []) or []):
         if not _column_exists(view_info, metric):
             errors.append(
                 f"La vista '{view_name}' no contiene la métrica/columna '{metric}'. "
-                f"Columnas disponibles: {list(view_info.metricas.keys()) + view_info.columnas_fecha}"
+                f"Disponibles: {list(view_info.metricas.keys()) + view_info.columnas_fecha}"
             )
 
-    required_dimensions = getattr(task, "dimensions", []) or []
-    for dim in required_dimensions:
+    for dim in (getattr(task, "dimensions", []) or []):
         if not _column_exists(view_info, dim):
             errors.append(
                 f"La vista '{view_name}' no contiene la dimensión/columna '{dim}'. "
-                f"Columnas disponibles: {list(view_info.metricas.keys()) + view_info.columnas_fecha}"
+                f"Disponibles: {list(view_info.metricas.keys()) + view_info.columnas_fecha}"
             )
 
     return errors
 
 
-def _find_compatible_view(task, catalog: Dict[str, Any], allowed_views: List[str]) -> Optional[str]:
+def _find_compatible_view(task, allowed_views: List[str]) -> Optional[str]:
+    """Fallback léxico: busca una vista en allowed_views que tenga todas las columnas requeridas."""
     required_cols = set()
     for metric in (getattr(task, "metrics", []) or []):
         required_cols.add(_normalize(metric))
@@ -202,6 +194,8 @@ def _find_compatible_view(task, catalog: Dict[str, Any], allowed_views: List[str
 
     candidate_views = getattr(task, "candidate_views", []) or allowed_views
     for view_full_name in candidate_views:
+        if view_full_name not in allowed_views:
+            continue
         view_name = view_full_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(view_name)
         if not view_info:
@@ -224,6 +218,115 @@ def _find_compatible_view(task, catalog: Dict[str, Any], allowed_views: List[str
     return None
 
 
+def _ensure_semantic_prefix(view_name: Optional[str]) -> Optional[str]:
+    if not view_name:
+        return None
+    return view_name if view_name.startswith("semantic.") else f"semantic.{view_name}"
+
+
+# ------------------------------------------------------------------
+# NUEVO: Selección de vista unificada (Retriever + Fallback léxico)
+# ------------------------------------------------------------------
+def _select_view_for_task(
+    task: SQLPayload,
+    allowed_views: List[str],
+    original_query: str = ""
+) -> tuple[Optional[str], List[str], List[str]]:
+    """
+    Selecciona la vista para una subtarea usando semantic_retriever,
+    con fallback léxico si Chroma falla.
+
+    Retorna: (preferred_view, candidate_views, errors)
+    """
+    errors: List[str] = []
+
+    # Hints estructurados desde el payload
+    hints = payload_to_column_hints(task, original_query=original_query or task.task)
+
+    # Candidatos originales propuestos por el LLM (normalizados)
+    original_candidates = list(getattr(task, "candidate_views", []) or [])
+    original_candidates = [
+        _ensure_semantic_prefix(cv)
+        for cv in original_candidates
+        if cv and _ensure_semantic_prefix(cv) in allowed_views
+    ]
+
+    preferred: Optional[str] = None
+    retriever_candidates: List[str] = []
+
+    try:
+        # UNA sola llamada al retriever; reutilizamos detalles
+        detailed = obtener_candidatas_detalles(
+            query=task.task,
+            k=5,
+            allowed_views=allowed_views,
+            column_hints=hints,
+        )
+
+        # Candidatos ordenados del retriever
+        retriever_candidates = [
+            _ensure_semantic_prefix(c["view_name"])
+            for c in detailed
+            if _ensure_semantic_prefix(c["view_name"]) in allowed_views
+        ]
+
+        # Elegir la primera compatible; si ninguna lo es, la de mayor score
+        for c in detailed:
+            if c.get("can_answer"):
+                preferred = _ensure_semantic_prefix(c["view_name"])
+                break
+
+        if not preferred and detailed:
+            preferred = _ensure_semantic_prefix(detailed[0]["view_name"])
+            errors.append(
+                f"Tarea {task.task_id}: ninguna vista es completamente compatible; "
+                f"se usará la mejor disponible: {preferred}"
+            )
+
+    except Exception as e:
+        logger.warning(f"[Planner] semantic_retriever falló para tarea {task.task_id}: {e}")
+        # Fallback léxico
+        preferred = _find_compatible_view(task, allowed_views)
+        if not preferred and original_candidates:
+            preferred = original_candidates[0]
+        if not preferred:
+            errors.append(f"Tarea {task.task_id}: no se pudo seleccionar vista (retriever y fallback léxico fallaron).")
+
+    # Si el retriever no devolvió nada usable, intentar fallback léxico
+    if not preferred:
+        preferred = _find_compatible_view(task, allowed_views)
+
+    # Fusionar candidate_views: retriever primero, luego originales válidos
+    merged_candidates: List[str] = []
+    seen: Set[str] = set()
+    for cv in retriever_candidates + original_candidates:
+        if cv and cv not in seen and cv in allowed_views:
+            merged_candidates.append(cv)
+            seen.add(cv)
+    if preferred and preferred not in seen:
+        merged_candidates.insert(0, preferred)
+
+    # Validación léxica final
+    if preferred:
+        task.preferred_view = preferred
+        task.candidate_views = merged_candidates
+        lexical_errors = _validate_task_integrity(task, allowed_views)
+        if lexical_errors:
+            # Intentar corregir con fallback léxico
+            fallback = _find_compatible_view(task, allowed_views)
+            if fallback:
+                logger.info(f"[Planner] Fallback léxico a {fallback}")
+                preferred = fallback
+                task.preferred_view = preferred
+                if preferred not in merged_candidates:
+                    merged_candidates.insert(0, preferred)
+                task.candidate_views = merged_candidates
+            else:
+                errors.extend([f"Tarea {task.task_id}: {err}" for err in lexical_errors])
+
+    return preferred, merged_candidates, errors
+
+
 # ------------------------------------------------------------------
 # Nodo principal
 # ------------------------------------------------------------------
@@ -238,7 +341,7 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"[Planner] preferred_view={harness.get('preferred_view')}")
 
     if not allowed_views:
-        logger.error("[Planner] ERROR CRÍTICO: allowed_views está vacío. El harness no cargó vistas.")
+        logger.error("[Planner] ERROR CRÍTICO: allowed_views está vacío.")
         plan = PlannerContract(
             intent="unknown",
             goal="",
@@ -266,7 +369,6 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info("[Planner] Detectada pregunta de demand forecast")
         params = _extract_forecast_params(question)
 
-        # Si el LLM no logró extraer, usar fallback
         if not params.get("producto") or not params.get("sede"):
             params = _fallback_extract_forecast_params(question)
 
@@ -375,10 +477,6 @@ REGLAS DE NEGOCIO:
 - "Canjes", "fidelización", "puntos" → vistas de FIDELIZACIÓN.
 - "Cortesías", "gratis", "regalos" → vistas de CORTESÍA.
 
-REGLAS DE DEMAND FORECAST:
-- "Predice", "pronostica", "cuánto se venderá", "demanda futura" → question_type="demand_forecast".
-- El planner detectará esto automáticamente y extraerá producto/sede/n_días.
-
 OUTPUT: JSON con schema PlannerContract.
 - tasks: lista de SQLPayload con task_id, task, execution_strategy, metrics, dimensions, candidate_views, preferred_view.
 - needs_followup: true si hay ambigüedad insalvable.
@@ -391,53 +489,31 @@ REGLAS ADICIONALES:
     planner_llm = LLM.with_structured_output(PlannerContract, method="function_calling")
     plan_raw = planner_llm.invoke([system, human])
 
-    # langchain-openai 0.1.8 con function_calling puede devolver dict
     if isinstance(plan_raw, dict):
         plan = PlannerContract(**plan_raw)
     else:
         plan = plan_raw
 
     # ============================================================
-    # VALIDACIÓN DE INTEGRIDAD POST-LLM
+    # VALIDACIÓN Y ENRIQUECIMIENTO SEMÁNTICO POST-LLM
     # ============================================================
     validation_errors: List[str] = []
 
-    # Seguridad: si por alguna razón el LLM devolvió demand_forecast con tareas SQL, limpiamos
     if plan.question_type == "demand_forecast":
         plan.tasks = []
         plan.visualization_candidate = False
 
     for task in plan.tasks:
-        if task.preferred_view and not task.preferred_view.startswith("semantic."):
-            task.preferred_view = f"semantic.{task.preferred_view}"
+        preferred, candidates, errs = _select_view_for_task(task, allowed_views, original_query=question)
 
-        for i, cv in enumerate(task.candidate_views or []):
-            if not cv.startswith("semantic."):
-                task.candidate_views[i] = f"semantic.{cv}"
+        if errs:
+            validation_errors.extend(errs)
 
-        if task.preferred_view and task.preferred_view not in allowed_views:
-            fallback = _find_compatible_view(task, view_catalog, allowed_views)
-            if fallback:
-                logger.info(f"[Planner] Fallback de {task.preferred_view} a {fallback}")
-                task.preferred_view = fallback
-                if fallback not in (task.candidate_views or []):
-                    task.candidate_views = list(task.candidate_views or []) + [fallback]
-            else:
-                validation_errors.append(
-                    f"Tarea {task.task_id}: {task.preferred_view} no está en allowed_views."
-                )
-                continue
-
-        task_errors = _validate_task_integrity(task, view_catalog)
-        if task_errors:
-            fallback = _find_compatible_view(task, view_catalog, allowed_views)
-            if fallback:
-                logger.info(f"[Planner] Fallback por columnas incompatibles a {fallback}")
-                task.preferred_view = fallback
-                if fallback not in (task.candidate_views or []):
-                    task.candidate_views = list(task.candidate_views or []) + [fallback]
-            else:
-                validation_errors.extend([f"Tarea {task.task_id}: {err}" for err in task_errors])
+        if preferred:
+            task.preferred_view = preferred
+            task.candidate_views = candidates
+        else:
+            validation_errors.append(f"Tarea {task.task_id}: no se pudo asignar ninguna vista.")
 
     # ============================================================
     # FALLBACK: Si no se generaron tareas, crear una tarea genérica
@@ -445,7 +521,16 @@ REGLAS ADICIONALES:
     if not plan.tasks and plan.question_type not in ("demand_forecast", "unknown"):
         logger.warning(f"[Planner] LLM no generó tareas. Creando tarea fallback.")
         if allowed_views:
-            default_view = allowed_views[0]
+            hints = {"original_query": question}
+            try:
+                default_vista = seleccionar_vista_principal(query=question, column_hints=hints, allowed_views=allowed_views)
+                default_view = default_vista["view_name"] if default_vista else allowed_views[0]
+            except Exception as e:
+                logger.warning(f"[Planner] Retriever falló en fallback general: {e}")
+                default_view = allowed_views[0]
+
+            default_view = _ensure_semantic_prefix(default_view)
+
             plan.tasks = [
                 SQLPayload(
                     task_id="1",

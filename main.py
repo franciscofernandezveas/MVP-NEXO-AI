@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 import traceback
-import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -208,34 +207,14 @@ def health():
     return {"status": "ok", "version": "6.1.0-mvp"}
 
 # ============================================================================
-# 8. LIFESPAN CON PRECARGA DEL ORQUESTADOR
+# 8. LIFESPAN
 # ============================================================================
-
-_orchestrator_ready = False
-
-
-def _preload_orchestrator():
-    """Carga el orquestador en un hilo separado al arrancar."""
-    global _orchestrator_ready
-    try:
-        logger.info("🔌 Precargando orquestador BI...")
-        from core.orchestrator import BI_ORCHESTRATOR
-        _ = BI_ORCHESTRATOR  # fuerza importación completa
-        _orchestrator_ready = True
-        logger.info("✅ Orquestador BI precargado.")
-    except Exception as e:
-        logger.error(f"❌ Error precargando orquestador BI: {e}", exc_info=True)
-        _orchestrator_ready = False
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🟢 Nexo API iniciada")
-    # Precargar orquestador en hilo en segundo plano
-    threading.Thread(target=_preload_orchestrator, daemon=True).start()
     yield
     logger.info("🛑 Nexo API finalizada")
-
 
 app.router.lifespan_context = lifespan
 
