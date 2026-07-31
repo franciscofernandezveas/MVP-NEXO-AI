@@ -1,6 +1,5 @@
-"""
-core/harness.py
-"""
+# core/harness.py
+# -------------------------------------------------
 
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from core.semantic_retriever import (
     obtener_candidatas_detalles,
     seleccionar_vista_principal,
-    _detect_temporal_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,7 +26,7 @@ DEFAULT_AGENTS_MD_PATH = Path(
 
 
 # ============================================================================
-# Normalización de preguntas
+# Normalización de preguntas y nombres de vistas
 # ============================================================================
 
 def _normalize_question(question: str) -> str:
@@ -45,6 +43,21 @@ def _normalize_question(question: str) -> str:
     q = re.sub(r"[¿?!¡.,;:\"'`()\[\]{}]", "", q)
     q = re.sub(r"\s+", " ", q)
     return q
+
+
+def _clean_view_name(view_name: str) -> str:
+    """Elimina el prefijo 'semantic.' si existe."""
+    if not view_name:
+        return ""
+    return view_name.lower().replace("semantic.", "").strip()
+
+
+def _with_semantic_prefix(view_name: str) -> Optional[str]:
+    """Garantiza que el nombre de vista tenga el prefijo 'semantic.'."""
+    if not view_name:
+        return None
+    clean = _clean_view_name(view_name)
+    return f"semantic.{clean}"
 
 
 # ============================================================================
@@ -108,22 +121,12 @@ class BusinessMemory:
 
     @staticmethod
     def _is_valid_view_name(name: str) -> bool:
-        """
-        Filtra títulos de sección del markdown que NO son vistas de base de datos.
-        Ejemplos de falsas vistas: '1.1 Prioridad de Vistas', '4.2 Sintaxis de filtros de fecha'.
-        """
         if not name or not name.strip():
             return False
-
-        # Títulos de sección tipo "1.1 Algo", "4.2 Otra cosa"
         if re.match(r"^\d+(\.\d+)+\s+\w", name):
             return False
-
-        # Nombres que parecen títulos de documentación: tienen espacios pero no guiones bajos
-        # Las vistas reales usan snake_case o al menos no tienen espacios sueltos
         if " " in name and "_" not in name:
             return False
-
         return True
 
     def _parse(self):
@@ -136,8 +139,6 @@ class BusinessMemory:
 
             if line.startswith("### "):
                 nombre_vista = line.replace("### ", "").strip()
-
-                # NUEVO: saltar títulos de sección que no son vistas reales
                 if not self._is_valid_view_name(nombre_vista):
                     current_view = None
                     section = None
@@ -226,7 +227,7 @@ class BusinessMemory:
         return match.group(1).strip() if match else None
 
     def get_view(self, view_name: str) -> Optional[ViewInfo]:
-        return self.views.get(view_name)
+        return self.views.get(_clean_view_name(view_name))
 
     def list_views(self) -> List[str]:
         return list(self.views.keys())
@@ -241,35 +242,20 @@ class BusinessMemory:
 # ============================================================================
 
 def is_view_allowed(view_name: str, biz_mem: BusinessMemory) -> bool:
-    """
-    Una vista es segura si existe documentada en AGENTS.md.
-    Acepta nombres con o sin prefijo 'semantic.'.
-    """
     if not view_name:
         return False
-    clean = view_name.replace("semantic.", "").strip()
-    return biz_mem.get_view(clean) is not None
+    return biz_mem.get_view(view_name) is not None
 
 
 def extract_views_from_sql(sql: str) -> Set[str]:
-    """
-    Extrae vistas referenciadas en una query SQL (solo esquema semantic).
-    """
     if not sql:
         return set()
     pattern = r"(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)"
     matches = re.findall(pattern, sql, re.IGNORECASE)
-    views = set()
-    for match in matches:
-        views.add(match.lower())
-    return views
+    return set(matches)
 
 
 def validate_sql_views(sql: str, biz_mem: BusinessMemory) -> Tuple[bool, List[str]]:
-    """
-    Valida que todas las vistas usadas en el SQL estén documentadas.
-    Devuelve (is_valid, list_of_errors).
-    """
     used_views = extract_views_from_sql(sql)
     invalid = [v for v in used_views if not is_view_allowed(v, biz_mem)]
     return len(invalid) == 0, invalid
@@ -286,9 +272,6 @@ def build_harness_context(
     include_rules: bool = True,
     rules_md: Optional[str] = None,
 ) -> str:
-    """
-    Construye el contexto semántico como string a partir de candidatas del retriever.
-    """
     if biz_mem is None:
         biz_mem = BusinessMemory.from_file()
 
@@ -311,6 +294,7 @@ def build_harness_context(
         view_name = c.get("view_name") if isinstance(c, dict) else str(c)
         if not view_name:
             continue
+        view_name = _clean_view_name(view_name)
         view_names.append(view_name)
 
         view_info = biz_mem.get_view(view_name)
@@ -325,7 +309,6 @@ def build_harness_context(
 
     semantic_context = "\n\n".join(semantic_parts)
 
-    # Notas de ambigüedad
     ambiguity_notes: List[str] = []
     if user_question and view_names:
         detector = AmbiguityDetector(biz_mem)
@@ -458,7 +441,6 @@ def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optiona
     """
     q = _normalize_question(question)
 
-    # Mapeo de intención a vistas candidatas (en orden de preferencia)
     keyword_map = [
         (["venta", "vendido", "vendidos", "unidades vendidas", "ingreso"], [
             "sales_producto_daily",
@@ -493,15 +475,15 @@ def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optiona
     for keywords, candidate_views in keyword_map:
         if any(k in q for k in keywords):
             for cv in candidate_views:
-                if cv in allowed_views:
-                    return cv
+                clean_cv = _clean_view_name(cv)
+                if clean_cv in [_clean_view_name(v) for v in allowed_views]:
+                    return clean_cv
 
-    # Fallback general: primera vista de ventas, o la primera permitida
     sales_views = [v for v in allowed_views if "sales" in v or "kpi" in v]
     if sales_views:
-        return sales_views[0]
+        return _clean_view_name(sales_views[0])
 
-    return allowed_views[0] if allowed_views else None
+    return _clean_view_name(allowed_views[0]) if allowed_views else None
 
 
 # ============================================================================
@@ -515,63 +497,95 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
     """
     biz_mem = BusinessMemory.from_file()
 
-    # Recuperar candidatas del retriever vectorial con k amplio
-    candidatas_detalle = obtener_candidatas_detalles(
-        query=normalized_question,
-        k=10,
-        allowed_views=None,
-        min_score_threshold=-999.0,
-        column_hints={"original_query": normalized_question},
-    )
+    # FIX 1: Umbral razonable; no desactivar completamente la selección
+    MIN_SCORE_THRESHOLD = -5.0
+    MAX_FALLBACK_VIEWS = 3
 
-    # Si no hay candidatas, fallback a todas las vistas documentadas (ahora solo reales)
+    candidatas_detalle: List[Dict[str, Any]] = []
+    preferred_view: Optional[str] = None
+
+    try:
+        # FIX 2: Una sola llamada al retriever con umbral proporcional
+        candidatas_detalle = obtener_candidatas_detalles(
+            query=normalized_question,
+            k=10,
+            allowed_views=None,
+            min_score_threshold=MIN_SCORE_THRESHOLD,
+            column_hints={"original_query": normalized_question},
+        )
+
+        # FIX 3: Seleccionar vista principal usando el mismo retriever
+        vista_principal_obj = seleccionar_vista_principal(
+            query=normalized_question,
+            column_hints={"original_query": normalized_question},
+            allowed_views=None,
+            min_score_threshold=MIN_SCORE_THRESHOLD,
+        )
+        if vista_principal_obj:
+            preferred_view = _clean_view_name(vista_principal_obj["view_name"])
+
+    except Exception as e:
+        logger.warning(f"[Harness] Retriever falló: {e}. Usando fallback léxico.")
+        candidatas_detalle = []
+
+    # FIX 4: Fallback inteligente limitado (NO todas las vistas)
     if not candidatas_detalle:
-        logger.warning("Retriever no devolvió candidatas. Fallback a todas las vistas de AGENTS.md")
+        logger.warning(
+            "[Harness] Retriever no devolvió candidatas. Usando fallback léxico acotado."
+        )
+        default_v = _fallback_preferred_view(normalized_question, biz_mem.list_views())
+        fallback_views = [default_v] if default_v else ["sales_producto_daily"]
+        fallback_views = [
+            v for v in fallback_views
+            if v and biz_mem.get_view(v)
+        ]
+        if not fallback_views:
+            fallback_views = [
+                v for v in ["sales_producto_daily", "sales_review_day", "sales_week"]
+                if biz_mem.get_view(v)
+            ][:MAX_FALLBACK_VIEWS]
+
         candidatas_detalle = [
             {
                 "view_name": v,
                 "score": 0.0,
                 "original_score": 0.0,
                 "metadata_boost": 0.0,
+                "can_answer": True,
             }
-            for v in biz_mem.list_views()
+            for v in fallback_views
         ]
+        preferred_view = fallback_views[0] if fallback_views else None
 
-    # Determinar vista principal
-    vista_principal_obj = seleccionar_vista_principal(
-        query=normalized_question,
-        column_hints={"original_query": normalized_question},
-        allowed_views=None,
-        min_score_threshold=-999.0,
-    )
-    preferred_view = vista_principal_obj["view_name"] if vista_principal_obj else None
-
-    # allowed_views = todas las candidatas recuperadas + todas las vistas documentadas reales
+    # FIX 5: Construir allowed_views acotado y normalizado
     allowed_views_set: Set[str] = set()
     for c in candidatas_detalle:
         vn = c.get("view_name")
         if vn:
-            allowed_views_set.add(vn)
+            allowed_views_set.add(_clean_view_name(vn))
 
-    # Asegurar que la vista principal esté incluida
-    if preferred_view and preferred_view not in allowed_views_set:
-        allowed_views_set.add(preferred_view)
+    if preferred_view:
+        allowed_views_set.add(_clean_view_name(preferred_view))
 
-    # Asegurar que todas las vistas documentadas reales estén permitidas
-    for documented_view in biz_mem.list_views():
-        allowed_views_set.add(documented_view)
+    # Asegurar un mínimo de contexto sin inyectar TODO el catálogo
+    if len(allowed_views_set) < 2:
+        for v in ["sales_producto_daily", "sales_review_day", "sales_review_locales_latest"]:
+            if biz_mem.get_view(v):
+                allowed_views_set.add(v)
 
-    allowed_views = sorted(allowed_views_set)
+    # FIX 6: NO agregar automáticamente todas las vistas documentadas a allowed_views
+    # El catálogo completo ya se expone en all_documented_views para referencia.
+    allowed_views_clean = sorted(allowed_views_set)
 
-    # NUEVO: si no hay vista principal, usar fallback por keywords
+    # FIX 7: Si no hay vista principal, usar fallback por keywords
     if not preferred_view:
-        preferred_view = _fallback_preferred_view(normalized_question, allowed_views)
+        preferred_view = _fallback_preferred_view(normalized_question, allowed_views_clean)
         logger.info(f"[Harness] Fallback preferred_view: {preferred_view}")
 
-    # Construir contexto semántico solo para las top candidatas
-    top_candidates = candidatas_detalle[:5] if len(candidatas_detalle) >= 5 else candidatas_detalle
+    # FIX 8: Contexto semántico solo sobre top relevantes
+    top_candidates = candidatas_detalle[:5]
 
-    # NUEVO: si las top candidates están vacías o son malas, usar la preferred_view
+    # Si la mejor candidata no puede responder, preferimos la principal fallback
     if not top_candidates and preferred_view:
         top_candidates = [{"view_name": preferred_view, "score": 0.0}]
 
@@ -582,8 +596,12 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
         include_rules=True,
     )
 
-    # NUEVO: ambigüedad solo sobre top candidates, no sobre todas las vistas
-    ambiguity_views = [c.get("view_name") for c in top_candidates if c.get("view_name")]
+    # FIX 9: Ambigüedad solo sobre vistas relevantes
+    ambiguity_views = [
+        _clean_view_name(c.get("view_name"))
+        for c in top_candidates
+        if c.get("view_name")
+    ]
     if preferred_view and preferred_view not in ambiguity_views:
         ambiguity_views.append(preferred_view)
 
@@ -592,10 +610,10 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
 
     return {
         "semantic_context": semantic_context,
-        "allowed_views": [f"semantic.{v}" for v in allowed_views],
-        "preferred_view": f"semantic.{preferred_view}" if preferred_view else None,
+        "allowed_views": [_with_semantic_prefix(v) for v in allowed_views_clean],
+        "preferred_view": _with_semantic_prefix(preferred_view),
         "ambiguity_notes": ambiguity_notes,
-        "all_documented_views": [f"semantic.{v}" for v in biz_mem.list_views()],
+        "all_documented_views": [_with_semantic_prefix(v) for v in biz_mem.list_views()],
     }
 
 
@@ -611,7 +629,7 @@ def build_harness_context_cached(question: str) -> Dict[str, Any]:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    pregunta = "¿Cuántos canjes de fidelización hubo por sede el mes pasado?"
+    pregunta = "productos mas vendidos en merced en junio de 2026"
     context_pack = build_harness_context_cached(pregunta)
 
     print("preferred_view:", context_pack["preferred_view"])
