@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 
 import sqlparse
 from sqlparse.sql import Identifier, IdentifierList
-from sqlparse.tokens import Keyword
+from sqlparse.tokens import Keyword, Token
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
@@ -140,7 +140,12 @@ def _filters_to_sql_description(filters: List[Dict[str, Any]]) -> str:
 
 def _extract_table_aliases(sql: str) -> Dict[str, str]:
     aliases: Dict[str, str] = {}
-    parsed = sqlparse.parse(sql)
+    try:
+        parsed = sqlparse.parse(sql)
+    except Exception as e:
+        logger.warning(f"[SQL] sqlparse falló: {e}")
+        return aliases
+
     for stmt in parsed:
         tokens = list(stmt.tokens)
         for idx, token in enumerate(tokens):
@@ -167,10 +172,33 @@ def _parse_from_token(token, aliases):
             _parse_single_identifier(ident, aliases)
     elif isinstance(token, Identifier):
         _parse_single_identifier(token, aliases)
+    elif isinstance(token, Token):
+        # Token simple: tabla sin alias, subquery abreviada, etc.
+        value = token.value.strip()
+        if value.startswith("semantic."):
+            real = value.replace("semantic.", "")
+            aliases[real] = real
 
 
 def _parse_single_identifier(identifier, aliases):
-    parts = [t for t in identifier.tokens if not t.is_whitespace and t.value.upper() != "AS"]
+    # Manejar Token simple (tabla sin alias ni AS)
+    if isinstance(identifier, Token) and not isinstance(identifier, Identifier):
+        name = identifier.value.strip()
+        if name.startswith("semantic."):
+            real = name.replace("semantic.", "")
+            aliases[real] = real
+        return
+
+    try:
+        parts = [t for t in identifier.tokens if not t.is_whitespace and t.value.upper() != "AS"]
+    except AttributeError:
+        # No es un Identifier con .tokens
+        name = identifier.value.strip() if hasattr(identifier, "value") else str(identifier)
+        if name.startswith("semantic."):
+            real = name.replace("semantic.", "")
+            aliases[real] = real
+        return
+
     if not parts:
         return
     name = parts[0].value.strip()
@@ -182,7 +210,12 @@ def _parse_single_identifier(identifier, aliases):
 
 
 def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
-    aliases = _extract_table_aliases(sql)
+    try:
+        aliases = _extract_table_aliases(sql)
+    except Exception as e:
+        logger.warning(f"[SQL] No se pudo parsear aliases: {e}. Saltando validación de columnas.")
+        return True, ""
+
     if not aliases:
         return True, ""
 
@@ -192,7 +225,12 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
     }
     invalid: List[str] = []
 
-    parsed = sqlparse.parse(sql)
+    try:
+        parsed = sqlparse.parse(sql)
+    except Exception as e:
+        logger.warning(f"[SQL] No se pudo parsear SQL: {e}. Saltando validación de columnas.")
+        return True, ""
+
     for stmt in parsed:
         for token in stmt.flatten():
             if token.ttype is None:
