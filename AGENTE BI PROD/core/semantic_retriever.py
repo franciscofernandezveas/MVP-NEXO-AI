@@ -7,9 +7,6 @@ import re
 from datetime import datetime
 import os
 
-from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
-
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,12 +15,32 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
 COLLECTION_NAME = "semantic_views"
 
-_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-_vector_store = Chroma(
-    collection_name=COLLECTION_NAME,
-    embedding_function=_embeddings,
-    persist_directory=str(CHROMA_DIR),
-)
+# ------------------------------------------------------------------
+# INICIALIZACIÓN DEFENSIVA DE CHROMA Y EMBEDDINGS
+# ------------------------------------------------------------------
+_embeddings = None
+_vector_store = None
+
+try:
+    from langchain_openai import OpenAIEmbeddings
+    _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+except Exception as e:
+    logger.error(f"[SemanticRetriever] No se pudo inicializar embeddings: {e}")
+
+try:
+    from langchain_chroma import Chroma
+    if _embeddings:
+        _vector_store = Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=_embeddings,
+            persist_directory=str(CHROMA_DIR),
+        )
+        logger.info("[SemanticRetriever] Chroma inicializado correctamente.")
+    else:
+        logger.warning("[SemanticRetriever] Chroma no inicializado: embeddings no disponibles.")
+except Exception as e:
+    logger.error(f"[SemanticRetriever] No se pudo inicializar Chroma: {e}")
+    _vector_store = None
 
 
 def _validate_chroma_filter(allowed_views: Optional[List[str]]) -> Dict[str, Any]:
@@ -390,6 +407,10 @@ def obtener_candidatas_vistas(
     min_score_threshold: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Devuelve `k` vistas candidatas como diccionarios."""
+    if not _vector_store:
+        logger.warning("[SemanticRetriever] Chroma no disponible. No se recuperarán vistas.")
+        return []
+    
     search_kwargs = {"k": k}
     filter_dict = _validate_chroma_filter(allowed_views)
     if filter_dict:
@@ -401,9 +422,13 @@ def obtener_candidatas_vistas(
     except Exception as e:
         logger.warning(f"similarity_search_with_score falló: {e}")
         logger.info("Intentando con as_retriever...")
-        retriever = _vector_store.as_retriever(search_kwargs=search_kwargs)
-        docs = retriever.invoke(query)
-        docs_with_scores = [(doc, 0.0) for doc in docs]
+        try:
+            retriever = _vector_store.as_retriever(search_kwargs=search_kwargs)
+            docs = retriever.invoke(query)
+            docs_with_scores = [(doc, 0.0) for doc in docs]
+        except Exception as e2:
+            logger.error(f"[SemanticRetriever] Retrieval falló completamente: {e2}")
+            return []
 
     temporal_context = _detect_temporal_context(query)
     
@@ -579,6 +604,9 @@ def seleccionar_vista_principal(
 # NUEVO: RESOLUCIÓN SEMÁNTICA SOBRE CATÁLOGO DOCUMENTADO (BusinessMemory)
 # ------------------------------------------------------------------
 
+# NOTA: Lazy singleton para evitar import circular con core.harness.
+# core.harness importa funciones de este módulo durante su carga,
+# por lo que no podemos importar BusinessMemory a nivel de módulo aquí.
 _biz_mem_catalog = None
 
 
