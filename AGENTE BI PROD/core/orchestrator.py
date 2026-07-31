@@ -192,24 +192,89 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    sql_results = state.get("sql_results", []) or []
+    plan = state.get("plan")
+
+    if not sql_results:
+        logger.warning("[Viz Agent Node] No hay resultados SQL")
+        return {
+            "viz_result": None,
+            "last_agent": "viz_agent",
+            "messages": [AIMessage(content="[Viz Agent] Sin datos SQL para visualizar")]
+        }
+
+    # Elegir la primera tarea exitosa con datos
+    primary_result = next(
+        (
+            r for r in sql_results
+            if getattr(r, "status", None) in ("success", "partial")
+            and getattr(r, "row_count", 0) > 0
+        ),
+        sql_results[0]
+    )
+
+    rows = getattr(primary_result, "rows", []) or []
+    columns = getattr(primary_result, "columns", []) or []
+
+    # Normalizar chart_type_hint (plan puede ser dict o Pydantic object)
+    chart_type_hint = "auto"
+    if plan:
+        if isinstance(plan, dict):
+            chart_type_hint = plan.get("chart_type_hint") or "auto"
+        else:
+            chart_type_hint = getattr(plan, "chart_type_hint", None) or "auto"
+
     viz_input = {
         "question": state["question"],
-        "sql_rows": state["sql_results"][0].rows if state["sql_results"] and len(state["sql_results"]) > 0 else [],
-        "sql_columns": state["sql_results"][0].columns if state["sql_results"] and len(state["sql_results"]) > 0 else [],
-        "chart_type_hint": getattr(state.get("plan"), "chart_type_hint", "auto"),
+        "sql_rows": rows,
+        "sql_columns": columns,
+        "chart_type_hint": chart_type_hint,
         "messages": [],
         "figure_spec": None,
         "error_message": "",
         "attempts": 0,
-        "contract": None
+        "contract": None,
     }
 
-    viz_result = VIZ_SUBGRAPH.invoke(viz_input)
-    return {
-        "viz_result": viz_result["contract"],
-        "last_agent": "viz_agent",
-        "messages": [AIMessage(content="[Viz Agent] Especificación de visualización generada")]
-    }
+    try:
+        viz_result = VIZ_SUBGRAPH.invoke(viz_input)
+        contract = viz_result.get("contract") if isinstance(viz_result, dict) else None
+
+        # Normalizar a dict si es Pydantic
+        if contract is not None and not isinstance(contract, dict):
+            contract = contract.dict() if hasattr(contract, "dict") else vars(contract)
+
+        # Si el Viz Agent dice que no es visualizable, no forzar render
+        if contract and contract.get("status") == "error":
+            logger.warning(f"[Viz Agent Node] Spec no viable: {contract.get('reasoning')}")
+            return {
+                "viz_result": contract,
+                "last_agent": "viz_agent",
+                "messages": [AIMessage(content="[Viz Agent] Los datos no son aptos para visualización.")]
+            }
+
+        # Extraer z_axis desde figure_spec si no viene en el contrato raíz
+        if contract:
+            figure_spec = contract.get("figure_spec") or {}
+            if figure_spec.get("z_axis") and not contract.get("z_axis"):
+                contract["z_axis"] = figure_spec["z_axis"]
+            # Asegurar que chart_type del contrato coincida con figure_spec
+            if figure_spec.get("type") and not contract.get("chart_type"):
+                contract["chart_type"] = figure_spec["type"]
+
+        return {
+            "viz_result": contract,
+            "last_agent": "viz_agent",
+            "messages": [AIMessage(content=f"[Viz Agent] Spec generada: {contract.get('chart_type') if contract else None}")]
+        }
+
+    except Exception as e:
+        logger.error(f"[Viz Agent Node] Error en subgrafo: {e}", exc_info=True)
+        return {
+            "viz_result": None,
+            "last_agent": "viz_agent",
+            "messages": [AIMessage(content=f"[Viz Agent] Error generando spec: {e}")]
+        }
 
 
 @traceable(name="Orchestrator: Execute Demand Forecast")

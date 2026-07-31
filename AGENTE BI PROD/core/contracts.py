@@ -153,12 +153,19 @@ class ForecastResult(BaseModel):
 class VizSpecContract(BaseModel):
     """Contrato de salida del Viz Agent."""
     status: Literal["success", "error"]
-    chart_type: Optional[Literal["bar", "line", "pie", "scatter"]]
+    chart_type: Optional[Literal["bar", "line", "pie", "scatter", "heatmap"]]
     title: Optional[str]
     x_axis: Optional[str]
     y_axis: Optional[str]
-    color_column: Optional[str] = None
-    orientation: str = "v"
+    z_axis: Optional[str] = Field(
+        default=None,
+        description="Para heatmaps: métrica numérica que determina el color de la celda"
+    )
+    color_column: Optional[str] = Field(
+        default=None,
+        description="Columna para agrupar series (líneas/barras) o métrica de color (heatmap)"
+    )
+    orientation: Literal["v", "h"] = "v"
     figure_spec: Optional[Dict[str, Any]]
     reasoning: str
     error_message: Optional[str] = None
