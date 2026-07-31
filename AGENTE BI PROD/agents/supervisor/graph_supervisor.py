@@ -1,14 +1,18 @@
 # agents/supervisor/graph_supervisor.py
 # -------------------------------------------------
 
+# agents/supervisor/graph_supervisor.py
+# -------------------------------------------------
+
 import json
-from typing import Any, Dict, Literal, Optional
-from langchain_core.messages import AIMessage
+from typing import Any, Dict, List, Literal, Optional
+from langchain_core.messages import AIMessage, HumanMessage
 from core.llm import LLM
 from core.contracts import SupervisorDecision
 from core.config import logger
 
 from langsmith import traceable
+
 
 MAX_ITERATIONS = 30
 
@@ -25,6 +29,32 @@ def _get(obj: Any, attr: str, default: Any = None) -> Any:
     return getattr(obj, attr, default)
 
 
+def _is_new_topic(question: str, previous_question: Optional[str]) -> bool:
+    """
+    Heurística simple para detectar si el usuario quiere cambiar de tema.
+    Útil para reiniciar el plan en el mismo thread cuando el contexto previo
+    ya no es relevante.
+    """
+    if not previous_question:
+        return False
+
+    new_topic_markers = [
+        "ahora", "en cambio", "otra cosa", "diferente", "nueva pregunta",
+        "cambia de tema", "hablamos de otra cosa", "olvidate de eso", "olvida eso"
+    ]
+    return any(marker in question.lower() for marker in new_topic_markers)
+
+
+def _extract_last_user_question(messages: List[Any]) -> Optional[str]:
+    """Extrae la última pregunta del usuario del historial."""
+    if not messages:
+        return None
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return getattr(msg, "content", None)
+    return None
+
+
 @traceable(name="Supervisor: Route Next Agent")
 def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     current_iter = state.get("iteration_count", 0)
@@ -32,7 +62,6 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     render_attempts = state.get("render_attempts", 0)
 
     def make_update(next_node: str, **extra) -> Dict[str, Any]:
-        # Siempre propagamos render_attempts para no perderlo en el estado
         base = {
             "next": next_node,
             "last_agent": "supervisor",
@@ -61,6 +90,32 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     last_agent = state.get("last_agent")
     forecast_results = state.get("forecast_results")
     forecast_error = state.get("forecast_error")
+    question = state.get("question", "")
+    messages = state.get("messages", [])
+
+    # NUEVO: Detectar cambio de tema y reiniciar plan si aplica
+    previous_question = _extract_last_user_question(messages[:-1]) if messages else None
+    if plan and previous_question and _is_new_topic(question, previous_question):
+        logger.info(
+            f"[Supervisor] Detectado cambio de tema ('{question}' vs '{previous_question}'). "
+            f"Reiniciando planificación."
+        )
+        return make_update(
+            "planner",
+            plan=None,
+            sql_results=[],
+            viz_result=None,
+            viz_approved=None,
+            viz_rendered=False,
+            final_answer=None,
+            research_findings=None,
+            forecast_request=None,
+            forecast_results=None,
+            forecast_error=None,
+            messages=messages + [
+                AIMessage(content="[Supervisor] Nuevo tema detectado; reiniciando planificación.")
+            ]
+        )
 
     # === ANTI-LOOP: Validación de viz_result ===
     viz_is_valid = False
@@ -85,7 +140,6 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     # === ANTI-LOOP RENDER ===
-    # Si el render anterior falló, limitamos reintentos y forzamos avance
     if last_agent == "render_plotly":
         if not viz_rendered:
             if render_attempts >= 1:

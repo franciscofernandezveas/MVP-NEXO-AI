@@ -1,3 +1,6 @@
+# core/orchestrator.py
+# -------------------------------------------------
+
 import logging
 from typing import Optional, Any, List, Dict, Annotated
 from typing_extensions import TypedDict
@@ -38,7 +41,7 @@ class OrchestratorState(TypedDict):
     final_answer: Optional[str]
     iteration_count: int
     last_agent: Optional[str]
-    next: Optional[str]  # usado por supervisor para routing condicional
+    next: Optional[str]
     harness_context: Optional[Dict[str, Any]]
     semantic_context: str
     allowed_views: List[str]
@@ -48,11 +51,25 @@ class OrchestratorState(TypedDict):
     forecast_request: Optional[Dict[str, Any]]
     forecast_results: Optional[List[Dict[str, Any]]]
     forecast_error: Optional[str]
+    render_attempts: int
+
+
+def _to_dict(obj: Any) -> Dict[str, Any]:
+    """Normaliza objetos Pydantic a dicts planos para evitar fricciones en el estado."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    return vars(obj)
 
 
 @traceable(name="Orchestrator: Build Harness Context")
 def build_harness_context_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    harness = build_harness_context_cached(_normalize_question(state["question"]))
+    # FIX: fallback si question no viene en el estado
+    question = state.get("question", "")
+    harness = build_harness_context_cached(_normalize_question(question))
 
     return {
         "harness_context": harness,
@@ -203,20 +220,18 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
             "messages": [AIMessage(content="[Viz Agent] Sin datos SQL para visualizar")]
         }
 
-    # Elegir la primera tarea exitosa con datos
     primary_result = next(
         (
             r for r in sql_results
-            if getattr(r, "status", None) in ("success", "partial")
-            and getattr(r, "row_count", 0) > 0
+            if _get(r, "status") in ("success", "partial")
+            and _get(r, "row_count", 0) > 0
         ),
         sql_results[0]
     )
 
-    rows = getattr(primary_result, "rows", []) or []
-    columns = getattr(primary_result, "columns", []) or []
+    rows = _get(primary_result, "rows", []) or []
+    columns = _get(primary_result, "columns", []) or []
 
-    # Normalizar chart_type_hint (plan puede ser dict o Pydantic object)
     chart_type_hint = "auto"
     if plan:
         if isinstance(plan, dict):
@@ -240,11 +255,9 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
         viz_result = VIZ_SUBGRAPH.invoke(viz_input)
         contract = viz_result.get("contract") if isinstance(viz_result, dict) else None
 
-        # Normalizar a dict si es Pydantic
         if contract is not None and not isinstance(contract, dict):
             contract = contract.dict() if hasattr(contract, "dict") else vars(contract)
 
-        # Si el Viz Agent dice que no es visualizable, no forzar render
         if contract and contract.get("status") == "error":
             logger.warning(f"[Viz Agent Node] Spec no viable: {contract.get('reasoning')}")
             return {
@@ -253,12 +266,10 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "messages": [AIMessage(content="[Viz Agent] Los datos no son aptos para visualización.")]
             }
 
-        # Extraer z_axis desde figure_spec si no viene en el contrato raíz
         if contract:
             figure_spec = contract.get("figure_spec") or {}
             if figure_spec.get("z_axis") and not contract.get("z_axis"):
                 contract["z_axis"] = figure_spec["z_axis"]
-            # Asegurar que chart_type del contrato coincida con figure_spec
             if figure_spec.get("type") and not contract.get("chart_type"):
                 contract["chart_type"] = figure_spec["type"]
 
@@ -277,9 +288,16 @@ def viz_agent_node(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
 
+def _get(obj: Any, attr: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(attr, default)
+    return getattr(obj, attr, default)
+
+
 @traceable(name="Orchestrator: Execute Demand Forecast")
 def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    # Lazy import: solo carga forecasting cuando realmente se usa
     from agents.forecasting_agent.graph_demand_forecaster import run_forecast
 
     logger.info(f"[Forecaster] Estado recibido. forecast_request={state.get('forecast_request')}")
@@ -387,10 +405,6 @@ def forecaster_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def researcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Wrapper lazy para el nodo de research.
-    Solo carga el research_node cuando realmente se usa.
-    """
     from agents.research.research_node import make_research_node
     node = make_research_node(SQL_SUBGRAPH, LLM)
     return node(state)

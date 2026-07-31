@@ -23,6 +23,37 @@ _biz_mem = BusinessMemory.from_file()
 
 
 # ------------------------------------------------------------------
+# NUEVO: Contexto conversacional para preguntas de seguimiento
+# ------------------------------------------------------------------
+def _build_conversational_context(messages: List[Any], current_question: str, max_turns: int = 4) -> str:
+    """
+    Construye un contexto conversacional reciente para que el Planner entienda
+    preguntas de seguimiento o referencias implícitas.
+    """
+    if not messages:
+        return current_question
+
+    # Tomar los últimos mensajes del usuario y del asistente
+    recent = messages[-max_turns * 2:]
+    context_lines = []
+
+    for msg in recent:
+        role = "Usuario" if isinstance(msg, HumanMessage) else "Asistente"
+        content = getattr(msg, "content", str(msg))
+        if content:
+            context_lines.append(f"{role}: {content[:300]}")
+
+    if len(context_lines) <= 1:
+        return current_question
+
+    return (
+        "Contexto reciente de la conversación:\n"
+        + "\n".join(context_lines)
+        + f"\n\nPregunta actual del usuario: {current_question}"
+    )
+
+
+# ------------------------------------------------------------------
 # Detección de demand forecast
 # ------------------------------------------------------------------
 FORECAST_KEYWORDS = [
@@ -335,7 +366,12 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     allowed_views = harness.get("allowed_views", [])
     ambiguity_notes = harness.get("ambiguity_notes", [])
     question = state["question"]
+    messages = state.get("messages", [])
 
+    # NUEVO: enriquecer la pregunta con contexto conversacional
+    contextual_question = _build_conversational_context(messages, question)
+
+    logger.info(f"[Planner] Pregunta contextual: {contextual_question[:200]}...")
     logger.info(f"[Planner] allowed_views={allowed_views}")
     logger.info(f"[Planner] ambiguity_notes={ambiguity_notes}")
     logger.info(f"[Planner] preferred_view={harness.get('preferred_view')}")
@@ -365,12 +401,12 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # ================================================================
     # PRIORIDAD MÁXIMA: Detección de demand forecast
     # ================================================================
-    if _is_demand_forecast_question(question):
+    if _is_demand_forecast_question(contextual_question):
         logger.info("[Planner] Detectada pregunta de demand forecast")
-        params = _extract_forecast_params(question)
+        params = _extract_forecast_params(contextual_question)
 
         if not params.get("producto") or not params.get("sede"):
-            params = _fallback_extract_forecast_params(question)
+            params = _fallback_extract_forecast_params(contextual_question)
 
         if not params.get("producto") or not params.get("sede"):
             return {
@@ -485,7 +521,8 @@ REGLAS ADICIONALES:
 - "informe completo", "reporte detallado", "análisis profundo", "deep dive" → question_type="deep_research".
 """)
 
-    human = HumanMessage(content=f"Pregunta del usuario: {question}")
+    # NUEVO: pasar contextual_question al LLM
+    human = HumanMessage(content=f"Pregunta del usuario: {contextual_question}")
     planner_llm = LLM.with_structured_output(PlannerContract, method="function_calling")
     plan_raw = planner_llm.invoke([system, human])
 
@@ -521,9 +558,9 @@ REGLAS ADICIONALES:
     if not plan.tasks and plan.question_type not in ("demand_forecast", "unknown"):
         logger.warning(f"[Planner] LLM no generó tareas. Creando tarea fallback.")
         if allowed_views:
-            hints = {"original_query": question}
+            hints = {"original_query": contextual_question}
             try:
-                default_vista = seleccionar_vista_principal(query=question, column_hints=hints, allowed_views=allowed_views)
+                default_vista = seleccionar_vista_principal(query=contextual_question, column_hints=hints, allowed_views=allowed_views)
                 default_view = default_vista["view_name"] if default_vista else allowed_views[0]
             except Exception as e:
                 logger.warning(f"[Planner] Retriever falló en fallback general: {e}")
@@ -534,7 +571,7 @@ REGLAS ADICIONALES:
             plan.tasks = [
                 SQLPayload(
                     task_id="1",
-                    task=f"Responder a la pregunta: {question}",
+                    task=f"Responder a la pregunta: {contextual_question}",
                     metrics=[],
                     dimensions=[],
                     filters_description="",
