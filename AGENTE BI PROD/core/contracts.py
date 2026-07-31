@@ -2,28 +2,28 @@ from typing import Any, List, Optional, Literal, Dict
 from pydantic import BaseModel, Field
 
 
+class FilterSpec(BaseModel):
+    column: str
+    operator: Literal["=", "!=", ">", "<", ">=", "<=", "ILIKE", "IN", "BETWEEN"]
+    value: Any
+    value_type: Literal["string", "number", "date", "list"] = "string"
+
+
 class SQLPayload(BaseModel):
-    """Instrucción técnica individual."""
-    task_id: str = Field(default="1", description="Identificador de la subtarea")
+    task_id: str = Field(default="1")
     task: str = Field(..., description="Descripción técnica de la tarea SQL")
     metrics: List[str] = Field(default_factory=list)
     dimensions: List[str] = Field(default_factory=list)
-    filters_description: str = Field(default="", description="Filtros en lenguaje natural")
+    filters: List[FilterSpec] = Field(
+        default_factory=list,
+        description="Filtros estructurados para traducción directa a SQL"
+    )
+    filters_description: str = Field(default="", description="Filtros en lenguaje natural (legacy/audit)")
     time_window: Optional[str] = None
     assumptions: List[str] = Field(default_factory=list)
-    execution_strategy: str = Field(
-        default="single_view",
-        description="daily, compare_periods, historical, monthly, by_branch, by_product..."
-    )
-    candidate_views: List[str] = Field(
-        default_factory=list,
-        description="Shortlist de vistas semantic. permitidas para esta tarea"
-    )
-    preferred_view: Optional[str] = Field(
-        default=None,
-        description="Vista elegida por el planner como principal (debe estar en candidate_views)"
-    )
-
+    execution_strategy: str = Field(default="single_view")
+    candidate_views: List[str] = Field(default_factory=list)
+    preferred_view: Optional[str] = Field(default=None)
 
 class ResearchPlan(BaseModel):
     """Plan de exploración profunda interna (múltiples queries a la BD)."""

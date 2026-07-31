@@ -1,7 +1,7 @@
 # core/semantic_retriever.py
 # -------------------------------------------------
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 import logging
 import re
 from datetime import datetime
@@ -573,3 +573,123 @@ def seleccionar_vista_principal(
                         return candidate
     
     return vista_principal
+
+
+# ------------------------------------------------------------------
+# NUEVO: RESOLUCIÓN SEMÁNTICA SOBRE CATÁLOGO DOCUMENTADO (BusinessMemory)
+# ------------------------------------------------------------------
+from core.harness import BusinessMemory
+from core.contracts import SQLPayload
+
+_biz_mem_catalog = BusinessMemory.from_file()
+
+
+def _normalize_for_catalog(text: str) -> str:
+    if not text:
+        return ""
+    return (
+        text.lower()
+        .strip()
+        .replace("_", " ")
+        .replace("á", "a").replace("é", "e").replace("í", "i")
+        .replace("ó", "o").replace("ú", "u")
+    )
+
+
+_SEMANTIC_COLUMN_MAP = {
+    "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku"],
+    "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"],
+    "categoria": ["categoria", "categoría", "categoria_nueva"],
+    "subcategoria": ["subcategoria", "subcategoría"],
+    "fecha": ["fecha", "fecha_completa", "fecha_venta", "mes", "anio", "año"],
+    "venta_total": ["venta_total", "ventas", "ventas_totales", "subtotal_diario", "ingreso"],
+    "unidades": ["unidades", "cantidad", "unidades_totales", "unidades_vendidas"],
+    "transacciones": ["transacciones", "total_transacciones", "numero_transacciones"],
+    "ticket_promedio": ["ticket_promedio"],
+}
+
+
+def get_view_columns(view_name: str) -> List[str]:
+    """
+    Devuelve las columnas reales (métricas + fechas) documentadas para una vista.
+    """
+    clean = view_name.replace("semantic.", "").strip()
+    info = _biz_mem_catalog.get_view(clean)
+    if not info:
+        return []
+    return list(info.metricas.keys()) + info.columnas_fecha
+
+
+def column_exists_in_view(view_name: str, column_name: str) -> bool:
+    """
+    Verifica si una columna semántica existe en la vista, con mapeo flexible.
+    """
+    requested = _normalize_for_catalog(column_name)
+    available = [_normalize_for_catalog(c) for c in get_view_columns(view_name)]
+
+    for avail in available:
+        if requested == avail or requested in avail or avail in requested:
+            return True
+
+    for variant in _SEMANTIC_COLUMN_MAP.get(requested, [requested]):
+        v = _normalize_for_catalog(variant)
+        for avail in available:
+            if v == avail or v in avail or avail in v:
+                return True
+    return False
+
+
+def resolve_column(view_name: str, semantic_name: str) -> Optional[str]:
+    """
+    Devuelve el nombre REAL de la columna en la vista que mejor coincida.
+    """
+    requested = _normalize_for_catalog(semantic_name)
+    available = get_view_columns(view_name)
+    available_norm = [_normalize_for_catalog(c) for c in available]
+
+    # Exacto
+    for i, avail in enumerate(available_norm):
+        if requested == avail:
+            return available[i]
+
+    # Subcadena
+    for i, avail in enumerate(available_norm):
+        if requested in avail or avail in requested:
+            return available[i]
+
+    # Mapeo semántico
+    for variant in _SEMANTIC_COLUMN_MAP.get(requested, [requested]):
+        v = _normalize_for_catalog(variant)
+        for i, avail in enumerate(available_norm):
+            if v == avail or v in avail or avail in v:
+                return available[i]
+    return None
+
+
+def find_compatible_view(task: SQLPayload, allowed_views: List[str]) -> Optional[str]:
+    """
+    Encuentra la primera vista que contenga todas las métricas,
+    dimensiones y columnas de filtro.
+    """
+    required: Set[str] = set()
+    for m in (task.metrics or []):
+        required.add(_normalize_for_catalog(m))
+    for d in (task.dimensions or []):
+        required.add(_normalize_for_catalog(d))
+    for f in (task.filters or []):
+        required.add(_normalize_for_catalog(f.column))
+
+    if not required:
+        return None
+
+    candidates = task.candidate_views or allowed_views
+    for view_full in candidates:
+        view_name = view_full.replace("semantic.", "").strip()
+        available = {_normalize_for_catalog(c) for c in get_view_columns(view_name)}
+        missing = [
+            col for col in required
+            if not any(col == avail or col in avail or avail in col for avail in available)
+        ]
+        if not missing:
+            return view_full
+    return None

@@ -1,25 +1,29 @@
 import re
 import json
 import logging
-from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple, Set
+from typing import Any, Dict, List, Optional, Literal, NotRequired, Tuple
 from typing_extensions import TypedDict
+from datetime import datetime, timedelta
+
+import sqlparse
+from sqlparse.sql import Identifier, IdentifierList
+from sqlparse.tokens import Keyword
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 
 from core.llm import LLM
-from core.database import execute_sql_query, get_semantic_schema_info_cached
+from core.database import execute_sql_query
 from core.contracts import SQLContract
-from core.sql_utils import extract_views_used, extract_columns_used
-
-# ============================================================
-# NUEVO: Seguridad basada en catálogo semántico (AGENTS.md)
-# ============================================================
+from core.sql_utils import extract_views_used
+from core.semantic_retriever import (
+    column_exists_in_view,
+    resolve_column,
+    get_view_columns,
+)
 from core.harness import BusinessMemory, is_view_allowed
 
-# Cargar catálogo semántico una sola vez al importar el módulo
 _biz_mem = BusinessMemory.from_file()
-
 logger = logging.getLogger("bi_orchestrator")
 
 
@@ -39,26 +43,16 @@ class SQLAgentState(TypedDict):
     schema_used: NotRequired[List[str]]
 
 
-def _normalize(text: str) -> str:
-    """Normaliza texto para comparación flexible de columnas."""
-    if not text:
-        return ""
-    return text.lower().strip().replace("_", " ").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
-
-
+# ------------------------------------------------------------------
+# Catálogo y utilidades
+# ------------------------------------------------------------------
 def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
-    """
-    Construye un catálogo estructurado de vistas permitidas con sus columnas.
-    Incluye métricas y dimensiones/documentación para que el agente no alucine columnas.
-    """
     catalog: Dict[str, Any] = {}
-    
     for view_full_name in allowed_views:
         view_name = view_full_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(view_name)
         if not view_info:
             continue
-        
         catalog[view_full_name] = {
             "tipo": view_info.tipo,
             "descripcion": view_info.descripcion,
@@ -68,94 +62,184 @@ def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
             "columnas_fecha": view_info.columnas_fecha,
             "notas": view_info.notas,
         }
-    
     return catalog
 
 
-def _column_exists_in_view(view_name: str, column_name: str) -> bool:
-    """
-    Verifica si una columna existe en la vista (métrica o columna de fecha/documentada).
-    Soporta coincidencia flexible.
-    """
-    clean_view = view_name.replace("semantic.", "").strip()
-    view_info = _biz_mem.get_view(clean_view)
-    if not view_info:
-        return False
-    
-    requested = _normalize(column_name)
-    
-    # Métricas y columnas documentadas
-    available_cols: List[str] = list(view_info.metricas.keys()) + view_info.columnas_fecha
-    
-    # Normalizar
-    available_normalized = [_normalize(c) for c in available_cols]
-    
-    # Coincidencia exacta o subcadena
-    for avail in available_normalized:
-        if requested in avail or avail in requested:
-            return True
-    
-    # Mapeos semánticos comunes
-    semantic_map = {
-        "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku"],
-        "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"],
-        "categoria": ["categoria", "categoría", "categoria_nueva"],
-        "subcategoria": ["subcategoria", "subcategoría"],
-        "fecha": ["fecha", "fecha_completa", "fecha_venta", "mes", "anio", "año"],
-        "venta_total": ["venta_total", "ventas", "ventas_totales", "subtotal_diario", "ingreso"],
-        "unidades": ["unidades", "cantidad", "unidades_totales", "unidades_vendidas", "unidades_fidelizacion", "unidades_cortesia"],
-        "transacciones": ["transacciones", "total_transacciones", "numero_transacciones"],
-        "ticket_promedio": ["ticket_promedio"],
+def _detect_date_column(view_name: Optional[str]) -> Optional[str]:
+    if not view_name:
+        return None
+    for col in get_view_columns(view_name):
+        if "fecha" in col.lower():
+            return col
+    return None
+
+
+def _time_window_to_sql(date_column: str, time_window: Optional[str]) -> Optional[str]:
+    if not time_window or not date_column:
+        return None
+
+    tw = time_window.lower().strip()
+    today = datetime.now().date()
+
+    m = re.match(r"last_(\d+)_days?", tw)
+    if m:
+        n = int(m.group(1))
+        start = (datetime.now().date() - timedelta(days=n)).isoformat()
+        return f"{date_column} >= '{start}' AND {date_column} <= '{today}'"
+
+    m = re.match(r"next_(\d+)_days?", tw)
+    if m:
+        n = int(m.group(1))
+        end = (datetime.now().date() + timedelta(days=n)).isoformat()
+        return f"{date_column} >= '{today}' AND {date_column} <= '{end}'"
+
+    if tw == "current_month":
+        return f"DATE_TRUNC('month', {date_column}) = DATE_TRUNC('month', CURRENT_DATE)"
+    if tw == "previous_month":
+        return f"DATE_TRUNC('month', {date_column}) = DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month')"
+    if tw in ("current_year", "ytd"):
+        return f"EXTRACT(YEAR FROM {date_column}) = EXTRACT(YEAR FROM CURRENT_DATE)"
+
+    return None
+
+
+def _strategy_guidance(strategy: str, date_col: Optional[str]) -> str:
+    d = date_col or "fecha"
+    guides = {
+        "single_view": "SELECT dim, metric FROM preferred_view WHERE ... GROUP BY dim",
+        "by_branch": f"SELECT nombre_sede, metric FROM preferred_view WHERE ... GROUP BY nombre_sede ORDER BY metric DESC",
+        "by_product": f"SELECT producto, metric FROM preferred_view WHERE ... GROUP BY producto ORDER BY metric DESC",
+        "monthly": f"SELECT DATE_TRUNC('month', {d}) AS mes, metric FROM preferred_view WHERE ... GROUP BY mes ORDER BY mes",
+        "compare_periods": f"WITH current AS (SELECT ... FROM preferred_view WHERE {d} >= periodo_actual), previous AS (...) SELECT ...",
+        "historical": f"SELECT {d}, metric FROM preferred_view WHERE {d} >= ... ORDER BY {d}",
     }
-    
-    variants = semantic_map.get(requested, [requested])
-    for variant in variants:
-        v = _normalize(variant)
-        for avail in available_normalized:
-            if v in avail or avail in v:
-                return True
-    
-    return False
+    return guides.get(strategy, guides["single_view"])
+
+
+def _filters_to_sql_description(filters: List[Dict[str, Any]]) -> str:
+    if not filters:
+        return "Sin filtros estructurados"
+    lines = []
+    text_cols = {
+        "nombre_sede", "sede", "sucursal", "local", "tienda", "plaza",
+        "producto", "descripcion", "descripción", "categoria", "categoría"
+    }
+    for f in filters:
+        col = f.get("column", "")
+        op = f.get("operator", "=")
+        val = f.get("value")
+        vt = f.get("value_type", "string")
+        if op.upper() == "IN" and isinstance(val, list):
+            lines.append(f"{col} IN ({', '.join(repr(v) for v in val)})")
+        elif col in text_cols or vt == "string":
+            lines.append(f"LOWER({col}) = LOWER('{val}')  -- o: {col} ILIKE '%{val}%'")
+        else:
+            lines.append(f"{col} {op} {val}")
+    return "\n".join(lines)
+
+
+def _extract_table_aliases(sql: str) -> Dict[str, str]:
+    aliases: Dict[str, str] = {}
+    parsed = sqlparse.parse(sql)
+    for stmt in parsed:
+        tokens = list(stmt.tokens)
+        for idx, token in enumerate(tokens):
+            if token.ttype is Keyword and token.value.upper() in ("FROM", "JOIN"):
+                nxt_idx = _next_real_token(tokens, idx)
+                if nxt_idx is not None:
+                    _parse_from_token(tokens[nxt_idx], aliases)
+    return aliases
+
+
+def _next_real_token(tokens, idx):
+    for i in range(idx + 1, len(tokens)):
+        t = tokens[i]
+        if not t.is_whitespace and t.ttype not in (
+            sqlparse.tokens.Comment.Single, sqlparse.tokens.Comment.Multiline
+        ):
+            return i
+    return None
+
+
+def _parse_from_token(token, aliases):
+    if isinstance(token, IdentifierList):
+        for ident in token.get_identifiers():
+            _parse_single_identifier(ident, aliases)
+    elif isinstance(token, Identifier):
+        _parse_single_identifier(token, aliases)
+
+
+def _parse_single_identifier(identifier, aliases):
+    parts = [t for t in identifier.tokens if not t.is_whitespace and t.value.upper() != "AS"]
+    if not parts:
+        return
+    name = parts[0].value.strip()
+    alias = parts[-1].value.strip() if len(parts) > 1 else name
+    if name.startswith("semantic."):
+        real = name.replace("semantic.", "")
+        aliases[alias] = real
+        aliases[real] = real
 
 
 def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
-    """
-    Valida que todas las columnas usadas en el SQL existan en las vistas documentadas.
-    Devuelve (is_valid, error_message).
-    """
-    used_views = extract_views_used(sql)
-    if not used_views:
+    aliases = _extract_table_aliases(sql)
+    if not aliases:
         return True, ""
-    
-    for view_name in used_views:
-        cols = extract_columns_used(sql)
-        invalid_cols = []
-        
-        for col in cols:
-            if not _column_exists_in_view(view_name, col):
-                # Ignorar palabras reservadas y alias comunes que no son columnas
-                if col.lower() in ["as", "by", "on", "and", "or", "not", "sum", "count", "avg", "min", "max"]:
+
+    functions = {
+        "sum", "count", "avg", "min", "max", "round", "coalesce", "nullif",
+        "date_trunc", "extract", "lower", "upper", "trim", "length"
+    }
+    invalid: List[str] = []
+
+    parsed = sqlparse.parse(sql)
+    for stmt in parsed:
+        for token in stmt.flatten():
+            if token.ttype is None:
+                val = token.value.strip()
+                if "." in val:
+                    alias, col = val.split(".", 1)
+                    alias = alias.strip()
+                    col = col.strip()
+                else:
+                    if len(aliases) == 1:
+                        alias = list(aliases.keys())[0]
+                        col = val
+                    else:
+                        continue
+
+                if col.lower() in functions:
                     continue
-                invalid_cols.append(col)
-        
-        if invalid_cols:
-            clean_view = view_name.replace("semantic.", "")
-            view_info = _biz_mem.get_view(clean_view)
-            available = list(view_info.metricas.keys()) + view_info.columnas_fecha if view_info else []
-            return False, (
-                f"ERROR_INSALVABLE: La vista '{view_name}' no contiene las columnas "
-                f"{invalid_cols}. Columnas VÁLIDAS: {available}. "
-                f"No intentes 'corregir' usando otra columna."
-            )
-    
+
+                view_name = aliases.get(alias)
+                if not view_name:
+                    continue
+
+                if not column_exists_in_view(f"semantic.{view_name}", col):
+                    invalid.append(f"semantic.{view_name}.{col}")
+
+    if invalid:
+        return False, f"ERROR_COLUMNAS_INVALIDAS: {', '.join(invalid)}. Usa solo columnas del catálogo semántico."
     return True, ""
 
+
+def _sql_uses_preferred_view(sql: str, preferred: Optional[str]) -> bool:
+    if not preferred:
+        return True
+    clean = preferred.replace("semantic.", "").strip()
+    pattern = re.compile(rf"\bsemantic\.{re.escape(clean)}\b", re.IGNORECASE)
+    return bool(pattern.search(sql))
+
+
+# ------------------------------------------------------------------
+# Nodos del grafo SQL
+# ------------------------------------------------------------------
 def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
     if state.get("schema_info") and state["schema_info"].strip():
         schema = state["schema_info"]
         logger.debug("[SQL] Usando schema inyectado por orquestador (filtrado)")
     else:
-        logger.warning("[SQL] No hay schema_info inyectado. Omitiendo fallback a BD.")
+        logger.warning("[SQL] No hay schema_info inyectado.")
         schema = "Schema no disponible. Usar catálogo semántico y allowed_views."
     return {
         "schema_info": schema,
@@ -163,87 +247,85 @@ def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
     }
 
 
-
-
 def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
-    preferred = state.get("preferred_view")
-    allowed = state.get("allowed_views", [])
-    
-    # ============================================================
-    # NUEVO: Catálogo estructurado para el prompt
-    # ============================================================
-    catalogo_detallado = _build_sql_catalog(allowed)
-    
-    system = SystemMessage(content=f"""
-Eres un Data Engineer senior experto en PostgreSQL.
+    payload = state.get("payload", {})
 
-CONTEXTO CRÍTICO:
-- TÚ SOLO puedes acceder al esquema 'semantic.'.
-- PROHIBIDO usar tablas de staging, raw, public o cualquier otro esquema.
+    # PRIORIDAD: payload de la subtarea
+    preferred = payload.get("preferred_view") or state.get("preferred_view")
+    allowed = payload.get("candidate_views") or state.get("allowed_views", [])
+
+    if not allowed:
+        return _sql_error(state, None, "No hay vistas permitidas para esta subtarea.")
+
+    relevant_views = ([preferred] if preferred else []) + [v for v in allowed if v != preferred]
+    relevant_views = list(dict.fromkeys(relevant_views))
+
+    catalogo_detallado = _build_sql_catalog(relevant_views)
+
+    # Mapeo de columnas reales
+    column_mapping = {}
+    if preferred:
+        for col in (payload.get("metrics", []) + payload.get("dimensions", [])):
+            real = resolve_column(preferred, col)
+            column_mapping[col] = real or f"NO_ENCONTRADA:{col}"
+
+    date_col = _detect_date_column(preferred)
+    time_window_sql = _time_window_to_sql(date_col, payload.get("time_window")) if date_col else None
+    strategy_guidance = _strategy_guidance(payload.get("execution_strategy", "single_view"), date_col)
+
+    system = SystemMessage(content=f"""
+Eres un Data Engineer senior experto en PostgreSQL. Debes obedecer ESTRICTAMENTE el plan del Planner.
 
 REGLAS ABSOLUTAS:
-1. Antes de escribir CUALQUIER query, consulta el CATÁLOGO ESTRUCTURADO DE VISTAS.
-2. SOLO puedes usar columnas que aparezcan en 'metricas' o 'columnas_fecha' de la vista seleccionada.
-3. SI una columna que necesitas NO está en el catálogo, NO la inventes. Responde ERROR_INSALVABLE.
-4. Usa ÚNICAMENTE vistas que estén en `allowed_views` o en el catálogo documentado.
-5. Si `preferred_view` existe y tiene todas las columnas necesarias, ÚSALA.
-6. Toda referencia a tabla DEBE ser: semantic.nombre_vista.
-7. Genera UNA query SQL SELECT válida para PostgreSQL.
-8. Devuélvela en un bloque ```sql ... ```.
+1. Usa EXCLUSIVAMENTE vistas bajo el esquema `semantic.`.
+2. La vista OBLIGATORIA es: `{preferred or "NINGUNA - elige una de allowed_views"}`. Si no puedes resolver la query con ella, responde `ERROR_INSALVABLE`.
+3. Usa SOLO columnas listadas en `metricas` o `columnas_fecha` del catálogo.
+4. Mapea cada métrica/dimensión del plan a la `columna_real` indicada en `mapeo_de_columnas`.
+5. Para filtros de texto (sede, producto, categoría) usa `ILIKE` o `LOWER(x) = LOWER(y)`. NUNCA `=` directo.
+6. La query debe responder EXACTAMENTE a: `{payload.get("task", "")}`.
+7. Estrategia de ejecución: `{payload.get("execution_strategy", "single_view")}`. Guía: {strategy_guidance}
+8. Ventana temporal: `{payload.get("time_window", "ninguna")}`. Traducción sugerida: {time_window_sql or "N/A"}
 9. PROHIBIDO: DELETE, DROP, INSERT, UPDATE, TRUNCATE.
-10. Si hay un error previo de ejecución, CORRÍGELO respetando las columnas VÁLIDAS del catálogo.
-11. La query debe responder EXACTAMENTE a la tarea del payload.
+10. Devuelve UNA query SQL SELECT entre ```sql ... ```.
 
-REGLA DE INTEGRIDAD DE COLUMNAS:
-- Antes de usar una columna en SELECT, WHERE, GROUP BY, ORDER BY u ON:
-  a) Verifica su nombre exacto en el catálogo.
-  b) Si no existe, NO uses una columna "parecida". Devuelve ERROR_INSALVABLE.
+ANTES del SQL, escribe tu plan de traducción:
+- Vista elegida: ...
+- Columnas disponibles: ...
+- Mapeo métricas/dimensiones: ...
+- Filtros estructurados a WHERE: ...
+- Estrategia aplicada: ...
 
-REGLA DE DIMENSIONES DE TEXTO:
-- Para columnas de nombre o texto como `nombre_sede`, `local`, `sucursal`, `producto`, `categoria`, NUNCA uses `=` directo.
-- Usa siempre `ILIKE` o `LOWER(column) = LOWER('valor')`.
-- Ejemplo: `WHERE nombre_sede ILIKE 'merced'`.
-
-NO respondas en lenguaje natural. Solo SQL o la marca ERROR_INSALVABLE.
+NO respondas en lenguaje natural fuera del plan de traducción y el bloque SQL.
 """)
 
-    
-    payload = state.get("payload")
-    if not payload:
-        return {
-            "generated_sql": "",
-            "error_message": "No se encontró payload en el estado del subgrafo SQL.",
-            "attempts": state.get("attempts", 0) + 1,
-            "messages": state.get("messages", []) + [AIMessage(content="[SQL] Error: falta payload")]
-        }
-
-    ctx = f"""
-TAREA DEL PAYLOAD:
+    human_content = f"""
+PAYLOAD DEL PLANNER:
 {json.dumps(payload, indent=2, ensure_ascii=False)}
 
-CATÁLOGO ESTRUCTURADO DE VISTAS (USA SOLO ESTAS COLUMNAS):
+CATÁLOGO DE VISTAS RELEVANTES:
 {json.dumps(catalogo_detallado, indent=2, ensure_ascii=False)}
 
-VISTA PREFERIDA: {preferred or 'Ninguna'}
-VISTAS PERMITIDAS RECOMENDADAS (allowed_views): {allowed}
+MAPEO DE COLUMNAS:
+{json.dumps(column_mapping, indent=2, ensure_ascii=False)}
 
-CONTEXTO SEMÁNTICO DE NEGOCIO:
-{state.get('semantic_context', 'No disponible')}
+FILTROS ESTRUCTURADOS A TRADUCIR A WHERE:
+{_filters_to_sql_description(payload.get("filters", []))}
 
-SCHEMA TÉCNICO (solo vistas permitidas):
-{state.get('schema_info', 'No cargado')}
+VENTANA TEMPORAL:
+{payload.get("time_window", "ninguna")} -> {time_window_sql or "N/A"}
 
-ERROR PREVIO (si existe):
-{state.get('error_message', 'Ninguno')}
+PREGUNTA ORIGINAL:
+{state.get("question", "")}
+
+ERROR PREVIO:
+{state.get("error_message", "Ninguno")}
 """
-    human = HumanMessage(content=ctx)
-    
+
     messages = state.get("messages", [])
     if len(messages) > 4:
         messages = messages[-4:]
-        logger.debug("[SQL] Historial truncado a 4 mensajes")
-    
-    response = LLM.invoke([system] + messages + [human])
+
+    response = LLM.invoke([system] + messages + [HumanMessage(content=human_content)])
     content = response.content
 
     match = re.search(r"```sql\s*(.*?)\s*```", content, re.DOTALL | re.IGNORECASE)
@@ -253,70 +335,50 @@ ERROR PREVIO (si existe):
     sql_upper = sql_extracted.upper()
     forbidden_cmds = ["DELETE", "DROP", "INSERT", "UPDATE", "TRUNCATE"]
     if any(cmd in sql_upper for cmd in forbidden_cmds):
-        return {
-            "generated_sql": "",
-            "error_message": "Seguridad: comando DML/DDL detectado.",
-            "attempts": state.get("attempts", 0) + 1,
-            "messages": messages + [response, AIMessage(content="[SQL] Bloqueado por seguridad")]
-        }
+        return _sql_error(state, response, "Seguridad: comando DML/DDL detectado.")
 
-    # 2. Detección de insalvable
+    # 2. Insalvable
     if "ERROR_INSALVABLE" in content.upper():
-        return {
-            "generated_sql": "",
-            "error_message": "Ninguna vista permitida resuelve la consulta. Se necesita revisión humana.",
-            "attempts": state.get("attempts", 0) + 1,
-            "messages": messages + [response, AIMessage(content="[SQL] Insalvable por vistas faltantes")]
-        }
+        return _sql_error(state, response, "Ninguna vista permitida resuelve la consulta. Se necesita revisión humana.")
 
-    # 3. Validación de seguridad contra catálogo semántico
+    # 3. Debe usar preferred_view
+    if not _sql_uses_preferred_view(sql_extracted, preferred):
+        err = f"La query debe usar la vista obligatoria '{preferred}'. SQL generado no la referencia."
+        return _sql_error(state, response, err)
+
+    # 4. Vistas documentadas
     used_views = extract_views_used(sql_extracted)
-
     if used_views:
         invalid_views = [v for v in used_views if not is_view_allowed(v, _biz_mem)]
         if invalid_views:
-            err_msg = (
-                f"SECURITY: Vistas no documentadas en AGENTS.md: {invalid_views}. "
-                f"Catálogo disponible: {', '.join(_biz_mem.list_views())}"
-            )
-            logger.warning(f"[SQL] {err_msg}")
-            return {
-                "generated_sql": "",
-                "error_message": err_msg,
-                "attempts": state.get("attempts", 0) + 1,
-                "messages": messages + [response, AIMessage(content=f"[SQL] {err_msg}")]
-            }
-
-        # Advertencia informativa si usa vista fuera de allowed_views
-        allowed_set = {v.lower().replace("semantic.", "") for v in allowed}
-        for v in used_views:
-            clean = v.lower().replace("semantic.", "")
-            if clean not in allowed_set:
-                logger.info(
-                    f"[SQL] Vista '{v}' está en el catálogo pero fuera de allowed_views "
-                    f"recomendadas. Shortlist: {allowed}"
-                )
+            err = f"SECURITY: Vistas no documentadas en AGENTS.md: {invalid_views}"
+            return _sql_error(state, response, err)
     else:
         if sql_extracted and re.search(r'\bselect\b', sql_extracted, re.IGNORECASE):
             logger.warning("[SQL] Query SELECT sin vistas semantic. detectadas.")
 
-    # ============================================================
-    # NUEVO: Validación de columnas antes de ejecutar
-    # ============================================================
+    # 5. Columnas válidas por ámbito
     is_valid, column_error = _validate_columns_in_sql(sql_extracted)
     if not is_valid:
-        logger.warning(f"[SQL] {column_error}")
-        return {
-            "generated_sql": "",
-            "error_message": column_error,
-            "attempts": state.get("attempts", 0) + 1,
-            "messages": messages + [response, AIMessage(content=f"[SQL] {column_error}")]
-        }
+        return _sql_error(state, response, column_error)
 
     return {
         "generated_sql": sql_extracted,
         "attempts": state.get("attempts", 0) + 1,
         "messages": messages + [response]
+    }
+
+
+def _sql_error(state, response, error_message: str) -> Dict[str, Any]:
+    logger.warning(f"[SQL] {error_message}")
+    msgs = state.get("messages", [])
+    if response is not None:
+        msgs = msgs + [response]
+    return {
+        "generated_sql": "",
+        "error_message": error_message,
+        "attempts": state.get("attempts", 0) + 1,
+        "messages": msgs + [AIMessage(content=f"[SQL] {error_message}")]
     }
 
 
@@ -345,51 +407,31 @@ def sql_execute_query(state: SQLAgentState) -> Dict[str, Any]:
 
 
 def _is_recoverable_db_error(error: str) -> bool:
-    """
-    Determina si un error de DB justifica un reintento.
-    'column does not exist' puede ser recoverable si el agente aprende las columnas válidas.
-    'relation does not exist' NO es recoverable si la tabla no existe.
-    """
     if not error:
         return False
     e = error.lower()
-    
-    # Errores de columna: recoverable si el prompt tiene catálogo (pero limitar intentos)
     if "column" in e and "does not exist" in e:
         return True
-    
-    # Errores de sintaxis u operadores: recoverable
     if any(x in e for x in ["syntax error", "invalid input syntax", "operator does not exist", "ambiguous column"]):
         return True
-    
-    # Errores de tabla/vista: no recoverable (no podemos crear tablas)
     if any(x in e for x in ["relation", "undefined_table", "does not exist"]) and "column" not in e:
         return False
-    
     return False
 
 
 def _enrich_error_with_valid_columns(error: str, sql: str) -> str:
-    """
-    Si el error es UndefinedColumn, enriquece el mensaje con las columnas válidas
-    de la vista afectada para que el reintento tenga contexto claro.
-    """
     if not error or "UndefinedColumn" not in error:
         return error
-    
     used_views = extract_views_used(sql)
     enrichments = []
-    
     for view_name in used_views:
         clean = view_name.replace("semantic.", "").strip()
         view_info = _biz_mem.get_view(clean)
         if view_info:
             available = list(view_info.metricas.keys()) + view_info.columnas_fecha
             enrichments.append(f"\nColumnas VÁLIDAS para {view_name}: {available}")
-    
     if enrichments:
         return error + "\n" + "\n".join(enrichments)
-    
     return error
 
 
@@ -400,6 +442,7 @@ def sql_validate_and_package(state: SQLAgentState) -> Dict[str, Any]:
     allowed = state.get("allowed_views", [])
     semantic_ctx = state.get("semantic_context", "")
     preferred = state.get("preferred_view")
+    payload = state.get("payload", {})
     attempts = state.get("attempts", 0)
 
     columns: List[str] = []
@@ -409,7 +452,6 @@ def sql_validate_and_package(state: SQLAgentState) -> Dict[str, Any]:
     reason = ""
     needs_followup = False
 
-    # Enriquecer error de columna con columnas válidas para el reintento
     if err and "UndefinedColumn" in err:
         err = _enrich_error_with_valid_columns(err, sql)
 
@@ -447,7 +489,7 @@ def sql_validate_and_package(state: SQLAgentState) -> Dict[str, Any]:
         error_message=err or None,
         schema_used=["semantic"],
         allowed_views=allowed,
-        preferred_view=preferred,
+        preferred_view=payload.get("preferred_view") or preferred,
         semantic_context_used=semantic_ctx[:500] + "..." if len(semantic_ctx) > 500 else semantic_ctx,
         query_confidence=0.95 if status == "success" else 0.0,
         needs_followup=needs_followup,
