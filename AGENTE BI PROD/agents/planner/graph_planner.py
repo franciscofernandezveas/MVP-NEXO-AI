@@ -91,10 +91,6 @@ def _fallback_extract_forecast_params(question: str) -> Dict[str, Any]:
 
 
 def _build_view_catalog(allowed_views: List[str]) -> Dict[str, Any]:
-    """
-    Catálogo de vistas permitidas para inyectar al prompt del planner.
-    Las keys usan el nombre completo con prefijo semantic.
-    """
     catalog = {}
     for view_full_name in allowed_views:
         view_name = view_full_name.replace("semantic.", "").strip()
@@ -114,9 +110,6 @@ def _build_view_catalog(allowed_views: List[str]) -> Dict[str, Any]:
 
 
 def _parse_filters_description(description: str) -> List[FilterSpec]:
-    """
-    Fallback: convierte descripción textual de filtros en filtros estructurados.
-    """
     if not description:
         return []
 
@@ -154,8 +147,9 @@ def _parse_filters_description(description: str) -> List[FilterSpec]:
 
 def _validate_task_integrity(task: SQLPayload) -> List[str]:
     """
-    Valida que la vista preferida soporte métricas, dimensiones y filtros del payload.
-    Auto-corrige nombres de columnas si encuentra un match semántico.
+    Valida que la vista preferida soporte métricas, dimensiones y filtros.
+    Auto-corrige nombres de columnas cuando encuentra un match semántico.
+    Devuelve solo errores que no pueden corregirse.
     """
     errors = []
     preferred = task.preferred_view
@@ -221,6 +215,32 @@ def _validate_task_integrity(task: SQLPayload) -> List[str]:
     return errors
 
 
+def _repair_task_view(task: SQLPayload, allowed_views: List[str]) -> bool:
+    """
+    Intenta reparar la tarea encontrando una vista compatible.
+    Devuelve True si encontró una vista válida.
+    """
+    if not task.metrics and not task.dimensions and not task.filters:
+        return False
+
+    fallback = find_compatible_view(task, allowed_views)
+    if not fallback:
+        logger.warning(f"[Planner] No se encontró vista compatible para tarea {task.task_id}")
+        return False
+
+    logger.info(f"[Planner] Fallback de {task.preferred_view} a {fallback}")
+    task.preferred_view = fallback
+    if fallback not in (task.candidate_views or []):
+        task.candidate_views = list(task.candidate_views or []) + [fallback]
+
+    # Re-validar después del fallback
+    re_errors = _validate_task_integrity(task)
+    if re_errors:
+        logger.warning(f"[Planner] Fallback a {fallback} sigue con errores: {re_errors}")
+        return False
+
+    return True
+
 
 # ------------------------------------------------------------------
 # Nodo principal
@@ -229,11 +249,12 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     harness = state.get("harness_context", {})
     allowed_views = harness.get("allowed_views", [])
     ambiguity_notes = harness.get("ambiguity_notes", [])
+    harness_preferred = harness.get("preferred_view")
     question = state["question"]
 
     logger.info(f"[Planner] allowed_views={allowed_views}")
     logger.info(f"[Planner] ambiguity_notes={ambiguity_notes}")
-    logger.info(f"[Planner] preferred_view={harness.get('preferred_view')}")
+    logger.info(f"[Planner] preferred_view={harness_preferred}")
 
     if not allowed_views:
         logger.error("[Planner] ERROR CRÍTICO: allowed_views está vacío.")
@@ -326,10 +347,9 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     # ================================================================
-    # Corte temprano si hay ambigüedad
+    # Corte temprano si hay ambigüedad SIN preferred_view
     # ================================================================
-    preferred_view = harness.get("preferred_view")
-    if ambiguity_notes and not preferred_view:
+    if ambiguity_notes and not harness_preferred:
         plan = PlannerContract(
             intent="unknown",
             goal="",
@@ -361,15 +381,25 @@ Eres un Planner BI avanzado. Transformas preguntas de negocio en planes operacio
 CATÁLOGO DE VISTAS PERMITIDAS (con columnas disponibles):
 {json.dumps(view_catalog, indent=2, ensure_ascii=False)}
 
+VISTA PREFERIDA SUGERIDA POR EL SISTEMA:
+{harness_preferred or "Ninguna - elige la más apropiada del catálogo"}
+
 REGLAS CRÍTICAS DE SELECCIÓN DE VISTA:
 1. ANTES de asignar una vista a una tarea, verifica en el catálogo de arriba que esa vista contenga EXPLÍCITAMENTE las columnas que la tarea requiere.
-2. NUNCA asignes una vista si la columna requerida no aparece en su lista de métricas/columnas.
-3. Si la pregunta pide desglose por PRODUCTO, elige ÚNICAMENTE vistas que tengan 'producto', 'descripcion' o similar.
-4. Si la pregunta pide desglose por SEDE/LOCAL, elige vistas que tengan 'sucursal', 'nombre_sede' o similar.
-5. Si la pregunta pide desglose por CATEGORÍA, elige vistas que tengan 'categoria'.
-6. SEGURIDAD: Usa ÚNICAMENTE vistas presentes en el catálogo de arriba. NO inventes vistas.
-7. DESCOMPOSICIÓN: Si la pregunta tiene múltiples KPIs de distinta naturaleza o contextos temporales distintos, genera tareas SEPARADAS.
-8. NO DESCOMPONER si es la misma intención, misma granularidad y misma temporalidad.
+2. Si el sistema sugirió una `preferred_view` arriba, ÚSALA como vista principal salvo que tengas evidencia clara de que no sirve.
+3. NUNCA asignes una vista si la columna requerida no aparece en su lista de métricas/columnas.
+4. Si la pregunta pide desglose por PRODUCTO, elige ÚNICAMENTE vistas que tengan 'producto', 'descripcion' o similar.
+5. Si la pregunta pide desglose por SEDE/SUCURSAL/LOCAL, elige ÚNICAMENTE vistas que tengan 'nombre_sede', 'sucursal' o similar.
+6. Si la pregunta pide desglose por CATEGORÍA, elige vistas que tengan 'categoria'.
+7. VISTAS TIPO DASHBOARD: 'sales_week', 'dashboard_*', 'kpi_*' son KPIs agregados. NO las uses para desglose por sucursal, producto o fecha.
+8. SEGURIDAD: Usa ÚNICAMENTE vistas presentes en el catálogo de arriba. NO inventes vistas.
+9. DESCOMPOSICIÓN: Si la pregunta tiene múltiples KPIs de distinta naturaleza o contextos temporales distintos, genera tareas SEPARADAS.
+10. NO DESCOMPONER si es la misma intención, misma granularidad y misma temporalidad.
+
+REGLAS DE NOMBRES DE COLUMNAS:
+- Usa ÚNICAMENTE los nombres exactos del catálogo.
+- Ejemplos: 'venta_total' (no 'ventas_total'), 'nombre_sede' (no 'sucursal' a menos que exista), 'total_transacciones'.
+- Si no estás seguro, consulta la lista 'metricas' y 'columnas_fecha' del catálogo.
 
 REGLAS DE NEGOCIO:
 - "Se han vendido" / "ventas" / "unidades vendidas" → vistas de VENTAS NORMALES.
@@ -380,14 +410,12 @@ REGLAS DE FILTROS:
 - Genera SIEMPRE filtros estructurados en el campo `filters` de SQLPayload.
 - Para columnas de texto (sede, producto, categoría, local) usa operator="ILIKE" y value_type="string".
 - Ejemplo: {{"column": "nombre_sede", "operator": "ILIKE", "value": "merced", "value_type": "string"}}
-- Para valores numéricos usa operator="=" y value_type="number".
-- Para listas usa operator="IN" y value_type="list".
 
 REGLAS DE TIME WINDOW:
 - "últimos 7 días" → time_window="last_7_days"
+- "junio de 2026" → time_window="2026-06-01_to_2026-06-30"
 - "este mes" → time_window="current_month"
 - "mes pasado" → time_window="previous_month"
-- "año actual" → time_window="current_year"
 
 REGLAS DE ESTRATEGIA:
 - Una sola métrica, sin desglose → execution_strategy="single_view"
@@ -399,14 +427,13 @@ REGLAS DE ESTRATEGIA:
 
 REGLAS DE DEMAND FORECAST:
 - "Predice", "pronostica", "cuánto se venderá", "demanda futura" → question_type="demand_forecast".
-- El planner detectará esto automáticamente y extraerá producto/sede/n_días.
 
 REGLAS ADICIONALES:
 - "informe completo", "reporte detallado", "análisis profundo", "deep dive" → question_type="deep_research".
 
 OUTPUT: JSON con schema PlannerContract.
 - tasks: lista de SQLPayload con task_id, task, execution_strategy, metrics, dimensions, filters, time_window, candidate_views, preferred_view.
-- needs_followup: true si hay ambigüedad insalvable.
+- needs_followup: true solo si hay ambigüedad insalvable.
 """)
 
     human = HumanMessage(content=f"Pregunta del usuario: {question}")
@@ -419,7 +446,7 @@ OUTPUT: JSON con schema PlannerContract.
         plan = plan_raw
 
     # ============================================================
-    # VALIDACIÓN DE INTEGRIDAD POST-LLM
+    # VALIDACIÓN Y REPARACIÓN POST-LLM
     # ============================================================
     validation_errors: List[str] = []
 
@@ -442,28 +469,18 @@ OUTPUT: JSON con schema PlannerContract.
 
         # Si preferred_view no está en allowed_views, buscar compatible
         if task.preferred_view and task.preferred_view not in allowed_views:
-            fallback = find_compatible_view(task, allowed_views)
-            if fallback:
-                logger.info(f"[Planner] Fallback de {task.preferred_view} a {fallback}")
-                task.preferred_view = fallback
-                if fallback not in (task.candidate_views or []):
-                    task.candidate_views = list(task.candidate_views or []) + [fallback]
-            else:
+            repaired = _repair_task_view(task, allowed_views)
+            if not repaired:
                 validation_errors.append(
                     f"Tarea {task.task_id}: {task.preferred_view} no está en allowed_views."
                 )
                 continue
 
-        # Validar que la vista preferida contenga métricas/dimensiones/filtros
+        # Validar integridad y reparar si falla
         task_errors = _validate_task_integrity(task)
         if task_errors:
-            fallback = find_compatible_view(task, allowed_views)
-            if fallback:
-                logger.info(f"[Planner] Fallback por columnas incompatibles a {fallback}")
-                task.preferred_view = fallback
-                if fallback not in (task.candidate_views or []):
-                    task.candidate_views = list(task.candidate_views or []) + [fallback]
-            else:
+            repaired = _repair_task_view(task, allowed_views)
+            if not repaired:
                 validation_errors.extend([f"Tarea {task.task_id}: {err}" for err in task_errors])
 
     # ============================================================
@@ -472,7 +489,7 @@ OUTPUT: JSON con schema PlannerContract.
     if not plan.tasks and plan.question_type not in ("demand_forecast", "unknown"):
         logger.warning(f"[Planner] LLM no generó tareas. Creando tarea fallback.")
         if allowed_views:
-            default_view = allowed_views[0]
+            default_view = harness_preferred or allowed_views[0]
             plan.tasks = [
                 SQLPayload(
                     task_id="1",
@@ -496,6 +513,10 @@ OUTPUT: JSON con schema PlannerContract.
         plan.followup_reason = " | ".join(validation_errors)
         plan.confidence = min(plan.confidence, 0.5)
         logger.warning(f"[Planner] Errores de validación: {validation_errors}")
+    else:
+        # Si pasó validación, asegurar que no quedó needs_followup por defecto
+        if not plan.needs_followup:
+            plan.followup_reason = None
 
     task_summary = " | ".join([f"{t.task_id}:{t.task}" for t in plan.tasks])
     prefs = [t.preferred_view for t in plan.tasks]
