@@ -579,9 +579,6 @@ def seleccionar_vista_principal(
 # NUEVO: RESOLUCIÓN SEMÁNTICA SOBRE CATÁLOGO DOCUMENTADO (BusinessMemory)
 # ------------------------------------------------------------------
 
-# NOTA: Lazy singleton para evitar import circular con core.harness.
-# core.harness importa funciones de este módulo durante su carga,
-# por lo que no podemos importar BusinessMemory a nivel de módulo aquí.
 _biz_mem_catalog = None
 
 
@@ -606,18 +603,43 @@ def _normalize_for_catalog(text: str) -> str:
     )
 
 
-_SEMANTIC_COLUMN_MAP = {
+# Grupos semánticos canónicos → sinónimos
+_SEMANTIC_COLUMN_GROUPS = {
     "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku", "productos"],
-    "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación", "sucursales"],
+    "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación", "sucursales", "sedes", "locales"],
     "categoria": ["categoria", "categoría", "categoria_nueva", "categorias", "categorías"],
     "subcategoria": ["subcategoria", "subcategoría"],
-    "fecha": ["fecha", "fecha_completa", "fecha_venta", "mes", "anio", "año"],
-    "venta_total": ["venta_total", "ventas", "ventas_totales", "ventas_total", "subtotal_diario", "ingreso", "total_ventas"],
+    "fecha": ["fecha", "fecha_completa", "fecha_venta", "mes", "anio", "año", "dia", "día"],
+    "venta_total": ["venta_total", "ventas", "ventas_totales", "ventas_total", "total_ventas", "subtotal_diario", "ingreso", "total"],
     "unidades": ["unidades", "cantidad", "unidades_totales", "unidades_vendidas", "unidades_total"],
     "transacciones": ["transacciones", "total_transacciones", "numero_transacciones", "transacciones_totales"],
     "ticket_promedio": ["ticket_promedio", "ticket_promedio_sede"],
 }
 
+# Mapa invertido: cada término apunta a su grupo canónico + otros sinónimos
+_SEMANTIC_COLUMN_MAP: Dict[str, List[str]] = {}
+for canonical, synonyms in _SEMANTIC_COLUMN_GROUPS.items():
+    _SEMANTIC_COLUMN_MAP[canonical] = synonyms
+    for syn in synonyms:
+        _SEMANTIC_COLUMN_MAP.setdefault(syn, []).append(canonical)
+
+
+def _semantic_matches(requested_norm: str, available_norm: str) -> bool:
+    """
+    Compara un término solicitado con una columna disponible.
+    Soporta: exacto, subcadena, y pertenencia al mismo grupo semántico.
+    """
+    if requested_norm == available_norm:
+        return True
+    if requested_norm in available_norm or available_norm in requested_norm:
+        return True
+
+    group = _SEMANTIC_COLUMN_MAP.get(requested_norm, [])
+    for term in group:
+        term_norm = _normalize_for_catalog(term)
+        if term_norm == available_norm or term_norm in available_norm or available_norm in term_norm:
+            return True
+    return False
 
 
 def get_view_columns(view_name: str) -> List[str]:
@@ -633,20 +655,14 @@ def get_view_columns(view_name: str) -> List[str]:
 
 def column_exists_in_view(view_name: str, column_name: str) -> bool:
     """
-    Verifica si una columna semántica existe en la vista, con mapeo flexible.
+    Verifica si una columna semántica existe en la vista, con mapeo bidireccional.
     """
     requested = _normalize_for_catalog(column_name)
     available = [_normalize_for_catalog(c) for c in get_view_columns(view_name)]
 
     for avail in available:
-        if requested == avail or requested in avail or avail in requested:
+        if _semantic_matches(requested, avail):
             return True
-
-    for variant in _SEMANTIC_COLUMN_MAP.get(requested, [requested]):
-        v = _normalize_for_catalog(variant)
-        for avail in available:
-            if v == avail or v in avail or avail in v:
-                return True
     return False
 
 
@@ -658,21 +674,17 @@ def resolve_column(view_name: str, semantic_name: str) -> Optional[str]:
     available = get_view_columns(view_name)
     available_norm = [_normalize_for_catalog(c) for c in available]
 
-    # Exacto
+    # Exacto o subcadena directa
     for i, avail in enumerate(available_norm):
-        if requested == avail:
+        if requested == avail or requested in avail or avail in requested:
             return available[i]
 
-    # Subcadena
-    for i, avail in enumerate(available_norm):
-        if requested in avail or avail in requested:
-            return available[i]
-
-    # Mapeo semántico
-    for variant in _SEMANTIC_COLUMN_MAP.get(requested, [requested]):
-        v = _normalize_for_catalog(variant)
+    # Mapeo semántico por grupos
+    group = _SEMANTIC_COLUMN_MAP.get(requested, [])
+    for term in group:
+        term_norm = _normalize_for_catalog(term)
         for i, avail in enumerate(available_norm):
-            if v == avail or v in avail or avail in v:
+            if term_norm == avail or term_norm in avail or avail in term_norm:
                 return available[i]
     return None
 
@@ -699,7 +711,7 @@ def find_compatible_view(task: Any, allowed_views: List[str]) -> Optional[str]:
         available = {_normalize_for_catalog(c) for c in get_view_columns(view_name)}
         missing = [
             col for col in required
-            if not any(col == avail or col in avail or avail in col for avail in available)
+            if not any(_semantic_matches(col, avail) for avail in available)
         ]
         if not missing:
             return view_full
