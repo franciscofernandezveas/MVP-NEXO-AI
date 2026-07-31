@@ -13,17 +13,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 
 from core.llm import LLM
-from core.database import execute_sql_query
+from core.database import execute_sql_query, get_semantic_schema_for_views
 from core.contracts import SQLContract
 from core.sql_utils import extract_views_used
-from core.semantic_retriever import (
-    column_exists_in_view,
-    resolve_column,
-    get_view_columns,
-)
-from core.harness import BusinessMemory, is_view_allowed
+from core.harness import is_view_allowed
 
-_biz_mem = BusinessMemory.from_file()
 logger = logging.getLogger("bi_orchestrator")
 
 
@@ -44,33 +38,120 @@ class SQLAgentState(TypedDict):
 
 
 # ------------------------------------------------------------------
-# Catálogo y utilidades
+# Extracción de esquema real
 # ------------------------------------------------------------------
-def _build_sql_catalog(allowed_views: List[str]) -> Dict[str, Any]:
+def _extract_columns_from_ddl(ddl: str) -> List[str]:
+    """
+    Extrae nombres de columnas reales desde un DDL-like.
+    Soporta formato:
+      col_name TYPE,
+      col_name TYPE NOT NULL,
+    """
+    if not ddl:
+        return []
+    cols = []
+    # Capturar bloques CREATE TABLE/VIEW ... (
+    blocks = re.findall(
+        r"CREATE\s+(?:TABLE|VIEW)\s+[\w\.]+\s*\((.*?)\);",
+        ddl,
+        re.DOTALL | re.IGNORECASE
+    )
+    for block in blocks:
+        for line in block.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("--"):
+                continue
+            # Quitar NOT NULL, NULL, DEFAULT...
+            line = re.sub(r"\s+(?:NOT\s+NULL|NULL|DEFAULT\s+.*)$", "", line, flags=re.IGNORECASE)
+            m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s+\w+", line)
+            if m:
+                cols.append(m.group(1))
+    return cols
+
+
+def _get_real_columns(schema_info: str, preferred_view: Optional[str]) -> List[str]:
+    """Devuelve columnas reales parseadas del esquema."""
+    return _extract_columns_from_ddl(schema_info)
+
+
+# ------------------------------------------------------------------
+# Mapeo semántico local (sinónimos comunes)
+# ------------------------------------------------------------------
+def _normalize(text: str) -> str:
+    if not text:
+        return ""
+    return text.lower().strip().replace("_", " ").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+
+_COLUMN_SYNONYMS = {
+    "sede": ["nombre_sede", "sucursal", "local", "tienda", "plaza", "sucursales"],
+    "nombre_sede": ["sucursal", "local", "tienda", "plaza", "sede"],
+    "sucursal": ["nombre_sede", "local", "tienda", "plaza", "sede"],
+    "producto": ["descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku"],
+    "descripcion": ["producto", "nombre_producto"],
+    "categoria": ["categoria_nueva", "categoría"],
+    "fecha": ["fecha_completa", "fecha_venta", "mes", "anio", "año"],
+    "venta_total": ["venta_total", "ventas", "ventas_totales", "total_ventas", "subtotal_diario", "ingreso"],
+    "unidades": ["cantidad", "unidades_totales", "unidades_vendidas"],
+    "transacciones": ["total_transacciones", "numero_transacciones", "transacciones_totales"],
+    "ticket_promedio": ["ticket_promedio_sede"],
+}
+
+
+def _resolve_column_local(requested: str, real_columns: List[str]) -> Optional[str]:
+    """Mapea un nombre semántico a una columna real."""
+    requested_norm = _normalize(requested)
+    real_norm = {c: _normalize(c) for c in real_columns}
+
+    # Exacto
+    if requested in real_columns:
+        return requested
+
+    # Normalizado exacto
+    for c, n in real_norm.items():
+        if requested_norm == n:
+            return c
+
+    # Subcadena
+    for c, n in real_norm.items():
+        if requested_norm in n or n in requested_norm:
+            return c
+
+    # Sinónimos
+    synonyms = _COLUMN_SYNONYMS.get(requested_norm, [])
+    for syn in synonyms:
+        for c, n in real_norm.items():
+            if syn == n:
+                return c
+
+    return None
+
+
+def _column_exists_local(column_name: str, real_columns: List[str]) -> bool:
+    return _resolve_column_local(column_name, real_columns) is not None
+
+
+# ------------------------------------------------------------------
+# Construcción del catálogo real
+# ------------------------------------------------------------------
+def _build_real_catalog(preferred_view: Optional[str], schema_info: str) -> Dict[str, Any]:
     catalog: Dict[str, Any] = {}
-    for view_full_name in allowed_views:
-        view_name = view_full_name.replace("semantic.", "").strip()
-        view_info = _biz_mem.get_view(view_name)
-        if not view_info:
-            continue
-        catalog[view_full_name] = {
-            "tipo": view_info.tipo,
-            "descripcion": view_info.descripcion,
-            "granularidad": view_info.granularidad,
-            "filtro_fecha": view_info.filtro_fecha,
-            "metricas": list(view_info.metricas.keys()),
-            "columnas_fecha": view_info.columnas_fecha,
-            "notas": view_info.notas,
+    if preferred_view:
+        real_columns = _get_real_columns(schema_info, preferred_view)
+        catalog[preferred_view] = {
+            "columnas_reales": real_columns,
+            "advertencia": "USA EXACTAMENTE ESTOS NOMBRES DE COLUMNA. Nada más. Nada menos.",
         }
     return catalog
 
 
-def _detect_date_column(view_name: Optional[str]) -> Optional[str]:
-    if not view_name:
-        return None
-    for col in get_view_columns(view_name):
-        if "fecha" in col.lower():
-            return col
+# ------------------------------------------------------------------
+# Utilidades de fecha y estrategia
+# ------------------------------------------------------------------
+def _detect_date_column(real_columns: List[str]) -> Optional[str]:
+    for c in real_columns:
+        if "fecha" in c.lower():
+            return c
     return None
 
 
@@ -93,6 +174,10 @@ def _time_window_to_sql(date_column: str, time_window: Optional[str]) -> Optiona
         end = (datetime.now().date() + timedelta(days=n)).isoformat()
         return f"{date_column} >= '{today}' AND {date_column} <= '{end}'"
 
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})_to_(\d{4})-(\d{2})-(\d{2})", tw)
+    if m:
+        return f"{date_column} >= '{m.group(1)}-{m.group(2)}-{m.group(3)}' AND {date_column} <= '{m.group(4)}-{m.group(5)}-{m.group(6)}'"
+
     if tw == "current_month":
         return f"DATE_TRUNC('month', {date_column}) = DATE_TRUNC('month', CURRENT_DATE)"
     if tw == "previous_month":
@@ -106,38 +191,76 @@ def _time_window_to_sql(date_column: str, time_window: Optional[str]) -> Optiona
 def _strategy_guidance(strategy: str, date_col: Optional[str]) -> str:
     d = date_col or "fecha"
     guides = {
-        "single_view": "SELECT dim, metric FROM preferred_view WHERE ... GROUP BY dim",
-        "by_branch": f"SELECT nombre_sede, metric FROM preferred_view WHERE ... GROUP BY nombre_sede ORDER BY metric DESC",
-        "by_product": f"SELECT producto, metric FROM preferred_view WHERE ... GROUP BY producto ORDER BY metric DESC",
-        "monthly": f"SELECT DATE_TRUNC('month', {d}) AS mes, metric FROM preferred_view WHERE ... GROUP BY mes ORDER BY mes",
-        "compare_periods": f"WITH current AS (SELECT ... FROM preferred_view WHERE {d} >= periodo_actual), previous AS (...) SELECT ...",
-        "historical": f"SELECT {d}, metric FROM preferred_view WHERE {d} >= ... ORDER BY {d}",
+        "single_view": "SELECT dimensiones, metricas FROM preferred_view WHERE ... GROUP BY dimensiones",
+        "by_branch": f"SELECT nombre_sede, metricas FROM preferred_view WHERE ... GROUP BY nombre_sede ORDER BY metricas DESC",
+        "by_product": f"SELECT producto, metricas FROM preferred_view WHERE ... GROUP BY producto ORDER BY metricas DESC",
+        "monthly": f"SELECT DATE_TRUNC('month', {d}) AS mes, metricas FROM preferred_view WHERE ... GROUP BY mes ORDER BY mes",
+        "compare_periods": f"WITH current AS (SELECT ... FROM preferred_view WHERE {d} >= ...), previous AS (...) SELECT ...",
+        "historical": f"SELECT {d}, metricas FROM preferred_view WHERE {d} >= ... ORDER BY {d}",
     }
     return guides.get(strategy, guides["single_view"])
 
 
-def _filters_to_sql_description(filters: List[Dict[str, Any]]) -> str:
+def _translate_filters(filters: List[Dict[str, Any]], real_columns: List[str]) -> str:
+    """Traduce filtros estructurados a SQL usando nombres de columna reales."""
     if not filters:
-        return "Sin filtros estructurados"
+        return ""
+
     lines = []
-    text_cols = {
-        "nombre_sede", "sede", "sucursal", "local", "tienda", "plaza",
-        "producto", "descripcion", "descripción", "categoria", "categoría"
-    }
     for f in filters:
-        col = f.get("column", "")
+        col_sem = f.get("column", "")
+        col_real = _resolve_column_local(col_sem, real_columns)
+        if not col_real:
+            continue
         op = f.get("operator", "=")
         val = f.get("value")
         vt = f.get("value_type", "string")
+
         if op.upper() == "IN" and isinstance(val, list):
-            lines.append(f"{col} IN ({', '.join(repr(v) for v in val)})")
-        elif col in text_cols or vt == "string":
-            lines.append(f"LOWER({col}) = LOWER('{val}')  -- o: {col} ILIKE '%{val}%'")
+            lines.append(f"{col_real} IN ({', '.join(repr(v) for v in val)})")
+        elif _is_text_column(col_real):
+            lines.append(f"LOWER({col_real}) = LOWER('{val}')")
         else:
-            lines.append(f"{col} {op} {val}")
-    return "\n".join(lines)
+            lines.append(f"{col_real} {op} {val}")
+
+    return " AND ".join(lines)
 
 
+def _is_text_column(col_name: str) -> bool:
+    text_patterns = ["sede", "sucursal", "local", "tienda", "plaza", "producto", "descripcion", "categoria", "subcategoria"]
+    return any(p in col_name.lower() for p in text_patterns)
+
+
+def _translate_metrics(metrics: List[str], real_columns: List[str]) -> str:
+    """Traduce métricas semánticas a expresiones SQL con columnas reales."""
+    exprs = []
+    for m in metrics:
+        real = _resolve_column_local(m, real_columns)
+        if not real:
+            continue
+        if any(fn in m.lower() for fn in ["venta", "ingreso", "total", "subtotal"]):
+            exprs.append(f"SUM({real}) AS total_{real}")
+        elif any(fn in m.lower() for fn in ["unidades", "cantidad", "transacciones"]):
+            exprs.append(f"SUM({real}) AS total_{real}")
+        else:
+            exprs.append(f"{real} AS {real}")
+    if not exprs:
+        return "COUNT(*) AS n"
+    return ", ".join(exprs)
+
+
+def _translate_dimensions(dimensions: List[str], real_columns: List[str]) -> str:
+    exprs = []
+    for d in dimensions:
+        real = _resolve_column_local(d, real_columns)
+        if real:
+            exprs.append(real)
+    return ", ".join(exprs) if exprs else ""
+
+
+# ------------------------------------------------------------------
+# Validación de columnas con sqlparse
+# ------------------------------------------------------------------
 def _extract_table_aliases(sql: str) -> Dict[str, str]:
     aliases: Dict[str, str] = {}
     try:
@@ -173,7 +296,6 @@ def _parse_from_token(token, aliases):
     elif isinstance(token, Identifier):
         _parse_single_identifier(token, aliases)
     elif isinstance(token, Token):
-        # Token simple: tabla sin alias, subquery abreviada, etc.
         value = token.value.strip()
         if value.startswith("semantic."):
             real = value.replace("semantic.", "")
@@ -181,7 +303,6 @@ def _parse_from_token(token, aliases):
 
 
 def _parse_single_identifier(identifier, aliases):
-    # Manejar Token simple (tabla sin alias ni AS)
     if isinstance(identifier, Token) and not isinstance(identifier, Identifier):
         name = identifier.value.strip()
         if name.startswith("semantic."):
@@ -192,7 +313,6 @@ def _parse_single_identifier(identifier, aliases):
     try:
         parts = [t for t in identifier.tokens if not t.is_whitespace and t.value.upper() != "AS"]
     except AttributeError:
-        # No es un Identifier con .tokens
         name = identifier.value.strip() if hasattr(identifier, "value") else str(identifier)
         if name.startswith("semantic."):
             real = name.replace("semantic.", "")
@@ -209,11 +329,11 @@ def _parse_single_identifier(identifier, aliases):
         aliases[real] = real
 
 
-def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
+def _validate_columns_in_sql(sql: str, real_columns: List[str]) -> Tuple[bool, str]:
     try:
         aliases = _extract_table_aliases(sql)
     except Exception as e:
-        logger.warning(f"[SQL] No se pudo parsear aliases: {e}. Saltando validación de columnas.")
+        logger.warning(f"[SQL] No se pudo parsear aliases: {e}. Saltando validación.")
         return True, ""
 
     if not aliases:
@@ -228,7 +348,7 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
     try:
         parsed = sqlparse.parse(sql)
     except Exception as e:
-        logger.warning(f"[SQL] No se pudo parsear SQL: {e}. Saltando validación de columnas.")
+        logger.warning(f"[SQL] No se pudo parsear SQL: {e}. Saltando validación.")
         return True, ""
 
     for stmt in parsed:
@@ -253,11 +373,11 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
                 if not view_name:
                     continue
 
-                if not column_exists_in_view(f"semantic.{view_name}", col):
+                if col not in real_columns:
                     invalid.append(f"semantic.{view_name}.{col}")
 
     if invalid:
-        return False, f"ERROR_COLUMNAS_INVALIDAS: {', '.join(invalid)}. Usa solo columnas del catálogo semántico."
+        return False, f"ERROR_COLUMNAS_INVALIDAS: {', '.join(invalid)}. Columnas VÁLIDAS: {real_columns}"
     return True, ""
 
 
@@ -273,90 +393,122 @@ def _sql_uses_preferred_view(sql: str, preferred: Optional[str]) -> bool:
 # Nodos del grafo SQL
 # ------------------------------------------------------------------
 def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
-    if state.get("schema_info") and state["schema_info"].strip():
-        schema = state["schema_info"]
-        logger.debug("[SQL] Usando schema inyectado por orquestador (filtrado)")
-    else:
-        logger.warning("[SQL] No hay schema_info inyectado.")
-        schema = "Schema no disponible. Usar catálogo semántico y allowed_views."
+    payload = state.get("payload", {})
+    preferred = payload.get("preferred_view") or state.get("preferred_view")
+
+    # Si no hay schema_info inyectado, obtenerlo de la BD
+    schema = state.get("schema_info", "")
+    if not schema.strip() and preferred:
+        try:
+            schema = get_semantic_schema_for_views([preferred])
+        except Exception as e:
+            logger.warning(f"[SQL] No se pudo obtener schema real de {preferred}: {e}")
+
+    if not schema.strip():
+        logger.warning("[SQL] Schema real no disponible. Usar allowed_views y semantic_context.")
+        schema = "-- Schema real no disponible"
+
     return {
         "schema_info": schema,
-        "messages": state.get("messages", []) + [AIMessage(content="[SQL] Schema listo.")]
+        "messages": state.get("messages", []) + [AIMessage(content="[SQL] Schema real listo.")]
     }
 
 
 def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
     payload = state.get("payload", {})
-
-    # PRIORIDAD: payload de la subtarea
     preferred = payload.get("preferred_view") or state.get("preferred_view")
     allowed = payload.get("candidate_views") or state.get("allowed_views", [])
 
     if not allowed:
         return _sql_error(state, None, "No hay vistas permitidas para esta subtarea.")
 
-    relevant_views = ([preferred] if preferred else []) + [v for v in allowed if v != preferred]
-    relevant_views = list(dict.fromkeys(relevant_views))
+    if not preferred:
+        return _sql_error(state, None, "No hay preferred_view definida para esta subtarea.")
 
-    catalogo_detallado = _build_sql_catalog(relevant_views)
+    # 1. Obtener columnas reales del schema_info
+    schema_info = state.get("schema_info", "")
+    real_columns = _get_real_columns(schema_info, preferred)
 
-    # Mapeo de columnas reales
+    if not real_columns:
+        logger.warning(f"[SQL] No se pudieron extraer columnas reales de {preferred}. Schema: {schema_info[:200]}")
+        # Fallback: usar allowed_views
+        real_columns = []
+
+    # 2. Mapeo de requerimientos a columnas reales
     column_mapping = {}
-    if preferred:
-        for col in (payload.get("metrics", []) + payload.get("dimensions", [])):
-            real = resolve_column(preferred, col)
-            column_mapping[col] = real or f"NO_ENCONTRADA:{col}"
+    unresolved = []
+    for col in (payload.get("metrics", []) + payload.get("dimensions", [])):
+        real = _resolve_column_local(col, real_columns)
+        column_mapping[col] = real or f"NO_ENCONTRADA:{col}"
+        if not real:
+            unresolved.append(col)
 
-    date_col = _detect_date_column(preferred)
+    for f in (payload.get("filters", []) or []):
+        real = _resolve_column_local(f.get("column", ""), real_columns)
+        if real:
+            column_mapping[f.get("column")] = real
+        else:
+            unresolved.append(f.get("column"))
+
+    if unresolved:
+        err = f"ERROR_INSALVABLE: Columnas no encontradas en {preferred}: {unresolved}. Columnas disponibles: {real_columns}"
+        return _sql_error(state, None, err)
+
+    # 3. Detectar fecha real
+    date_col = _detect_date_column(real_columns)
+
+    # 4. Pre-traducir para el prompt
+    dims_expr = _translate_dimensions(payload.get("dimensions", []), real_columns)
+    metrics_expr = _translate_metrics(payload.get("metrics", []), real_columns)
+    filters_expr = _translate_filters(payload.get("filters", []), real_columns)
     time_window_sql = _time_window_to_sql(date_col, payload.get("time_window")) if date_col else None
     strategy_guidance = _strategy_guidance(payload.get("execution_strategy", "single_view"), date_col)
 
+    catalogo_real = _build_real_catalog(preferred, schema_info)
+
     system = SystemMessage(content=f"""
-Eres un Data Engineer senior experto en PostgreSQL. Debes obedecer ESTRICTAMENTE el plan del Planner.
+Eres un Data Engineer senior experto en PostgreSQL. Debes generar SQL usando ÚNICAMENTE el esquema real proporcionado.
 
 REGLAS ABSOLUTAS:
 1. Usa EXCLUSIVAMENTE vistas bajo el esquema `semantic.`.
-2. La vista OBLIGATORIA es: `{preferred or "NINGUNA - elige una de allowed_views"}`. Si no puedes resolver la query con ella, responde `ERROR_INSALVABLE`.
-3. Usa SOLO columnas listadas en `metricas` o `columnas_fecha` del catálogo.
-4. Mapea cada métrica/dimensión del plan a la `columna_real` indicada en `mapeo_de_columnas`.
-5. Para filtros de texto (sede, producto, categoría) usa `ILIKE` o `LOWER(x) = LOWER(y)`. NUNCA `=` directo.
-6. La query debe responder EXACTAMENTE a: `{payload.get("task", "")}`.
-7. Estrategia de ejecución: `{payload.get("execution_strategy", "single_view")}`. Guía: {strategy_guidance}
-8. Ventana temporal: `{payload.get("time_window", "ninguna")}`. Traducción sugerida: {time_window_sql or "N/A"}
-9. PROHIBIDO: DELETE, DROP, INSERT, UPDATE, TRUNCATE.
-10. Devuelve UNA query SQL SELECT entre ```sql ... ```.
+2. La vista OBLIGATORIA es: `{preferred}`. Toda referencia a tabla DEBE ser `{preferred}`.
+3. Usa ÚNICAMENTE columnas de la lista `columnas_reales` del catálogo. NUNCA inventes nombres.
+4. Mapeo de columnas reales: usa los nombres de la columna REAL, no los semánticos del plan.
+5. Para columnas de texto (sede/sucursal/local/tienda/plaza/producto/categoria) usa `ILIKE` o `LOWER(x) = LOWER(y)`. NUNCA `=` directo.
+6. PROHIBIDO: DELETE, DROP, INSERT, UPDATE, TRUNCATE.
+7. Devuelve UNA query SQL SELECT entre ```sql ... ```.
 
 ANTES del SQL, escribe tu plan de traducción:
 - Vista elegida: ...
 - Columnas disponibles: ...
-- Mapeo métricas/dimensiones: ...
-- Filtros estructurados a WHERE: ...
+- Mapeo requerimientos → columnas reales: ...
+- SELECT proyectado: ...
+- WHERE proyectado: ...
 - Estrategia aplicada: ...
-
-NO respondas en lenguaje natural fuera del plan de traducción y el bloque SQL.
 """)
 
     human_content = f"""
-PAYLOAD DEL PLANNER:
+TAREA DEL PLANNER:
 {json.dumps(payload, indent=2, ensure_ascii=False)}
 
-CATÁLOGO DE VISTAS RELEVANTES:
-{json.dumps(catalogo_detallado, indent=2, ensure_ascii=False)}
+ESQUEMA REAL DE LA VISTA:
+{json.dumps(catalogo_real, indent=2, ensure_ascii=False)}
 
-MAPEO DE COLUMNAS:
+MAPEO REQUERIMIENTO → COLUMNA REAL:
 {json.dumps(column_mapping, indent=2, ensure_ascii=False)}
 
-FILTROS ESTRUCTURADOS A TRADUCIR A WHERE:
-{_filters_to_sql_description(payload.get("filters", []))}
+SUGERENCIAS DE TRADUCCIÓN:
+- SELECT dimensiones: {dims_expr or 'N/A'}
+- SELECT métricas: {metrics_expr or 'N/A'}
+- WHERE filtros: {filters_expr or 'N/A'}
+- Ventana temporal ({payload.get('time_window', 'ninguna')}): {time_window_sql or 'N/A'}
+- Estrategia: {payload.get('execution_strategy', 'single_view')} → {strategy_guidance}
 
-VENTANA TEMPORAL:
-{payload.get("time_window", "ninguna")} -> {time_window_sql or "N/A"}
-
-PREGUNTA ORIGINAL:
-{state.get("question", "")}
+PREGUNTA TÉCNICA DE LA SUBTAREA:
+{state.get('question', '')}
 
 ERROR PREVIO:
-{state.get("error_message", "Ninguno")}
+{state.get('error_message', 'Ninguno')}
 """
 
     messages = state.get("messages", [])
@@ -384,19 +536,8 @@ ERROR PREVIO:
         err = f"La query debe usar la vista obligatoria '{preferred}'. SQL generado no la referencia."
         return _sql_error(state, response, err)
 
-    # 4. Vistas documentadas
-    used_views = extract_views_used(sql_extracted)
-    if used_views:
-        invalid_views = [v for v in used_views if not is_view_allowed(v, _biz_mem)]
-        if invalid_views:
-            err = f"SECURITY: Vistas no documentadas en AGENTS.md: {invalid_views}"
-            return _sql_error(state, response, err)
-    else:
-        if sql_extracted and re.search(r'\bselect\b', sql_extracted, re.IGNORECASE):
-            logger.warning("[SQL] Query SELECT sin vistas semantic. detectadas.")
-
-    # 5. Columnas válidas por ámbito
-    is_valid, column_error = _validate_columns_in_sql(sql_extracted)
+    # 4. Columnas válidas contra esquema real
+    is_valid, column_error = _validate_columns_in_sql(sql_extracted, real_columns)
     if not is_valid:
         return _sql_error(state, response, column_error)
 
@@ -463,11 +604,12 @@ def _enrich_error_with_valid_columns(error: str, sql: str) -> str:
     used_views = extract_views_used(sql)
     enrichments = []
     for view_name in used_views:
-        clean = view_name.replace("semantic.", "").strip()
-        view_info = _biz_mem.get_view(clean)
-        if view_info:
-            available = list(view_info.metricas.keys()) + view_info.columnas_fecha
-            enrichments.append(f"\nColumnas VÁLIDAS para {view_name}: {available}")
+        try:
+            ddl = get_semantic_schema_for_views([view_name])
+            cols = _extract_columns_from_ddl(ddl)
+            enrichments.append(f"\nColumnas VÁLIDAS para {view_name}: {cols}")
+        except Exception as e:
+            logger.warning(f"[SQL] No se pudo enriquecer error con columnas de {view_name}: {e}")
     if enrichments:
         return error + "\n" + "\n".join(enrichments)
     return error

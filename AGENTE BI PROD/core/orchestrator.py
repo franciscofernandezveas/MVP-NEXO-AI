@@ -188,10 +188,15 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
         if not preferred:
             logger.warning(f"[SQL Agent Wrapper] Tarea {task_id} sin preferred_view.")
 
+        # ------------------------------------------------------------------
+        # OBTENER ESQUEMA REAL DE LA VISTA PREFERIDA (no todas las candidatas)
+        # ------------------------------------------------------------------
+        views_for_schema = [preferred] if preferred else candidate_views
         try:
-            schema_info = get_semantic_schema_for_views(candidate_views)
+            schema_info = get_semantic_schema_for_views(views_for_schema)
+            logger.info(f"[SQL Agent Wrapper] Schema obtenido para {views_for_schema}: {len(schema_info)} chars")
         except Exception as e:
-            logger.warning(f"[SQL Agent Wrapper] Error obteniendo schema: {e}")
+            logger.warning(f"[SQL Agent Wrapper] Error obteniendo schema de {views_for_schema}: {e}")
             schema_info = state.get("schema_info", "")
 
         # La pregunta para el subgrafo SQL debe ser la TAREA técnica, no la pregunta global
@@ -234,7 +239,7 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
                 needs_followup=True
             )
 
-        # Enriquecer contrato con metadatos de la subtarea (sin sobrescribir lo que ya venga del subgrafo)
+        # Enriquecer contrato con metadatos de la subtarea
         contract.task_id = task_id
         if not contract.allowed_views:
             contract.allowed_views = candidate_views
@@ -274,6 +279,7 @@ def sql_agent_wrapper(state: Dict[str, Any]) -> Dict[str, Any]:
             )
         ]
     }
+
 
 
 def _select_viz_source(state: Dict[str, Any]) -> tuple:
