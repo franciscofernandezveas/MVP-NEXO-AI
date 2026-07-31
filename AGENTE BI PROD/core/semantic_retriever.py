@@ -607,16 +607,17 @@ def _normalize_for_catalog(text: str) -> str:
 
 
 _SEMANTIC_COLUMN_MAP = {
-    "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku"],
-    "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"],
-    "categoria": ["categoria", "categoría", "categoria_nueva"],
+    "producto": ["producto", "descripcion", "descripción", "nombre_producto", "articulo", "artículo", "sku", "productos"],
+    "sucursal": ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación", "sucursales"],
+    "categoria": ["categoria", "categoría", "categoria_nueva", "categorias", "categorías"],
     "subcategoria": ["subcategoria", "subcategoría"],
     "fecha": ["fecha", "fecha_completa", "fecha_venta", "mes", "anio", "año"],
-    "venta_total": ["venta_total", "ventas", "ventas_totales", "subtotal_diario", "ingreso"],
-    "unidades": ["unidades", "cantidad", "unidades_totales", "unidades_vendidas"],
-    "transacciones": ["transacciones", "total_transacciones", "numero_transacciones"],
-    "ticket_promedio": ["ticket_promedio"],
+    "venta_total": ["venta_total", "ventas", "ventas_totales", "ventas_total", "subtotal_diario", "ingreso", "total_ventas"],
+    "unidades": ["unidades", "cantidad", "unidades_totales", "unidades_vendidas", "unidades_total"],
+    "transacciones": ["transacciones", "total_transacciones", "numero_transacciones", "transacciones_totales"],
+    "ticket_promedio": ["ticket_promedio", "ticket_promedio_sede"],
 }
+
 
 
 def get_view_columns(view_name: str) -> List[str]:

@@ -155,6 +155,7 @@ def _parse_filters_description(description: str) -> List[FilterSpec]:
 def _validate_task_integrity(task: SQLPayload) -> List[str]:
     """
     Valida que la vista preferida soporte métricas, dimensiones y filtros del payload.
+    Auto-corrige nombres de columnas si encuentra un match semántico.
     """
     errors = []
     preferred = task.preferred_view
@@ -168,33 +169,57 @@ def _validate_task_integrity(task: SQLPayload) -> List[str]:
         errors.append(f"La vista '{preferred}' no está documentada en AGENTS.md.")
         return errors
 
+    # Auto-corregir métricas
+    corrected_metrics = []
     for metric in (task.metrics or []):
-        if not column_exists_in_view(preferred, metric):
+        if column_exists_in_view(preferred, metric):
+            corrected_metrics.append(metric)
+        else:
             real = resolve_column(preferred, metric)
-            hint = f" ¿Quizás quisiste '{real}'?" if real else ""
-            errors.append(
-                f"La vista '{view_name}' no contiene la métrica '{metric}'.{hint} "
-                f"Columnas disponibles: {get_view_columns(preferred)}"
-            )
+            if real:
+                logger.info(f"[Planner] Auto-corrigiendo métrica '{metric}' -> '{real}'")
+                corrected_metrics.append(real)
+            else:
+                errors.append(
+                    f"La vista '{view_name}' no contiene la métrica '{metric}'. "
+                    f"Columnas disponibles: {get_view_columns(preferred)}"
+                )
+                corrected_metrics.append(metric)
+    task.metrics = corrected_metrics
 
+    # Auto-corregir dimensiones
+    corrected_dimensions = []
     for dim in (task.dimensions or []):
-        if not column_exists_in_view(preferred, dim):
+        if column_exists_in_view(preferred, dim):
+            corrected_dimensions.append(dim)
+        else:
             real = resolve_column(preferred, dim)
-            hint = f" ¿Quizás quisiste '{real}'?" if real else ""
-            errors.append(
-                f"La vista '{view_name}' no contiene la dimensión '{dim}'.{hint} "
-                f"Columnas disponibles: {get_view_columns(preferred)}"
-            )
+            if real:
+                logger.info(f"[Planner] Auto-corrigiendo dimensión '{dim}' -> '{real}'")
+                corrected_dimensions.append(real)
+            else:
+                errors.append(
+                    f"La vista '{view_name}' no contiene la dimensión '{dim}'. "
+                    f"Columnas disponibles: {get_view_columns(preferred)}"
+                )
+                corrected_dimensions.append(dim)
+    task.dimensions = corrected_dimensions
 
+    # Auto-corregir filtros
     for f in (task.filters or []):
         if not column_exists_in_view(preferred, f.column):
             real = resolve_column(preferred, f.column)
-            hint = f" ¿Quizás quisiste '{real}'?" if real else ""
-            errors.append(
-                f"La vista '{view_name}' no contiene la columna de filtro '{f.column}'.{hint}"
-            )
+            if real:
+                logger.info(f"[Planner] Auto-corrigiendo filtro '{f.column}' -> '{real}'")
+                f.column = real
+            else:
+                errors.append(
+                    f"La vista '{view_name}' no contiene la columna de filtro '{f.column}'. "
+                    f"Columnas disponibles: {get_view_columns(preferred)}"
+                )
 
     return errors
+
 
 
 # ------------------------------------------------------------------
