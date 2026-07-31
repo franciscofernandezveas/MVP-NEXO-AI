@@ -1,6 +1,3 @@
-# routes/onboarding/chat.py
-# -------------------------------------------------
-
 import os
 import json
 import time
@@ -11,7 +8,6 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
-from typing import Any, Optional
 
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import StreamingResponse
@@ -31,15 +27,6 @@ PENDING_ACTIONS: dict = {}
 class ChatRequest(BaseModel):
     question: str
     messages: list[dict] = []
-
-
-def _get(obj: Any, attr: str, default: Any = None) -> Any:
-    """Lee atributos de objetos Pydantic o claves de diccionarios serializados."""
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(attr, default)
-    return getattr(obj, attr, default)
 
 
 def _build_initial_state(question: str) -> dict:
@@ -81,46 +68,8 @@ def _node_message(node: str) -> str:
     }.get(node, f"Procesando ({node})...")
 
 
-# ============================================================================
-# NUEVO: Limpieza de charts residuales
-# ============================================================================
-
-def _cleanup_residual_charts() -> None:
-    """Elimina archivos de gráficos de ejecuciones anteriores."""
-    files_dir = Path(os.getenv("FILES_DIR", "/app/files")).resolve()
-    charts_dir = files_dir / "charts"
-    if not charts_dir.exists():
-        return
-
-    for filename in ["chart.png", "chart.html"]:
-        fp = charts_dir / filename
-        if fp.exists():
-            try:
-                fp.unlink()
-                logger.info(f"[Chat] Residual eliminado: {fp}")
-            except Exception as e:
-                logger.warning(f"[Chat] No se pudo eliminar residual {fp}: {e}")
-
-
-# ============================================================================
-# Publicación de chart
-# ============================================================================
-
-async def _publish_chart(
-    session_id: str,
-    base_url: str,
-    viz_result: Optional[Any] = None,
-) -> str | None:
-    """
-    Copia el chart generado en esta ejecución a un archivo público.
-    Solo publica si hay un chart_type válido en el contrato y el archivo existe y tiene contenido.
-    """
-    chart_type = _get(viz_result, "chart_type")
-
-    if not chart_type or chart_type == "null":
-        logger.info("[Chat] No hay chart_type válido en viz_result; omitiendo publicación.")
-        return None
-
+async def _publish_chart(session_id: str, base_url: str) -> str | None:
+    """Copia el chart generado a un archivo público y devuelve su URL."""
     files_dir = Path(os.getenv("FILES_DIR", "/app/files")).resolve()
     charts_dir = files_dir / "charts"
     src = charts_dir / "chart.png"
@@ -129,29 +78,22 @@ async def _publish_chart(
 
     logger.info(f"[_publish_chart] Buscando chart en: {src} | Existe: {src.exists()}")
 
-    if not src.exists() or src.stat().st_size == 0:
-        logger.warning("[_publish_chart] No existe chart.png generado en esta ejecución o está vacío")
-        return None
+    if src.exists() and src.stat().st_size > 0:
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_id = "".join(c for c in session_id if c.isalnum())[:20]
+            fname = f"chart_{safe_id}_{ts}_{uuid4().hex[:4]}.png"
+            dest = charts_dir / fname
+            shutil.copy2(str(src), str(dest))
+            public_url = os.getenv("BACKEND_PUBLIC_URL", base_url).rstrip('/')
+            chart_url = f"{public_url}/files/charts/{fname}"
+            logger.info(f"[_publish_chart] Chart publicado: {chart_url}")
+            return chart_url
+        except Exception:
+            logger.exception("[_publish_chart] Error copiando chart")
+            traceback.print_exc()
+    return None
 
-    try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe_id = "".join(c for c in session_id if c.isalnum())[:20]
-        fname = f"chart_{safe_id}_{ts}_{uuid4().hex[:4]}.png"
-        dest = charts_dir / fname
-        shutil.copy2(str(src), str(dest))
-        public_url = os.getenv("BACKEND_PUBLIC_URL", base_url).rstrip('/')
-        chart_url = f"{public_url}/files/charts/{fname}"
-        logger.info(f"[_publish_chart] Chart publicado: {chart_url}")
-        return chart_url
-    except Exception:
-        logger.exception("[_publish_chart] Error copiando chart")
-        traceback.print_exc()
-        return None
-
-
-# ============================================================================
-# Endpoint principal
-# ============================================================================
 
 @router.post("/{session_id}/chat")
 async def stream_chat(request: Request, session_id: str, body: ChatRequest):
@@ -168,9 +110,6 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
             with session_scope(session_id):
                 t_start = time.time()
                 try:
-                    # LIMPIEZA AL INICIO: garantiza que no haya charts de ejecuciones previas
-                    _cleanup_residual_charts()
-
                     question = body.question
                     yes_no = detect_yes_no_response(question)
 
@@ -202,13 +141,9 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                     chart_emitted = False
                     final_answer_emitted = False
 
-                    # Último estado conocido del stream
-                    final_state = None
-
                     async for state in BI_ORCHESTRATOR.astream(
                         initial_state, config, stream_mode="values"
                     ):
-                        final_state = state
                         agent = state.get("last_agent")
                         iteration = state.get("iteration_count", 0)
 
@@ -221,7 +156,14 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                             )
                             last_agent = agent
 
-                        # Emitir respuesta final si existe
+                        if not chart_emitted and (
+                            state.get("viz_rendered") or agent in ("render_plotly", "viz_agent")
+                        ):
+                            chart_url = await _publish_chart(session_id, base_url)
+                            if chart_url:
+                                yield sse_event("chart", url=chart_url, format="png")
+                                chart_emitted = True
+
                         answer = state.get("final_answer")
                         if answer and not final_answer_emitted:
                             final_answer = answer
@@ -229,19 +171,11 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                                 yield chunk
                             final_answer_emitted = True
 
-                    # AL FINAL DEL STREAM: publicar chart SOLO si fue renderizado en esta ejecución
-                    if final_state:
-                        viz_rendered = final_state.get("viz_rendered", False)
-                        viz_result = final_state.get("viz_result") or {}
-
-                        if viz_rendered and _get(viz_result, "chart_type"):
-                            chart_url = await _publish_chart(session_id, base_url, viz_result)
-                            if chart_url:
-                                yield sse_event("chart", url=chart_url, format="png")
-                                chart_emitted = True
-
                     if not chart_emitted:
-                        logger.info("[Chat] No se generó visualización en esta ejecución; no se publica chart.")
+                        chart_url = await _publish_chart(session_id, base_url)
+                        if chart_url:
+                            yield sse_event("chart", url=chart_url, format="png")
+                            chart_emitted = True
 
                     follow_up = "¿Quieres que te proporcione información más detallada sobre esto?"
                     async for chunk in sse_stream_text(follow_up, sleep_time=0.003):
