@@ -578,10 +578,20 @@ def seleccionar_vista_principal(
 # ------------------------------------------------------------------
 # NUEVO: RESOLUCIÓN SEMÁNTICA SOBRE CATÁLOGO DOCUMENTADO (BusinessMemory)
 # ------------------------------------------------------------------
-from core.harness import BusinessMemory
-from core.contracts import SQLPayload
 
-_biz_mem_catalog = BusinessMemory.from_file()
+# NOTA: Lazy singleton para evitar import circular con core.harness.
+# core.harness importa funciones de este módulo durante su carga,
+# por lo que no podemos importar BusinessMemory a nivel de módulo aquí.
+_biz_mem_catalog = None
+
+
+def _get_biz_mem_catalog():
+    """Devuelve instancia lazy/singleton de BusinessMemory."""
+    global _biz_mem_catalog
+    if _biz_mem_catalog is None:
+        from core.harness import BusinessMemory
+        _biz_mem_catalog = BusinessMemory.from_file()
+    return _biz_mem_catalog
 
 
 def _normalize_for_catalog(text: str) -> str:
@@ -614,7 +624,7 @@ def get_view_columns(view_name: str) -> List[str]:
     Devuelve las columnas reales (métricas + fechas) documentadas para una vista.
     """
     clean = view_name.replace("semantic.", "").strip()
-    info = _biz_mem_catalog.get_view(clean)
+    info = _get_biz_mem_catalog().get_view(clean)
     if not info:
         return []
     return list(info.metricas.keys()) + info.columnas_fecha
@@ -666,7 +676,7 @@ def resolve_column(view_name: str, semantic_name: str) -> Optional[str]:
     return None
 
 
-def find_compatible_view(task: SQLPayload, allowed_views: List[str]) -> Optional[str]:
+def find_compatible_view(task: Any, allowed_views: List[str]) -> Optional[str]:
     """
     Encuentra la primera vista que contenga todas las métricas,
     dimensiones y columnas de filtro.
