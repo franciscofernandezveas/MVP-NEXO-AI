@@ -2,6 +2,7 @@
 # -------------------------------------------------
 
 import logging
+import re  # <-- NUEVO: para detección de chitchat
 from typing import Optional, Any, List, Dict, Annotated
 from typing_extensions import TypedDict
 
@@ -30,6 +31,60 @@ from langsmith import traceable
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# NUEVO: Detección de chitchat (saludos, despedidas, gracias, identidad)
+# ------------------------------------------------------------------
+_CHITCHAT_PATTERNS = [
+    r'^(hola|buenos días|buenas tardes|buenas noches|hey|hi|hello)\b',
+    r'^(cómo estás|como estas|qué tal|que tal|todo bien)\b',
+    r'^(quién eres|quien eres|qué eres|que eres|qué puedes hacer|que puedes hacer|para qué sirves)\b',
+    r'^(gracias|muchas gracias|ok|okey|vale|entendido)\b',
+    r'^(adiós|adios|hasta luego|nos vemos|chao|bye)\b',
+]
+
+_BUSINESS_MARKERS = [
+    "venta", "ventas", "vendido", "vender", "unidades", "sede", "producto",
+    "categoría", "categoria", "sql", "query", "reporte", "informe", "forecast",
+    "pronóstico", "pronosticar", "demanda", "ticket", "promedio", "canje",
+    "canjes", "cortesía", "cortesia", "fidelización", "puntos", "cliente",
+    "mes", "año", "semana", "ayer", "hoy", "mañana"
+]
+
+
+def _is_chitchat(question: str) -> bool:
+    """
+    Detecta si una pregunta es puramente conversacional.
+    Es conservador: si la frase contiene palabras de negocio, NO es chitchat.
+    """
+    q = question.lower().strip()
+
+    # ¿Cumple algún patrón de chitchat?
+    is_match = any(re.search(p, q) for p in _CHITCHAT_PATTERNS)
+
+    # Si además contiene palabras de negocio, no es chitchat puro
+    has_business = any(marker in q for marker in _BUSINESS_MARKERS)
+
+    return is_match and not has_business
+
+
+def _generate_chitchat_response(question: str) -> str:
+    q = question.lower().strip()
+
+    if re.search(r'^(hola|buenos días|buenas tardes|buenas noches|hey|hi|hello)', q):
+        return "¡Hola! Soy tu asistente de análisis de datos. ¿En qué puedo ayudarte hoy?"
+    if re.search(r'^(cómo estás|como estas|qué tal|que tal)', q):
+        return "¡Estoy listo para ayudarte! ¿Qué información necesitas consultar?"
+    if re.search(r'^(quién eres|quien eres|qué eres|que eres|qué puedes hacer|que puedes hacer|para qué sirves)', q):
+        return "Soy un asistente BI que puede consultar ventas, productos, sedes, fidelización, cortesías y más. ¿Qué te gustaría saber?"
+    if re.search(r'^(gracias|muchas gracias)', q):
+        return "¡Con gusto! Estoy aquí para lo que necesites."
+    if re.search(r'^(adiós|adios|hasta luego|nos vemos|chao|bye)', q):
+        return "¡Hasta luego! Que tengas un buen día."
+    return "¡Hola! ¿En qué puedo ayudarte?"
+
+
+
+
 class OrchestratorState(TypedDict):
     question: str
     messages: Annotated[List[BaseMessage], add_messages]
@@ -52,6 +107,7 @@ class OrchestratorState(TypedDict):
     forecast_results: Optional[List[Dict[str, Any]]]
     forecast_error: Optional[str]
     render_attempts: int
+    is_chitchat: Optional[bool]      # <-- NUEVO
 
 
 def _to_dict(obj: Any) -> Dict[str, Any]:
@@ -63,6 +119,30 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     if hasattr(obj, "dict"):
         return obj.dict()
     return vars(obj)
+
+
+# ------------------------------------------------------------------
+# NUEVO: Nodos de chitchat
+# ------------------------------------------------------------------
+def detect_chitchat_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "is_chitchat": _is_chitchat(state.get("question", ""))
+    }
+
+
+def chitchat_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    question = state.get("question", "")
+    response = _generate_chitchat_response(question)
+
+    logger.info(f"[Chitchat] Pregunta='{question}' → Respuesta predefinida")
+
+    return {
+        "final_answer": response,
+        "last_agent": "chitchat",
+        "messages": state.get("messages", []) + [
+            AIMessage(content=f"[Chitchat] {response}")
+        ]
+    }
 
 
 @traceable(name="Orchestrator: Build Harness Context")
@@ -413,6 +493,8 @@ def researcher_node(state: Dict[str, Any]) -> Dict[str, Any]:
 builder = StateGraph(OrchestratorState)
 
 builder.add_node("build_harness", build_harness_context_node)
+builder.add_node("detect_chitchat", detect_chitchat_node)  # <-- NUEVO
+builder.add_node("chitchat", chitchat_node)                # <-- NUEVO
 builder.add_node("supervisor", supervisor_node)
 builder.add_node("planner", planner_node)
 builder.add_node("sql_agent", sql_agent_wrapper)
@@ -425,7 +507,20 @@ builder.add_node("forecaster", forecaster_node)
 
 # FLUJO ENTRADA
 builder.add_edge("__start__", "build_harness")
-builder.add_edge("build_harness", "supervisor")
+
+# NUEVO: corte de chitchat antes del supervisor
+builder.add_edge("build_harness", "detect_chitchat")
+
+builder.add_conditional_edges(
+    "detect_chitchat",
+    lambda state: "chitchat" if state.get("is_chitchat") else "supervisor",
+    {
+        "chitchat": "chitchat",
+        "supervisor": "supervisor",
+    }
+)
+
+builder.add_edge("chitchat", "__end__")
 
 # Supervisor decide el siguiente nodo según el campo "next" del estado
 builder.add_conditional_edges(
