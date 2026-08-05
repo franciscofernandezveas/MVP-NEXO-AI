@@ -45,21 +45,23 @@ async def _get_first_active_company(supabase):
     return data.get("id") if data else None
 
 
-async def _get_or_create_pilot_user(supabase, user_id: str):
+async def _get_or_create_user_profile(supabase, user_id: str):
     """
-    Busca el usuario en public.users. Si no existe, lo crea automáticamente.
+    Busca el perfil en public.user_profiles. Si no existe, lo crea
+    asociado a la primera empresa piloto activa.
+    El user_id debe existir previamente en auth.users.
     """
-    # 1. Buscar usuario existente
+    # 1. Buscar perfil existente
     data, err = _safe_execute(
-        supabase.table("users")
-        .select("id, company_id")
-        .eq("id", user_id)
+        supabase.table("user_profiles")
+        .select("user_id, company_id")
+        .eq("user_id", user_id)
         .maybe_single()
     )
-    if data and isinstance(data, dict):
+    if data:
         return data
 
-    logger.info(f"[sessions] usuario {user_id} no existe en public.users, creando perfil piloto...")
+    logger.info(f"[sessions] perfil no encontrado para {user_id}, creando uno...")
 
     # 2. Buscar primera empresa piloto activa
     company_id = await _get_first_active_company(supabase)
@@ -67,10 +69,10 @@ async def _get_or_create_pilot_user(supabase, user_id: str):
         logger.error("[sessions] no hay empresa piloto activa")
         return None
 
-    # 3. Crear usuario piloto mínimo
-    user_data, user_err = _safe_execute(
-        supabase.table("users").insert({
-            "id": user_id,
+    # 3. Crear perfil mínimo
+    profile_data, profile_err = _safe_execute(
+        supabase.table("user_profiles").insert({
+            "user_id": user_id,
             "company_id": company_id,
             "email": "piloto@nexobi.cl",
             "name": "Usuario Piloto",
@@ -80,11 +82,11 @@ async def _get_or_create_pilot_user(supabase, user_id: str):
         })
     )
 
-    if user_data and isinstance(user_data, list) and len(user_data) > 0:
-        logger.info(f"[sessions] usuario piloto creado: {user_id}")
-        return user_data[0]
+    if profile_data and isinstance(profile_data, list) and len(profile_data) > 0:
+        logger.info(f"[sessions] perfil creado para {user_id}")
+        return profile_data[0]
 
-    logger.error(f"[sessions] no se pudo crear usuario piloto: {user_err}")
+    logger.error(f"[sessions] no se pudo crear perfil: {profile_err}")
     return None
 
 
@@ -93,14 +95,13 @@ async def create_session(body: CreateSessionRequest):
     supabase = get_supabase_client()
     user_id_str = str(body.user_id)
 
-    user = await _get_or_create_pilot_user(supabase, user_id_str)
-    company_id = user.get("company_id") if user else None
+    profile = await _get_or_create_user_profile(supabase, user_id_str)
+    company_id = profile.get("company_id") if profile else None
 
-    # Fallback extremo: si no se pudo crear usuario, usar empresa por defecto
+    # Fallback: usar primera empresa activa
     if not company_id:
         company_id = await _get_first_active_company(supabase)
 
-    # Crear sesión (con o sin company_id)
     session_data, session_err = _safe_execute(
         supabase.table("sessions").insert({
             "user_id": user_id_str,
@@ -120,12 +121,21 @@ async def create_session(body: CreateSessionRequest):
         else session_data["id"]
     )
 
+    # Crear credenciales demo para que el agente pueda operar
+    _safe_execute(
+        supabase.table("session_credentials").upsert({
+            "session_id": session_id,
+            "is_demo": True,
+            "db_type": "postgresql",
+        })
+    )
+
     await emit_event(
         "session.started",
         user_id=user_id_str,
         company_id=company_id,
         session_id=session_id,
-        payload={"source": body.source or "web", "auto_created_user": user is None},
+        payload={"source": body.source or "web", "auto_created_profile": profile is None},
     )
 
     await emit_event(

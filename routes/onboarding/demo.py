@@ -13,14 +13,11 @@ class DemoStartResponse(BaseModel):
 
 
 @router.post("/start", response_model=DemoStartResponse)
-async def start_demo(user_id: str = None, company_id: str = None):
+async def start_demo():
     supabase = get_supabase_client()
     slug = "demo-main"
-
-    default_user_id = "dddddddd-dddd-dddd-dddd-dddddddddddd"
     default_company_id = "11111111-1111-1111-1111-111111111111"
 
-    # Si no vienen parámetros, buscar sesión demo existente
     existing = supabase.table("demo_sessions")\
         .select("id")\
         .eq("slug", slug)\
@@ -28,33 +25,34 @@ async def start_demo(user_id: str = None, company_id: str = None):
         .execute()
 
     if existing and existing.data:
-        session_id = existing.data["id"]
-    else:
-        result = supabase.table("demo_sessions")\
-            .insert({"slug": slug, "profile": {}, "is_demo": True})\
-            .execute()
+        return DemoStartResponse(session_id=existing.data["id"], ok=True)
 
-        session_id = result.data[0]["id"]
+    result = supabase.table("demo_sessions")\
+        .insert({"slug": slug, "profile": {}, "is_demo": True})\
+        .execute()
 
-        supabase.table("session_credentials")\
-            .insert({"session_id": session_id, "is_demo": True})\
-            .execute()
+    session_id = result.data[0]["id"]
 
-        # Registrar como sesión real de adopción
-        supabase.table("sessions").insert({
-            "id": session_id,
-            "user_id": user_id or default_user_id,
-            "company_id": company_id or default_company_id,
-            "source": "demo",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+    # Credenciales demo
+    supabase.table("session_credentials")\
+        .insert({"session_id": session_id, "is_demo": True})\
+        .execute()
 
-        await emit_event(
-            "session.started",
-            user_id=user_id or default_user_id,
-            company_id=company_id or default_company_id,
-            session_id=session_id,
-            payload={"source": "demo", "is_demo": True},
-        )
+    # Sesión de analytics demo (sin user_id real)
+    supabase.table("sessions").insert({
+        "id": session_id,
+        "user_id": None,
+        "company_id": default_company_id,
+        "source": "demo",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    await emit_event(
+        "session.started",
+        user_id=None,
+        company_id=default_company_id,
+        session_id=session_id,
+        payload={"source": "demo", "is_demo": True},
+    )
 
     return DemoStartResponse(session_id=session_id, ok=True)

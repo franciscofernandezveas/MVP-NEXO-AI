@@ -40,6 +40,19 @@ def _get(obj: Any, attr: str, default: Any = None) -> Any:
     return getattr(obj, attr, default)
 
 
+def _safe_execute(query, silent: bool = True):
+    """Ejecuta una query de supabase y devuelve (data, error)."""
+    try:
+        result = query.execute()
+        if result is None:
+            return None, "Supabase devolvió None"
+        return getattr(result, "data", None), None
+    except Exception as e:
+        if not silent:
+            logger.warning(f"[supabase] query error: {e}")
+        return None, str(e)
+
+
 def _build_initial_state(question: str) -> dict:
     return {
         "question": question,
@@ -129,33 +142,38 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
 
     supabase = get_supabase_client()
 
-    # Recuperar user_id/company_id de la sesión
-    session_row = supabase.table("sessions")\
-        .select("id, user_id, company_id, started_at")\
-        .eq("id", session_id)\
-        .maybe_single()\
-        .execute()
+    # Recuperar user_id/company_id de la sesión (robusto a respuestas None)
+    session_data, session_err = _safe_execute(
+        supabase.table("sessions")
+        .select("id, user_id, company_id, started_at")
+        .eq("id", session_id)
+        .maybe_single()
+    )
 
-    if not session_row.data:
+    if not session_data:
+        logger.error(f"[chat] sesión no encontrada: {session_id} | error: {session_err}")
         raise HTTPException(status_code=404, detail="Sesión no encontrada")
 
-    user_id = session_row.data.get("user_id")
-    company_id = session_row.data.get("company_id")
+    user_id = session_data.get("user_id")
+    company_id = session_data.get("company_id")
     first_query_at = datetime.now(timezone.utc)
 
     # Guardar mensaje del usuario
+    user_message_id = None
     try:
-        msg_user = supabase.table("messages").insert({
-            "session_id": session_id,
-            "user_id": user_id,
-            "role": "user",
-            "content": body.question,
-            "message_type": "question",
-        }).execute()
-        user_message_id = msg_user.data[0]["id"] if msg_user.data else None
+        msg_data, _ = _safe_execute(
+            supabase.table("messages").insert({
+                "session_id": session_id,
+                "user_id": user_id,
+                "role": "user",
+                "content": body.question,
+                "message_type": "question",
+            })
+        )
+        if msg_data and isinstance(msg_data, list) and len(msg_data) > 0:
+            user_message_id = msg_data[0]["id"]
     except Exception as e:
         logger.warning(f"[chat] no se pudo guardar mensaje usuario: {e}")
-        user_message_id = None
 
     await emit_event(
         "chat.message.sent",
@@ -256,33 +274,39 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                             sql_success = not any(r.get("error") for r in sql_results if isinstance(r, dict))
 
                     # Guardar mensaje del asistente
-                    try:
-                        if final_answer:
-                            msg_assistant = supabase.table("messages").insert({
-                                "session_id": session_id,
-                                "user_id": user_id,
-                                "role": "assistant",
-                                "content": final_answer[:4000],
-                                "message_type": "answer",
-                            }).execute()
-                            assistant_message_id = msg_assistant.data[0]["id"] if msg_assistant.data else None
+                    if final_answer:
+                        try:
+                            msg_data, _ = _safe_execute(
+                                supabase.table("messages").insert({
+                                    "session_id": session_id,
+                                    "user_id": user_id,
+                                    "role": "assistant",
+                                    "content": final_answer[:4000],
+                                    "message_type": "answer",
+                                })
+                            )
+                            if msg_data and isinstance(msg_data, list) and len(msg_data) > 0:
+                                assistant_message_id = msg_data[0]["id"]
 
                             # Guardar respuesta del agente
-                            ar_result = supabase.table("agent_responses").insert({
-                                "message_id": assistant_message_id,
-                                "session_id": session_id,
-                                "user_id": user_id,
-                                "response_time_ms": response_time_ms,
-                                "sql_generated": sql_generated,
-                                "sql_executed": sql_generated is not None,
-                                "sql_success": sql_success,
-                                "error_type": error_type,
-                                "has_visualization": chart_emitted,
-                                "has_dashboard": False,
-                            }).execute()
-                            response_id = ar_result.data[0]["id"] if ar_result.data else None
-                    except Exception as e:
-                        logger.warning(f"[chat] no se pudo guardar respuesta agente: {e}")
+                            ar_data, _ = _safe_execute(
+                                supabase.table("agent_responses").insert({
+                                    "message_id": assistant_message_id,
+                                    "session_id": session_id,
+                                    "user_id": user_id,
+                                    "response_time_ms": response_time_ms,
+                                    "sql_generated": sql_generated,
+                                    "sql_executed": sql_generated is not None,
+                                    "sql_success": sql_success,
+                                    "error_type": error_type,
+                                    "has_visualization": chart_emitted,
+                                    "has_dashboard": False,
+                                })
+                            )
+                            if ar_data and isinstance(ar_data, list) and len(ar_data) > 0:
+                                response_id = ar_data[0]["id"]
+                        except Exception as e:
+                            logger.warning(f"[chat] no se pudo guardar respuesta agente: {e}")
 
                     # Eventos de calidad
                     await emit_event(
@@ -318,17 +342,19 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                             reached_at = datetime.now(timezone.utc)
                             seconds_to_insight = int((reached_at - first_query_at).total_seconds())
 
-                            supabase.table("insights").insert({
-                                "session_id": session_id,
-                                "user_id": user_id,
-                                "company_id": company_id,
-                                "first_query_at": first_query_at.isoformat(),
-                                "insight_reached_at": reached_at.isoformat(),
-                                "query_count": query_count,
-                                "successful": True,
-                                "self_served": True,
-                                "description": final_answer[:500],
-                            }).execute()
+                            _safe_execute(
+                                supabase.table("insights").insert({
+                                    "session_id": session_id,
+                                    "user_id": user_id,
+                                    "company_id": company_id,
+                                    "first_query_at": first_query_at.isoformat(),
+                                    "insight_reached_at": reached_at.isoformat(),
+                                    "query_count": query_count,
+                                    "successful": True,
+                                    "self_served": True,
+                                    "description": final_answer[:500],
+                                })
+                            )
 
                             await emit_event(
                                 "insight.reached",
@@ -380,7 +406,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                     yield sse_event("error", content=str(e))
                     yield sse_event("end", intent="ERROR", success=False)
                 finally:
-                    print(f"Chat stream finalizado en {time.time() - t_start:.2f}s | session={session_id}")
+                    logger.info(f"Chat stream finalizado en {time.time() - t_start:.2f}s | session={session_id}")
 
     return StreamingResponse(
         event_generator(),
