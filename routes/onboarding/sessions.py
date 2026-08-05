@@ -3,13 +3,13 @@ from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime, timezone
 from uuid import UUID
+import logging
 
 from core.supabase_client import get_supabase_client
 from utils.analytics import emit_event
 
 router = APIRouter()
-
-logger = __import__("logging").getLogger("routes.onboarding.sessions")
+logger = logging.getLogger("routes.onboarding.sessions")
 
 
 class CreateSessionRequest(BaseModel):
@@ -22,37 +22,115 @@ class SessionResponse(BaseModel):
     ok: bool
 
 
+def _safe_execute(query):
+    """Ejecuta query y devuelve (data, error). Nunca lanza excepción."""
+    try:
+        result = query.execute()
+        if result is None:
+            return None, "Supabase devolvió None"
+        return getattr(result, "data", None), None
+    except Exception as e:
+        logger.warning(f"[supabase] query error: {e}")
+        return None, str(e)
+
+
+async def _get_first_active_company(supabase):
+    data, _ = _safe_execute(
+        supabase.table("companies")
+        .select("id")
+        .eq("is_active", True)
+        .limit(1)
+        .maybe_single()
+    )
+    return data.get("id") if data else None
+
+
+async def _get_or_create_pilot_user(supabase, user_id: str):
+    """
+    Busca el usuario en public.users. Si no existe, lo crea automáticamente.
+    """
+    # 1. Buscar usuario existente
+    data, err = _safe_execute(
+        supabase.table("users")
+        .select("id, company_id")
+        .eq("id", user_id)
+        .maybe_single()
+    )
+    if data and isinstance(data, dict):
+        return data
+
+    logger.info(f"[sessions] usuario {user_id} no existe en public.users, creando perfil piloto...")
+
+    # 2. Buscar primera empresa piloto activa
+    company_id = await _get_first_active_company(supabase)
+    if not company_id:
+        logger.error("[sessions] no hay empresa piloto activa")
+        return None
+
+    # 3. Crear usuario piloto mínimo
+    user_data, user_err = _safe_execute(
+        supabase.table("users").insert({
+            "id": user_id,
+            "company_id": company_id,
+            "email": "piloto@nexobi.cl",
+            "name": "Usuario Piloto",
+            "profile": "cafe_admin",
+            "role": "operator",
+            "is_active": True,
+        })
+    )
+
+    if user_data and isinstance(user_data, list) and len(user_data) > 0:
+        logger.info(f"[sessions] usuario piloto creado: {user_id}")
+        return user_data[0]
+
+    logger.error(f"[sessions] no se pudo crear usuario piloto: {user_err}")
+    return None
+
+
 @router.post("/create", response_model=SessionResponse)
 async def create_session(body: CreateSessionRequest):
     supabase = get_supabase_client()
+    user_id_str = str(body.user_id)
 
-    user = supabase.table("users").select("id, company_id").eq("id", str(body.user_id)).maybe_single().execute()
-    if not user.data:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    user = await _get_or_create_pilot_user(supabase, user_id_str)
+    company_id = user.get("company_id") if user else None
 
-    user_id = user.data["id"]
-    company_id = user.data.get("company_id")
+    # Fallback extremo: si no se pudo crear usuario, usar empresa por defecto
+    if not company_id:
+        company_id = await _get_first_active_company(supabase)
 
-    result = supabase.table("sessions").insert({
-        "user_id": user_id,
-        "company_id": company_id,
-        "source": body.source or "web",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    # Crear sesión (con o sin company_id)
+    session_data, session_err = _safe_execute(
+        supabase.table("sessions").insert({
+            "user_id": user_id_str,
+            "company_id": company_id,
+            "source": body.source or "web",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+    )
 
-    session_id = result.data[0]["id"]
+    if not session_data:
+        logger.error(f"[sessions] error insertando sesión: {session_err}")
+        raise HTTPException(status_code=500, detail=f"Error creando sesión: {session_err}")
+
+    session_id = (
+        session_data[0]["id"]
+        if isinstance(session_data, list) and len(session_data) > 0
+        else session_data["id"]
+    )
 
     await emit_event(
         "session.started",
-        user_id=user_id,
+        user_id=user_id_str,
         company_id=company_id,
         session_id=session_id,
-        payload={"source": body.source or "web"},
+        payload={"source": body.source or "web", "auto_created_user": user is None},
     )
 
     await emit_event(
         "feature.used",
-        user_id=user_id,
+        user_id=user_id_str,
         company_id=company_id,
         session_id=session_id,
         payload={"feature_name": "chat"},
@@ -65,14 +143,20 @@ async def create_session(body: CreateSessionRequest):
 async def session_heartbeat(session_id: str):
     supabase = get_supabase_client()
 
-    session = supabase.table("sessions").select("id, user_id, company_id").eq("id", session_id).maybe_single().execute()
-    if not session.data:
+    data, err = _safe_execute(
+        supabase.table("sessions")
+        .select("id, user_id, company_id")
+        .eq("id", session_id)
+        .maybe_single()
+    )
+
+    if not data:
         raise HTTPException(status_code=404, detail="Sesión no encontrada")
 
     await emit_event(
         "session.heartbeat",
-        user_id=session.data.get("user_id"),
-        company_id=session.data.get("company_id"),
+        user_id=data.get("user_id"),
+        company_id=data.get("company_id"),
         session_id=session_id,
     )
     return {"ok": True}
@@ -82,23 +166,35 @@ async def session_heartbeat(session_id: str):
 async def end_session(session_id: str):
     supabase = get_supabase_client()
 
-    session = supabase.table("sessions").select("id, user_id, company_id, started_at").eq("id", session_id).maybe_single().execute()
-    if not session.data:
+    data, err = _safe_execute(
+        supabase.table("sessions")
+        .select("id, user_id, company_id, started_at")
+        .eq("id", session_id)
+        .maybe_single()
+    )
+
+    if not data:
         raise HTTPException(status_code=404, detail="Sesión no encontrada")
 
-    started = datetime.fromisoformat(session.data["started_at"].replace("Z", "+00:00"))
-    ended = datetime.now(timezone.utc)
-    duration = int((ended - started).total_seconds())
+    try:
+        started = datetime.fromisoformat(data["started_at"].replace("Z", "+00:00"))
+    except Exception:
+        started = datetime.now(timezone.utc)
 
-    supabase.table("sessions").update({
-        "ended_at": ended.isoformat(),
-        "duration_seconds": duration,
-    }).eq("id", session_id).execute()
+    ended = datetime.now(timezone.utc)
+    duration = max(0, int((ended - started).total_seconds()))
+
+    _safe_execute(
+        supabase.table("sessions").update({
+            "ended_at": ended.isoformat(),
+            "duration_seconds": duration,
+        }).eq("id", session_id)
+    )
 
     await emit_event(
         "session.ended",
-        user_id=session.data.get("user_id"),
-        company_id=session.data.get("company_id"),
+        user_id=data.get("user_id"),
+        company_id=data.get("company_id"),
         session_id=session_id,
         payload={"duration_seconds": duration},
     )
