@@ -507,6 +507,8 @@ REGLAS CRÍTICAS DE SELECCIÓN DE VISTA:
 6. SEGURIDAD: Usa ÚNICAMENTE vistas presentes en el catálogo de arriba. NO inventes vistas.
 7. DESCOMPOSICIÓN: Si la pregunta tiene múltiples KPIs de distinta naturaleza o contextos temporales distintos, genera tareas SEPARADAS.
 8. NO DESCOMPONER si es la misma intención, misma granularidad y misma temporalidad.
+9. Si la pregunta del usuario no requiere de generar consulta no digas que ha fallado el plan
+10.si el usuario hace preguntas como 'Hola', 'como estás?' o 'quien eres?' responde cordialmente, no se necesitan consultas para estas preguntas
 
 REGLAS DE NEGOCIO:
 - "Se han vendido" / "ventas" / "unidades vendidas" → vistas de VENTAS NORMALES.
