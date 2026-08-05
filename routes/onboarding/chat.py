@@ -133,6 +133,69 @@ async def _publish_chart(session_id: str, base_url: str, viz_result: Optional[An
         return None
 
 
+def _sql_result_to_dict(result: Any) -> Any:
+    """
+    Convierte un SQLContract (u objeto Pydantic) a diccionario serializable.
+    Si ya es dict/list, lo devuelve tal cual. Si falla, devuelve string.
+    """
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, list):
+        return [_sql_result_to_dict(item) for item in result]
+
+    # Pydantic v2 / v1 compatible
+    if hasattr(result, "model_dump"):
+        try:
+            return result.model_dump(mode="json")
+        except Exception:
+            pass
+    if hasattr(result, "dict"):
+        try:
+            return result.dict()
+        except Exception:
+            pass
+
+    # Atributos públicos como dict
+    try:
+        return {
+            k: _sql_result_to_dict(v)
+            for k, v in result.__dict__.items()
+            if not k.startswith("_")
+        }
+    except Exception:
+        return str(result)
+
+
+def _is_sql_success(sql_results: list) -> Optional[bool]:
+    """
+    Determina si la ejecución SQL fue exitosa inspeccionando los contratos.
+    """
+    if not sql_results:
+        return None
+    for r in sql_results:
+        if isinstance(r, dict):
+            if r.get("error_message") or r.get("error"):
+                return False
+        else:
+            err = _get(r, "error_message") or _get(r, "error")
+            if err:
+                return False
+    return True
+
+
+def _sql_rows_returned(sql_results: list) -> int:
+    if not sql_results:
+        return 0
+    first = sql_results[0]
+    if isinstance(first, dict):
+        rows = first.get("rows") or first.get("row_count") or first.get("data") or []
+        return len(rows) if isinstance(rows, list) else 0
+    rows = _get(first, "rows") or _get(first, "row_count") or _get(first, "data") or []
+    return len(rows) if isinstance(rows, list) else 0
+
+
 @router.post("/{session_id}/chat")
 async def stream_chat(request: Request, session_id: str, body: ChatRequest):
     from core.orchestrator import BI_ORCHESTRATOR
@@ -201,7 +264,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                 sql_generated = None
                 sql_success = None
                 error_type = None
-                has_viz = False
+                sql_results_serializable = None
 
                 try:
                     _cleanup_residual_charts()
@@ -260,6 +323,18 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                         viz_rendered = final_state.get("viz_rendered", False)
                         viz_result = final_state.get("viz_result") or {}
                         sql_results = final_state.get("sql_results") or []
+
+                        # Convertir resultados a algo serializable
+                        sql_results_serializable = _sql_result_to_dict(sql_results)
+
+                        if sql_results:
+                            try:
+                                sql_generated = json.dumps(sql_results_serializable)
+                            except Exception:
+                                sql_generated = str(sql_results_serializable)
+                            sql_success = _is_sql_success(sql_results)
+                            error_type = None
+
                         has_viz = viz_rendered and bool(_get(viz_result, "chart_type"))
 
                         if has_viz:
@@ -267,11 +342,6 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                             if chart_url:
                                 yield sse_event("chart", url=chart_url, format="png")
                                 chart_emitted = True
-
-                        # Detectar SQL generado / éxito
-                        if sql_results:
-                            sql_generated = json.dumps(sql_results) if isinstance(sql_results, (list, dict)) else str(sql_results)
-                            sql_success = not any(r.get("error") for r in sql_results if isinstance(r, dict))
 
                     # Guardar mensaje del asistente
                     if final_answer:
@@ -331,7 +401,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                             payload={
                                 "success": bool(sql_success),
                                 "error_type": error_type,
-                                "rows_returned": len(sql_results) if isinstance(sql_results, list) else 0,
+                                "rows_returned": _sql_rows_returned(sql_results or []),
                             },
                         )
 
