@@ -9,7 +9,6 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from core.llm import LLM
 from core.contracts import PlannerContract, SQLPayload
 from core.harness import BusinessMemory
-# NUEVO: Integración con semantic_retriever
 from core.semantic_retriever import (
     obtener_candidatas_detalles,
     payload_to_column_hints,
@@ -33,7 +32,6 @@ def _build_conversational_context(messages: List[Any], current_question: str, ma
     if not messages:
         return current_question
 
-    # Tomar los últimos mensajes del usuario y del asistente
     recent = messages[-max_turns * 2:]
     context_lines = []
 
@@ -51,6 +49,70 @@ def _build_conversational_context(messages: List[Any], current_question: str, ma
         + "\n".join(context_lines)
         + f"\n\nPregunta actual del usuario: {current_question}"
     )
+
+
+# ------------------------------------------------------------------
+# NUEVO: Soporte para instrucciones de replanificación del supervisor
+# ------------------------------------------------------------------
+def _is_replan_instruction(instruction: Optional[str]) -> bool:
+    """Detecta si el supervisor pide una replanificación."""
+    if not instruction:
+        return False
+    markers = [
+        "reformula", "replan", "no generó progreso", "no lograron avanzar",
+        "reformular", "plan alternativo", "nuevo plan", "replantear"
+    ]
+    return any(marker in instruction.lower() for marker in markers)
+
+
+def _build_replan_context(state: Dict[str, Any]) -> str:
+    """
+    Construye un contexto estructurado con los hechos y el progreso previo
+    para que el planner genere un plan alternativo cuando hay estancamiento.
+    """
+    task_ledger = state.get("task_ledger", {}) or {}
+    progress_ledger = state.get("progress_ledger", {}) or {}
+    sql_results = state.get("sql_results", []) or []
+
+    parts: List[str] = []
+
+    original_question = task_ledger.get("original_question") or state.get("question", "")
+    parts.append(f"Pregunta original: {original_question}")
+
+    completed_steps = progress_ledger.get("completed_steps", [])
+    if completed_steps:
+        parts.append(f"Pasos completados previamente: {completed_steps}")
+
+    stall_count = progress_ledger.get("stall_count", 0)
+    if stall_count:
+        parts.append(f"Iteraciones sin progreso detectadas: {stall_count}")
+
+    # Resumen de resultados SQL previos
+    if sql_results:
+        summaries = []
+        for r in sql_results:
+            summaries.append(
+                f"- Tarea {_get(r, 'task_id')}: "
+                f"status={_get(r, 'status')}, "
+                f"filas={_get(r, 'row_count')}, "
+                f"can_answer={_get(r, 'can_answer')}, "
+                f"error={_get(r, 'error_message', 'ninguno')}"
+            )
+        parts.append("Resultados SQL previos:\n" + "\n".join(summaries))
+
+    if state.get("forecast_error"):
+        parts.append(f"Error previo en forecast: {state['forecast_error']}")
+
+    if state.get("research_findings"):
+        parts.append("Ya existen hallazgos de research previos; considéralos en el nuevo plan.")
+
+    # Hechos verificados del Task Ledger
+    facts = task_ledger.get("facts_verified", [])
+    if facts:
+        facts_text = "\n".join([f"- {f.get('content', '')}" for f in facts])
+        parts.append(f"Hechos verificados hasta ahora:\n{facts_text}")
+
+    return "\n\n".join(parts)
 
 
 # ------------------------------------------------------------------
@@ -118,6 +180,14 @@ def _fallback_extract_forecast_params(question: str) -> Dict[str, Any]:
 
 def _normalize(text: str) -> str:
     return text.lower().strip().replace("_", " ").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+
+def _get(obj: Any, attr: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(attr, default)
+    return getattr(obj, attr, default)
 
 
 def _column_exists(view_info, column_name: str) -> bool:
@@ -256,7 +326,7 @@ def _ensure_semantic_prefix(view_name: Optional[str]) -> Optional[str]:
 
 
 # ------------------------------------------------------------------
-# NUEVO: Selección de vista unificada (Retriever + Fallback léxico)
+# Selección de vista unificada (Retriever + Fallback léxico)
 # ------------------------------------------------------------------
 def _select_view_for_task(
     task: SQLPayload,
@@ -271,10 +341,8 @@ def _select_view_for_task(
     """
     errors: List[str] = []
 
-    # Hints estructurados desde el payload
     hints = payload_to_column_hints(task, original_query=original_query or task.task)
 
-    # Candidatos originales propuestos por el LLM (normalizados)
     original_candidates = list(getattr(task, "candidate_views", []) or [])
     original_candidates = [
         _ensure_semantic_prefix(cv)
@@ -286,7 +354,6 @@ def _select_view_for_task(
     retriever_candidates: List[str] = []
 
     try:
-        # UNA sola llamada al retriever; reutilizamos detalles
         detailed = obtener_candidatas_detalles(
             query=task.task,
             k=5,
@@ -294,14 +361,12 @@ def _select_view_for_task(
             column_hints=hints,
         )
 
-        # Candidatos ordenados del retriever
         retriever_candidates = [
             _ensure_semantic_prefix(c["view_name"])
             for c in detailed
             if _ensure_semantic_prefix(c["view_name"]) in allowed_views
         ]
 
-        # Elegir la primera compatible; si ninguna lo es, la de mayor score
         for c in detailed:
             if c.get("can_answer"):
                 preferred = _ensure_semantic_prefix(c["view_name"])
@@ -316,18 +381,15 @@ def _select_view_for_task(
 
     except Exception as e:
         logger.warning(f"[Planner] semantic_retriever falló para tarea {task.task_id}: {e}")
-        # Fallback léxico
         preferred = _find_compatible_view(task, allowed_views)
         if not preferred and original_candidates:
             preferred = original_candidates[0]
         if not preferred:
             errors.append(f"Tarea {task.task_id}: no se pudo seleccionar vista (retriever y fallback léxico fallaron).")
 
-    # Si el retriever no devolvió nada usable, intentar fallback léxico
     if not preferred:
         preferred = _find_compatible_view(task, allowed_views)
 
-    # Fusionar candidate_views: retriever primero, luego originales válidos
     merged_candidates: List[str] = []
     seen: Set[str] = set()
     for cv in retriever_candidates + original_candidates:
@@ -337,13 +399,11 @@ def _select_view_for_task(
     if preferred and preferred not in seen:
         merged_candidates.insert(0, preferred)
 
-    # Validación léxica final
     if preferred:
         task.preferred_view = preferred
         task.candidate_views = merged_candidates
         lexical_errors = _validate_task_integrity(task, allowed_views)
         if lexical_errors:
-            # Intentar corregir con fallback léxico
             fallback = _find_compatible_view(task, allowed_views)
             if fallback:
                 logger.info(f"[Planner] Fallback léxico a {fallback}")
@@ -368,6 +428,10 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     question = state["question"]
     messages = state.get("messages", [])
 
+    # NUEVO: leer instrucción del supervisor
+    instruction = state.get("next_agent_instruction") or state.get("supervisor_instruction")
+    is_replan = _is_replan_instruction(instruction)
+
     # NUEVO: enriquecer la pregunta con contexto conversacional
     contextual_question = _build_conversational_context(messages, question)
 
@@ -375,6 +439,8 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     logger.info(f"[Planner] allowed_views={allowed_views}")
     logger.info(f"[Planner] ambiguity_notes={ambiguity_notes}")
     logger.info(f"[Planner] preferred_view={harness.get('preferred_view')}")
+    if instruction:
+        logger.info(f"[Planner] Instrucción del supervisor: {instruction[:200]}...")
 
     if not allowed_views:
         logger.error("[Planner] ERROR CRÍTICO: allowed_views está vacío.")
@@ -393,9 +459,8 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "plan": plan,
             "last_agent": "planner",
-            "messages": state.get("messages", []) + [
-                AIMessage(content="[Planner] Error: no hay vistas de datos disponibles.")
-            ]
+            "messages": [AIMessage(content="[Planner] Error: no hay vistas de datos disponibles.")],
+            "next_agent_instruction": None,
         }
 
     # ================================================================
@@ -425,9 +490,10 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 ),
                 "forecast_request": None,
                 "last_agent": "planner",
-                "messages": state.get("messages", []) + [
+                "messages": [
                     AIMessage(content="[Planner] Pregunta de predicción de demanda detectada. Necesito producto y sede.")
-                ]
+                ],
+                "next_agent_instruction": None,
             }
 
         n_dias = int(params.get("n_dias", 7))
@@ -455,11 +521,12 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "fecha_inicio": params.get("fecha_inicio"),
             },
             "last_agent": "planner",
-            "messages": state.get("messages", []) + [
+            "messages": [
                 AIMessage(
                     content=f"[Planner] Demand forecast: {params['producto']} @ {params['sede']} | {n_dias} días"
                 )
-            ]
+            ],
+            "next_agent_instruction": None,
         }
 
     # ================================================================
@@ -482,9 +549,8 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "plan": plan,
             "last_agent": "planner",
-            "messages": state.get("messages", []) + [
-                AIMessage(content=f"[Planner] Ambigüedad detectada: {plan.followup_reason}")
-            ]
+            "messages": [AIMessage(content=f"[Planner] Ambigüedad detectada: {plan.followup_reason}")],
+            "next_agent_instruction": None,
         }
 
     # ================================================================
@@ -492,11 +558,24 @@ def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # ================================================================
     view_catalog = _build_view_catalog(allowed_views)
 
-    system = SystemMessage(content=f"""
+    # NUEVO: construir contexto de replanificación si aplica
+    replan_context = ""
+    if is_replan:
+        replan_context = _build_replan_context(state)
+        logger.info(f"[Planner] Contexto de replanificación:\n{replan_context[:500]}...")
+
+    system_prompt = f"""
 Eres un Planner BI avanzado. Transformas preguntas de negocio en planes operacionales estructurados.
 
 CATÁLOGO DE VISTAS PERMITIDAS (con columnas disponibles):
 {json.dumps(view_catalog, indent=2, ensure_ascii=False)}
+
+{"=" * 60}
+INSTRUCCIÓN DEL SUPERVISOR:
+{instruction or "Ninguna instrucción adicional. Planifica la pregunta del usuario de forma directa."}
+{"=" * 60 if is_replan else ""}
+{replan_context if is_replan else ""}
+{"=" * 60 if is_replan else ""}
 
 REGLAS CRÍTICAS DE SELECCIÓN DE VISTA:
 1. ANTES de asignar una vista a una tarea, verifica en el catálogo de arriba que esa vista contenga EXPLÍCITAMENTE las columnas que la tarea requiere.
@@ -507,8 +586,9 @@ REGLAS CRÍTICAS DE SELECCIÓN DE VISTA:
 6. SEGURIDAD: Usa ÚNICAMENTE vistas presentes en el catálogo de arriba. NO inventes vistas.
 7. DESCOMPOSICIÓN: Si la pregunta tiene múltiples KPIs de distinta naturaleza o contextos temporales distintos, genera tareas SEPARADAS.
 8. NO DESCOMPONER si es la misma intención, misma granularidad y misma temporalidad.
-9. Si la pregunta del usuario no requiere de generar consulta no digas que ha fallado el plan
-10.si el usuario hace preguntas como 'Hola', 'como estás?' o 'quien eres?' responde cordialmente, no se necesitan consultas para estas preguntas
+9. Si la pregunta del usuario no requiere de generar consulta no digas que ha fallado el plan.
+10. Si el usuario hace preguntas como 'Hola', 'como estás?' o 'quien eres?' responde cordialmente, no se necesitan consultas para estas preguntas.
+11. Si el supervisor solicita REPLANIFICACIÓN (instrucción de replan arriba), genera un plan ALTERNO: cambia de vista, simplifica la pregunta, o divide en subtareas más pequeñas. NO repitas el plan anterior.
 
 REGLAS DE NEGOCIO:
 - "Se han vendido" / "ventas" / "unidades vendidas" → vistas de VENTAS NORMALES.
@@ -521,12 +601,12 @@ OUTPUT: JSON con schema PlannerContract.
 
 REGLAS ADICIONALES:
 - "informe completo", "reporte detallado", "análisis profundo", "deep dive" → question_type="deep_research".
-""")
+"""
 
     # NUEVO: pasar contextual_question al LLM
     human = HumanMessage(content=f"Pregunta del usuario: {contextual_question}")
     planner_llm = LLM.with_structured_output(PlannerContract, method="function_calling")
-    plan_raw = planner_llm.invoke([system, human])
+    plan_raw = planner_llm.invoke([SystemMessage(content=system_prompt), human])
 
     if isinstance(plan_raw, dict):
         plan = PlannerContract(**plan_raw)
@@ -599,10 +679,11 @@ REGLAS ADICIONALES:
     return {
         "plan": plan,
         "last_agent": "planner",
-        "messages": state.get("messages", []) + [
+        "messages": [
             AIMessage(
                 content=f"[Planner] Intención: {plan.intent} | Tasks: {len(plan.tasks)} ({task_summary}) "
                         f"| Confianza: {plan.confidence} | Preferred: {prefs} | Followup: {plan.needs_followup}"
             )
-        ]
+        ],
+        "next_agent_instruction": None,  # limpiar instrucción ya consumida
     }

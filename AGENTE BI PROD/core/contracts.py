@@ -203,3 +203,43 @@ class HarnessContext(BaseModel):
         default_factory=dict,
         description="Reglas estables parseadas desde AGENTS.md"
     )
+
+class FactItem(BaseModel):
+    """Hecho o suposición razonada con trazabilidad."""
+    content: str
+    source: Literal[
+        "plan", "sql_result", "analyst", "viz",
+        "forecast", "research", "assumption", "user"
+    ]
+    verified: bool = False
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+
+
+class TaskLedger(BaseModel):
+    """Libro de registro de la tarea global: hechos, plan y suposiciones."""
+    original_question: str = ""
+    intent: str = ""
+    question_type: Optional[str] = None
+    plan: Optional[Any] = None
+    facts_verified: List[FactItem] = Field(default_factory=list)
+    facts_to_lookup: List[str] = Field(default_factory=list)
+    facts_to_derive: List[str] = Field(default_factory=list)
+    assumptions: List[FactItem] = Field(default_factory=list)
+    educated_guess: Optional[str] = None
+
+
+class ProgressLedger(BaseModel):
+    """Libro de registro del progreso: stall detection, routing e instrucciones."""
+    completed_steps: List[str] = Field(default_factory=list)
+    stall_count: int = 0
+    last_state_hash: Optional[str] = None
+    last_progress_reasoning: str = ""
+    task_complete: bool = False
+    next_agent: Optional[str] = None
+    instruction: Optional[str] = None
+    unproductive_loop_detected: bool = False
+
+
+    

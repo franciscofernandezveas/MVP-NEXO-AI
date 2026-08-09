@@ -1,5 +1,6 @@
 # core/orchestrator.py
 # -------------------------------------------------
+import hashlib
 import logging
 import os
 import re
@@ -21,7 +22,7 @@ from agents.viz_approval.graph_viz_approval import viz_approval_node
 from agents.research.research_node import make_research_node
 
 from core.llm import LLM
-from core.contracts import SQLContract, ForecastRequest
+from core.contracts import SQLContract, ForecastRequest, TaskLedger, ProgressLedger, FactItem
 from core.harness import build_harness_context_cached, _normalize_question
 from core.database import get_semantic_schema_for_views
 
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 def _build_checkpointer():
     """
     Configura PostgresSaver si existe POSTGRES_URI; de lo contrario,
-    cae gracefully a MemorySaver para desarrollo local/tests.
+    cae gracefulmente a MemorySaver para desarrollo local/tests.
     """
     try:
         from langgraph.checkpoint.postgres import PostgresSaver
@@ -62,7 +63,7 @@ def _build_checkpointer():
 
 
 # ------------------------------------------------------------------
-# Helpers utilitarios (definidos al inicio del módulo)
+# Helpers utilitarios
 # ------------------------------------------------------------------
 def _get(obj: Any, attr: str, default: Any = None) -> Any:
     if obj is None:
@@ -82,6 +83,129 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
     if hasattr(obj, "dict"):
         return obj.dict()
     return vars(obj)
+
+
+def _ensure_ledger(obj: Any, model_class: type) -> Any:
+    """Convierte un dict serializado de vuelta a Pydantic si es necesario."""
+    if obj is None:
+        return model_class()
+    if isinstance(obj, model_class):
+        return obj
+    if isinstance(obj, dict):
+        return model_class(**obj)
+    return model_class(**_to_dict(obj))
+
+
+def _compute_state_hash(state: "OrchestratorState") -> str:
+    """
+    Hash representativo del progreso real del sistema.
+    Cambia cuando cambian outputs significativos (SQL, viz, forecast, findings).
+    """
+    plan = state.get("plan")
+    question_type = _get(plan, "question_type", "none") if plan else "none"
+
+    sql_results = state.get("sql_results", []) or []
+    sql_summary = tuple(
+        (
+            _get(r, "task_id", idx),
+            _get(r, "status"),
+            _get(r, "row_count", 0),
+            _get(r, "can_answer", False),
+        )
+        for idx, r in enumerate(sql_results)
+    )
+
+    viz = state.get("viz_result")
+    viz_summary = (
+        _get(viz, "status", "none"),
+        _get(viz, "chart_type", "none"),
+        _get(viz, "suitable_for_visualization", False),
+    )
+
+    key = (
+        question_type,
+        sql_summary,
+        viz_summary,
+        state.get("viz_rendered", False),
+        state.get("viz_approved"),
+        bool(state.get("final_answer")),
+        bool(state.get("research_findings")),
+        bool(state.get("forecast_results")),
+        state.get("last_agent"),
+        state.get("forecast_error"),
+    )
+    return hashlib.md5(str(key).encode()).hexdigest()
+
+
+def _build_dynamic_instruction(state: "OrchestratorState", next_step: str) -> str:
+    """
+    Genera una instrucción contextual para el siguiente agente.
+    Puede ser heurística o, en una versión posterior, generada por LLM.
+    """
+    plan = state.get("plan")
+    question_type = _get(plan, "question_type", "general") if plan else "general"
+    sql_results = state.get("sql_results", []) or []
+    last_sql = sql_results[-1] if sql_results else None
+    progress = state.get("progress_ledger") or {}
+
+    if next_step == "planner":
+        if progress.get("stall_count", 0) > 0:
+            return (
+                "El plan anterior no generó progreso. Reformúlalo: simplifica la pregunta, "
+                "cambia de vista semántica, divide en subtareas más pequeñas, o ajusta filtros de fecha/producto/sede."
+            )
+        return (
+            "Genera un plan de ejecución claro para responder la pregunta del usuario "
+            "usando exclusivamente las vistas semánticas autorizadas."
+        )
+
+    if next_step == "sql_agent":
+        if last_sql and _get(last_sql, "row_count", 0) == 0:
+            return (
+                "La última consulta SQL devolvió 0 filas. Revisa los filtros, "
+                "el rango de fechas, la vista elegida o la granularidad de la agrupación."
+            )
+        if last_sql and _get(last_sql, "status") == "error":
+            return (
+                f"La última consulta SQL falló: {_get(last_sql, 'error_message', 'error desconocido')}. "
+                f"Corrige el SQL o elige otra vista."
+            )
+        return "Ejecuta las tareas SQL del plan actual y devuelve un contrato por cada una."
+
+    if next_step == "analyst":
+        if question_type == "demand_forecast" and state.get("forecast_results"):
+            return "Resume los resultados del pronóstico de demanda en lenguaje claro y accionable."
+        if state.get("research_findings"):
+            return "El researcher generó un informe detallado. Entrega una respuesta final concisa basada en esos hallazgos."
+        if not sql_results:
+            return "No hay datos disponibles. Explica por qué no se puede responder y qué información haría falta."
+        if not all(_get(r, "can_answer", False) for r in sql_results):
+            return (
+                "Algunas consultas no pudieron responder completamente. "
+                "Genera una respuesta parcial o estimación razonada (educated guess) con los datos disponibles, "
+                "señalando claramente los límites."
+            )
+        return "Genera la respuesta final en lenguaje natural a partir de los resultados SQL."
+
+    if next_step == "viz_agent":
+        return "Genera una especificación de visualización adecuada para los datos SQL obtenidos."
+
+    if next_step == "render_plotly":
+        return "Renderiza la especificación de visualización en una figura Plotly."
+
+    if next_step == "viz_approval":
+        return "Presenta la visualización al usuario para aprobación o rechazo."
+
+    if next_step == "researcher":
+        return (
+            "Realiza una exploración profunda con múltiples queries SQL autocontenidas "
+            "y genera un informe ejecutivo completo."
+        )
+
+    if next_step == "forecaster":
+        return "Ejecuta el pronóstico de demanda con los parámetros estructurados del plan."
+
+    return "Procesa la tarea asignada con criterio de calidad y trazabilidad."
 
 
 # ------------------------------------------------------------------
@@ -143,6 +267,13 @@ VALID_NEXT_STEPS = set(NextStep.__args__)
 class OrchestratorState(TypedDict):
     question: str
     messages: Annotated[List[BaseMessage], add_messages]
+
+    # Ledger general del supervisor
+    task_ledger: Optional[TaskLedger]
+    progress_ledger: Optional[ProgressLedger]
+    next_agent_instruction: Optional[str]
+
+    # Campos operativos existentes
     plan: Optional[Any]
     sql_results: List[SQLContract]
     viz_result: Optional[Any]
@@ -174,7 +305,9 @@ def resilient_node(node_name: str):
     En caso de fallo, registra el error y devuelve un mensaje explicativo
     para que el supervisor decida cómo continuar.
     """
-    def decorator(fn: Callable[[OrchestratorState], OrchestratorState]) -> Callable[[OrchestratorState], OrchestratorState]:
+    def decorator(
+        fn: Callable[[OrchestratorState], OrchestratorState]
+    ) -> Callable[[OrchestratorState], OrchestratorState]:
         @wraps(fn)
         def wrapper(state: OrchestratorState) -> OrchestratorState:
             try:
@@ -194,9 +327,7 @@ def resilient_node(node_name: str):
 # Nodos del Grafo
 # ------------------------------------------------------------------
 def detect_chitchat_node(state: OrchestratorState) -> OrchestratorState:
-    return {
-        "is_chitchat": _is_chitchat(state.get("question"))
-    }
+    return {"is_chitchat": _is_chitchat(state.get("question"))}
 
 
 def chitchat_node(state: OrchestratorState) -> OrchestratorState:
@@ -235,6 +366,10 @@ def build_harness_context_node(state: OrchestratorState) -> OrchestratorState:
 @traceable(name="Orchestrator: Execute SQL Tasks")
 def sql_agent_wrapper(state: OrchestratorState) -> OrchestratorState:
     logger.info(f"[SQL Agent Wrapper] Iniciando. Plan presente: {state.get('plan') is not None}")
+
+    instruction = state.get("next_agent_instruction")
+    if instruction:
+        logger.info(f"[SQL Agent] Instrucción recibida: {instruction}")
 
     if not state.get("plan"):
         return {
@@ -288,7 +423,8 @@ def sql_agent_wrapper(state: OrchestratorState) -> OrchestratorState:
             "query_result": None,
             "error_message": "",
             "contract": None,
-            "attempts": 0
+            "attempts": 0,
+            "supervisor_instruction": instruction,
         }
 
         try:
@@ -339,6 +475,10 @@ def viz_agent_node(state: OrchestratorState) -> OrchestratorState:
     sql_results = state.get("sql_results", []) or []
     plan = state.get("plan")
 
+    instruction = state.get("next_agent_instruction")
+    if instruction:
+        logger.info(f"[Viz Agent] Instrucción recibida: {instruction}")
+
     if not sql_results:
         return {
             "viz_result": None,
@@ -372,6 +512,7 @@ def viz_agent_node(state: OrchestratorState) -> OrchestratorState:
         "error_message": "",
         "attempts": 0,
         "contract": None,
+        "supervisor_instruction": instruction,
     }
 
     try:
@@ -412,6 +553,10 @@ def viz_agent_node(state: OrchestratorState) -> OrchestratorState:
 @traceable(name="Orchestrator: Execute Demand Forecast")
 def forecaster_node(state: OrchestratorState) -> OrchestratorState:
     from agents.forecasting_agent.graph_demand_forecaster import run_forecast
+
+    instruction = state.get("next_agent_instruction")
+    if instruction:
+        logger.info(f"[Forecaster] Instrucción recibida: {instruction}")
 
     request = state.get("forecast_request")
     if isinstance(request, dict):
@@ -464,33 +609,121 @@ def forecaster_node(state: OrchestratorState) -> OrchestratorState:
 # Instanciación única del nodo de investigación para evitar overhead
 _RESEARCHER_NODE = make_research_node(SQL_SUBGRAPH, LLM)
 
+
 def researcher_node(state: OrchestratorState) -> OrchestratorState:
+    instruction = state.get("next_agent_instruction")
+    if instruction:
+        logger.info(f"[Researcher] Instrucción recibida: {instruction}")
     return _RESEARCHER_NODE(state)
 
 
 def safe_supervisor_node(state: OrchestratorState) -> OrchestratorState:
     """
-    Supervisor con guard de iteraciones y validación defensiva del next.
+    Supervisor envuelto con:
+    - Task Ledger y Progress Ledger
+    - Stall detection real por hash de estado
+    - Replanificación automática tras >2 stalls
+    - Educated guess como salida válida
+    - Instrucciones dinámicas para el siguiente agente
     """
     max_iterations = 8
     current_count = state.get("iteration_count", 0)
 
-    # Guard contra loops infinitos
+    # Recuperar o inicializar ledgers
+    task_ledger = _ensure_ledger(state.get("task_ledger"), TaskLedger)
+    progress_ledger = _ensure_ledger(state.get("progress_ledger"), ProgressLedger)
+
+    # FIX 1: Actualizar Task Ledger SIEMPRE a partir del plan actual
+    question = state.get("question", "")
+    if question and not task_ledger.original_question:
+        task_ledger.original_question = question
+
+    plan = state.get("plan")
+    if plan:
+        task_ledger.plan = plan
+        task_ledger.question_type = _get(plan, "question_type")
+        task_ledger.intent = _get(plan, "intent", "")
+
+        # Recalcular facts verificados del plan actual (replanificación puede cambiarlos)
+        facts_verified: List[FactItem] = []
+        metrics = _get(plan, "metrics", []) or []
+        dimensions = _get(plan, "dimensions", []) or []
+        filters = _get(plan, "filters", "")
+        time_window = _get(plan, "time_window")
+
+        for m in metrics:
+            facts_verified.append(FactItem(content=f"Métrica objetivo: {m}", source="plan", verified=True))
+        for d in dimensions:
+            facts_verified.append(FactItem(content=f"Dimensión objetivo: {d}", source="plan", verified=True))
+        if filters:
+            facts_verified.append(FactItem(content=f"Filtros: {filters}", source="plan", verified=True))
+        if time_window:
+            facts_verified.append(FactItem(content=f"Ventana temporal: {time_window}", source="plan", verified=True))
+
+        task_ledger.facts_verified = facts_verified
+
+    # Guard absoluto de iteraciones
     if current_count >= max_iterations:
-        logger.warning(f"[Guard] Límite de iteraciones alcanzado ({current_count}). Forzando cierre.")
+        logger.warning(f"[Ledger Guard] Límite de iteraciones ({max_iterations}) alcanzado.")
         return {
             "next": "__end__",
-            "final_answer": state.get("final_answer") or "Se alcanzó el límite de pasos de razonamiento para esta consulta.",
+            "final_answer": state.get("final_answer") or "Se alcanzó el límite de pasos de razonamiento.",
             "iteration_count": current_count + 1,
-            "messages": [AIMessage(content=f"[Guard] Máximo de iteraciones alcanzado ({max_iterations}).")]
+            "last_agent": "supervisor",
+            "task_ledger": _to_dict(task_ledger),
+            "progress_ledger": _to_dict(progress_ledger),
+            "messages": [AIMessage(
+                content=f"[Supervisor] Límite de {max_iterations} iteraciones alcanzado. Forzando cierre."
+            )]
         }
 
+    # Stall detection real
+    current_hash = _compute_state_hash(state)
+    if progress_ledger.last_state_hash == current_hash:
+        progress_ledger.stall_count += 1
+    else:
+        progress_ledger.stall_count = 0
+        progress_ledger.last_state_hash = current_hash
+
+    progress_ledger.unproductive_loop_detected = progress_ledger.stall_count >= 2
+
+    logger.info(
+        f"[Ledger] Iteración {current_count} | hash={current_hash[:8]} | "
+        f"stall_count={progress_ledger.stall_count} | last_agent={state.get('last_agent')}"
+    )
+
+    # Replanificación automática tras stall > 2
+    if progress_ledger.stall_count > 2:
+        stall_count_at_replan = progress_ledger.stall_count  # capturar antes de resetear
+        logger.warning(f"[Ledger] Stall detectado ({stall_count_at_replan}). Replanificando...")
+
+        progress_ledger.completed_steps.append("replan")
+        progress_ledger.stall_count = 0
+        progress_ledger.last_state_hash = None
+
+        instruction = (
+            "Reformula el plan desde cero. Los agentes anteriores no lograron avanzar. "
+            "Considera simplificar la consulta, cambiar de vista semántica, o dividir la pregunta."
+        )
+        return {
+            "next": "planner",
+            "plan": None,
+            "next_agent_instruction": instruction,
+            "iteration_count": current_count + 1,
+            "last_agent": "supervisor",
+            "task_ledger": _to_dict(task_ledger),
+            "progress_ledger": _to_dict(progress_ledger),
+            "messages": [AIMessage(
+                content=f"[Supervisor] Replanificando tras {stall_count_at_replan} iteraciones sin progreso."
+            )]
+        }
+
+    # Delegar routing al supervisor interno
     try:
         result = supervisor_node(state)
         if not isinstance(result, dict):
             result = _to_dict(result)
 
-        # Normaliza el campo de decisión: admite "next", "next_agent" o "FINISH"
         raw_next = result.get("next") or result.get("next_agent", "__end__")
         if raw_next == "FINISH":
             raw_next = "__end__"
@@ -502,17 +735,58 @@ def safe_supervisor_node(state: OrchestratorState) -> OrchestratorState:
                 result["final_answer"] = "No pude determinar el siguiente paso del análisis."
 
         result["next"] = raw_next
-        result["iteration_count"] = current_count + 1
-        return result
 
     except Exception as e:
-        logger.exception("[Supervisor] Error crítico")
+        logger.exception("[Supervisor] Error crítico en routing")
         return {
             "next": "__end__",
             "final_answer": "Ocurrió un error interno al coordinar los agentes.",
             "iteration_count": current_count + 1,
+            "last_agent": "supervisor",
+            "task_ledger": _to_dict(task_ledger),
+            "progress_ledger": _to_dict(progress_ledger),
             "messages": [AIMessage(content=f"[Supervisor Error] {e}")]
         }
+
+    # Educated guess como salida válida
+    if result.get("next") == "__end__" and not state.get("final_answer"):
+        has_some_data = (
+            state.get("sql_results")
+            or state.get("forecast_results")
+            or state.get("research_findings")
+        )
+        if has_some_data:
+            logger.info("[Ledger] Sin respuesta final pero hay datos. Pidiendo educated guess al analyst.")
+            result["next"] = "analyst"
+            result["final_answer"] = None
+            instruction = (
+                "No se pudo completar la tarea de forma definitiva. "
+                "Genera una respuesta parcial o estimación razonada (educated guess) "
+                "con los datos disponibles, explicando claramente los límites y gaps."
+            )
+            result["next_agent_instruction"] = instruction
+            progress_ledger.instruction = instruction
+        else:
+            result["final_answer"] = (
+                result.get("final_answer")
+                or "No pude obtener datos suficientes para responder esta consulta."
+            )
+
+    # FIX 2: Respetar instrucción específica del supervisor interno; fallback heurístico
+    if result.get("next") and result.get("next") != "__end__":
+        instruction = result.get("next_agent_instruction") or _build_dynamic_instruction(state, result["next"])
+        result["next_agent_instruction"] = instruction
+        progress_ledger.instruction = instruction
+        progress_ledger.next_agent = result["next"]
+
+    # Actualizar Progress Ledger
+    progress_ledger.completed_steps.append(result.get("next", "__end__"))
+    result["progress_ledger"] = _to_dict(progress_ledger)
+    result["task_ledger"] = _to_dict(task_ledger)
+    result["iteration_count"] = current_count + 1
+    result["last_agent"] = "supervisor"
+
+    return result
 
 
 # ------------------------------------------------------------------
@@ -533,7 +807,7 @@ builder.add_node("viz_approval", resilient_node("viz_approval")(viz_approval_nod
 builder.add_node("researcher", resilient_node("researcher")(researcher_node))
 builder.add_node("forecaster", resilient_node("forecaster")(forecaster_node))
 
-# Flujo de entrada optimizado: chitchat se detecta antes de cualquier procesamiento costoso
+# Flujo de entrada optimizado
 builder.add_edge("__start__", "detect_chitchat")
 builder.add_conditional_edges(
     "detect_chitchat",
@@ -561,7 +835,7 @@ builder.add_conditional_edges(
     }
 )
 
-# Todos los workers retornan al supervisor para la siguiente decisión
+# Todos los workers retornan al supervisor
 for worker in ["planner", "sql_agent", "analyst", "viz_agent", "render_plotly", "viz_approval", "researcher", "forecaster"]:
     builder.add_edge(worker, "supervisor")
 

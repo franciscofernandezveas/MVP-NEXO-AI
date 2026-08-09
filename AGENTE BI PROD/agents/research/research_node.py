@@ -27,12 +27,10 @@ def _ensure_sql_payload(task: Any) -> SQLPayload:
 def _ensure_research_plan(plan: Any) -> ResearchPlan:
     """Convierte el plan a ResearchPlan si llegó como dict."""
     if isinstance(plan, dict):
-        # Asegurar que tasks también se conviertan a SQLPayload
         raw_tasks = plan.get("tasks", [])
         normalized_tasks = []
         for t in raw_tasks:
             if isinstance(t, dict):
-                # Manejar claves que puedan tener guiones bajos variantes
                 normalized_tasks.append(SQLPayload(**t))
             else:
                 normalized_tasks.append(t)
@@ -50,7 +48,6 @@ def _validate_tasks(tasks: List[Any], allowed_views: List[str]) -> List[str]:
         task = _ensure_sql_payload(raw_task)
         task.preferred_view = _normalize_view_name(task.preferred_view)
 
-        # Fallback de preferred_view si quedó fuera del shortlist
         if task.preferred_view and task.preferred_view not in allowed_set:
             valid_candidate = None
             for cv in task.candidate_views:
@@ -66,7 +63,6 @@ def _validate_tasks(tasks: List[Any], allowed_views: List[str]) -> List[str]:
                     f"'{task.preferred_view}' no está en allowed_views"
                 )
 
-        # Normalizar candidate_views
         task.candidate_views = [
             _normalize_view_name(cv) for cv in task.candidate_views
             if _normalize_view_name(cv) in allowed_set
@@ -89,6 +85,23 @@ def make_research_node(
         semantic_context = state.get("semantic_context", harness.get("semantic_context", ""))
         existing_sql_results = state.get("sql_results", []) or []
 
+        # NUEVO: leer instrucción del supervisor y contexto de ledger
+        instruction = state.get("next_agent_instruction") or state.get("supervisor_instruction")
+        progress_ledger = state.get("progress_ledger", {}) or {}
+        stall_count = progress_ledger.get("stall_count", 0)
+        is_replan = stall_count > 0 or progress_ledger.get("unproductive_loop_detected", False)
+
+        if instruction:
+            logger.info(f"[Researcher] Instrucción recibida: {instruction[:200]}...")
+
+        replan_hint = ""
+        if is_replan:
+            replan_hint = (
+                "\nIMPORTANTE: Esta es una REPLANIFICACIÓN. Los intentos previos no generaron progreso. "
+                "Diseña un plan de investigación ALTERNO: cambia el enfoque, las dimensiones, "
+                "las métricas o las temporalidades. NO repitas el plan anterior."
+            )
+
         system_prompt = f"""
 Eres un Researcher BI senior. El usuario pide un informe profundo o análisis completo del negocio.
 
@@ -96,6 +109,9 @@ CONTEXTO:
 - Vistas semánticas disponibles: {allowed_views}
 - Vista preferida por el harness: {preferred_view}
 - Contexto semántico: {semantic_context}
+
+INSTRUCCIÓN DEL SUPERVISOR:
+{instruction or "Ninguna instrucción adicional. Genera un informe completo y profundo."}{replan_hint}
 
 OBJETIVO:
 Genera un plan de exploración interno con múltiples queries SQL autocontenidas que cubran las métricas, dimensiones y temporalidades relevantes para responder: "{question}"
@@ -105,6 +121,7 @@ REGLAS:
 2. Cada tarea debe ser un SQLPayload con: task_id, task, metrics, dimensions, filters_description, time_window, execution_strategy, candidate_views, preferred_view.
 3. Incluye variedad analítica: tendencias históricas, comparativas por período, rankings, distribuciones por dimensión, KPIs agregados.
 4. NO inventes vistas ni columnas.
+5. Si es una replanificación, varía el enfoque y evita repetir queries anteriores.
 """
 
         try:
@@ -121,7 +138,8 @@ REGLAS:
                 "last_agent": "researcher",
                 "messages": [
                     AIMessage(content="[Researcher] Error al generar plan de investigación")
-                ]
+                ],
+                "next_agent_instruction": None,
             }
 
         warnings = _validate_tasks(plan.tasks, allowed_views)
@@ -129,6 +147,7 @@ REGLAS:
             logger.warning("[Researcher] Warnings de validación: %s", warnings)
 
         task_results: List[SQLContract] = []
+        schema_cache: Dict[str, str] = {}
 
         for raw_task in plan.tasks:
             task = _ensure_sql_payload(raw_task)
@@ -136,10 +155,13 @@ REGLAS:
             candidate_views = getattr(task, "candidate_views", []) or allowed_views
             preferred = getattr(task, "preferred_view", None) or preferred_view
 
-            try:
-                schema_info = get_semantic_schema_for_views(candidate_views)
-            except Exception:
-                schema_info = ""
+            cache_key = ",".join(sorted(candidate_views))
+            if cache_key not in schema_cache:
+                try:
+                    schema_cache[cache_key] = get_semantic_schema_for_views(candidate_views)
+                except Exception:
+                    schema_cache[cache_key] = ""
+            schema_info = schema_cache[cache_key]
 
             payload_dict = task.dict() if hasattr(task, "dict") else dict(task)
 
@@ -235,7 +257,8 @@ Instrucciones:
                     content=f"[Researcher] {len(task_results)} queries ejecutadas. "
                             f"Findings: {findings[:220]}..."
                 )
-            ]
+            ],
+            "next_agent_instruction": None,  # ← NUEVO: limpiar instrucción consumida
         }
 
     return research_node

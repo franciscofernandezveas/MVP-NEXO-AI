@@ -2,12 +2,16 @@
 # -------------------------------------------------
 
 import json
+import logging  # ← NUEVO: import requerido por logger
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from core.llm import LLM
 from langsmith import traceable
+
+# ← NUEVO: logger del módulo
+logger = logging.getLogger(__name__)
 
 
 def _get_attr(obj: Any, attr: str, default: Any = None) -> Any:
@@ -32,7 +36,6 @@ def _format_rows_markdown(rows: List[Dict[str, Any]], columns: List[str]) -> str
         values = []
         for col in columns:
             val = row.get(col, "")
-            # Formato numérico legible
             if isinstance(val, float):
                 val = f"{val:,.2f}"
             elif isinstance(val, int):
@@ -163,6 +166,123 @@ Instrucciones:
 """
 
 
+def _is_educated_guess_instruction(instruction: Optional[str]) -> bool:
+    """Detecta si el supervisor pide una estimación razonada."""
+    if not instruction:
+        return False
+    markers = [
+        "educated guess", "estimación razonada", "respuesta parcial",
+        "no se pudo completar", "límites", "gaps", "aproximación",
+        "mejor estimación", "inferencia razonada"
+    ]
+    return any(marker in instruction.lower() for marker in markers)
+
+
+def _is_partial_answer_instruction(instruction: Optional[str]) -> bool:
+    """Detecta si el supervisor pide una respuesta parcial sin educated guess explícito."""
+    if not instruction:
+        return False
+    markers = [
+        "respuesta parcial", "algunas consultas no pudieron",
+        "datos disponibles", "incompleto", "parcial"
+    ]
+    return any(marker in instruction.lower() for marker in markers)
+
+
+def _has_partial_data(results: list) -> bool:
+    """Determina si hay datos parciales (algunas tareas fallaron o devolvieron vacío pero otras sí tienen datos)."""
+    if not results:
+        return False
+    has_success_with_data = any(
+        _get_attr(r, "status") == "success" and _get_attr(r, "row_count", 0) > 0
+        for r in results
+    )
+    has_failure_or_empty = any(
+        _get_attr(r, "status") == "error"
+        or (_get_attr(r, "status") == "success" and _get_attr(r, "row_count", 0) == 0)
+        for r in results
+    )
+    return has_success_with_data and has_failure_or_empty
+
+
+def _build_educated_guess_system() -> SystemMessage:
+    return SystemMessage(content="""
+Eres un Analista de Negocio Senior. El sistema NO pudo completar la consulta de forma definitiva,
+pero cuenta con datos parciales. Tu trabajo es generar una **estimación razonada (educated guess)**
+que sea útil para el usuario sin inventar información.
+
+REGLAS ABSOLUTAS:
+1. CERO ALUCINACIONES: Usa ÚNICAMENTE los datos disponibles. Si no tienes un dato, dilo explícitamente.
+2. CUANTIFICA LA INCERTIDUMBRE: Usa frases como "aproximadamente", "alrededor de", "entre X e Y",
+   "no podemos afirmar con certeza, pero...". Nunca presentes estimaciones como hechos definitivos.
+3. EXPLICA LOS LÍMITES: En una sección final titulada **Limitaciones y supuestos**, explica claramente:
+   - Qué información faltó.
+   - Por qué no se pudo obtener.
+   - Qué supuestos hiciste para dar una respuesta útil.
+4. NO RECALCULES: No hagas cálculos complejos con datos parciales. Si haces una extrapolación simple,
+   indica que es una aproximación conservadora.
+5. FORMATO:
+   - Comienza con una respuesta directa y honesta.
+   - Presenta los datos disponibles con tablas Markdown si aplica.
+   - Finaliza con la sección de limitaciones.
+6. TONO: Profesional, cauteloso y útil. El usuario debe entender qué sabe el sistema y qué no.
+""")
+
+
+def _build_partial_answer_system() -> SystemMessage:
+    return SystemMessage(content="""
+Eres un Analista de Negocio Senior. El sistema obtuvo datos PARCIALES para responder la pregunta.
+Algunas consultas funcionaron y otras fallaron o no devolvieron registros.
+
+REGLAS ABSOLUTAS:
+1. CERO ALUCINACIONES: Usa ÚNICAMENTE los datos que el SQL devolvió correctamente.
+2. TRANSPARENCIA: Menciona claramente qué partes de la pregunta no pudieron responderse.
+3. RESPUESTA DIRECTA: Responde lo que SÍ se puede responder con los datos disponibles.
+4. NO RECALCULES: No intentes completar los gaps con cálculos manuales.
+5. FORMATO:
+   - Empieza con una respuesta concisa.
+   - Muestra los datos disponibles con tablas Markdown breves.
+   - Incluye una sección **Limitaciones** que enumere qué no se pudo obtener y por qué.
+6. TONO: Profesional y honesto. Es mejor decir "no lo sé" que inventar.
+""")
+
+
+def _build_normal_answer_system(research_mode: bool = False) -> SystemMessage:
+    if research_mode:
+        return SystemMessage(content="""
+Eres un Consultor de Negocio Senior. Recibes un informe de investigación profunda generado por un agente interno (Researcher) respaldado por datos crudos de múltiples consultas SQL.
+
+ESTRUCTURA OBLIGATORIA DEL INFORME:
+- **Resumen Ejecutivo:** Conclusión principal en 1 o 2 frases.
+- **Hallazgos Clave:** Puntos más destacados apoyados por las métricas.
+- **Desglose y Comparativas:** Análisis de las dimensiones evaluadas.
+- **Conclusiones y Recomendaciones:** Acciones prácticas sugeridas para el negocio.
+
+REGLAS ABSOLUTAS:
+1. CERO ALUCINACIONES: Usa ÚNICAMENTE los datos provistos. Si una consulta devolvió 0 filas, indícalo sin inventar explicaciones.
+2. NO RECALCULES: No calcules porcentajes, sumas o promedios manuales si el SQL no los devolvió ya calculados.
+3. VERIFICA EL INFORME: Contrasta el informe del Researcher con los "Datos crudos de apoyo (SQL results)". Si hay discrepancias o queries fallidas, menciónalas con transparencia.
+4. FORMATO EJECUTIVO: Usa **negritas** para resaltar KPIs clave y tablas Markdown para comparaciones de múltiples valores.
+5. TONO: Profesional, persuasivo y orientado a la toma de decisiones.
+""")
+    else:
+        return SystemMessage(content="""
+Eres un Analista de Negocio Senior. Recibes datos estructurados de MÚLTIPLES consultas SQL independientes.
+Debes redactar UNA respuesta coherente que integre todos los hallazgos y responda directamente la pregunta del usuario.
+
+REGLAS ABSOLUTAS:
+1. CERO ALUCINACIONES: Utiliza ÚNICAMENTE los datos provistos. Si una consulta devolvió 0 filas (lista vacía []), indícalo claramente: "No se registraron registros para los criterios solicitados".
+2. NO RECALCULES: No calcules porcentajes, sumas o promedios manuales. Cíñete a las métricas que el SQL ya devolvió.
+3. RESPUESTA DIRECTA: Comienza con la respuesta directa a la pregunta en la primera oración.
+4. FORMATO EJECUTIVO:
+   - Usa **negritas** para resaltar KPIs clave (ej. **$1,250,000**, **14%**).
+   - Si hay comparación de múltiples valores o dimensiones, usa tablas Markdown breves.
+   - No escribas párrafos gigantescos llenos de números crudos.
+5. TONO: Profesional, analítico y conversacional orientado a decisiones ("Esto sugiere que...", "El volumen se concentra en...").
+6. ADVERTENCIAS: Si los resultados incluyen warnings del sistema, menciónalos solo si afectan la interpretación de los datos.
+""")
+
+
 @traceable(name="Analyst: Generate Final Answer")
 def analyst_node(state: Dict[str, Any]) -> Dict[str, Any]:
     question = state["question"]
@@ -171,6 +291,17 @@ def analyst_node(state: Dict[str, Any]) -> Dict[str, Any]:
     plan = state.get("plan")
     forecast_results = state.get("forecast_results")
     forecast_error = state.get("forecast_error")
+
+    # NUEVO: leer instrucción del supervisor
+    instruction = state.get("next_agent_instruction") or state.get("supervisor_instruction")
+    wants_educated_guess = _is_educated_guess_instruction(instruction)
+    wants_partial_answer = _is_partial_answer_instruction(instruction)
+
+    # Detectar si la situación objetivamente amerita respuesta parcial
+    objective_partial = _has_partial_data(results)
+
+    if instruction:
+        logger.info(f"[Analyst] Instrucción del supervisor: {instruction[:200]}...")
 
     # ------------------------------------------------------------------
     # 0. Manejo de demand forecast
@@ -200,7 +331,8 @@ REGLAS ABSOLUTAS:
         return {
             "final_answer": response.content,
             "last_agent": "analyst",
-            "messages": [AIMessage(content=response.content, name="analyst")]
+            "messages": [AIMessage(content=response.content, name="analyst")],
+            "next_agent_instruction": None,  # ← NUEVO: limpiar instrucción consumida
         }
 
     # ------------------------------------------------------------------
@@ -210,7 +342,8 @@ REGLAS ABSOLUTAS:
         return {
             "final_answer": "No fue posible obtener datos para responder tu consulta.",
             "last_agent": "analyst",
-            "messages": [AIMessage(content="[Analyst] Sin datos ni research findings para analizar.")]
+            "messages": [AIMessage(content="[Analyst] Sin datos ni research findings para analizar.")],
+            "next_agent_instruction": None,  # ← NUEVO
         }
 
     # ------------------------------------------------------------------
@@ -220,8 +353,8 @@ REGLAS ABSOLUTAS:
     successful = [r for r in results if _get_attr(r, "status") == "success"]
     empty_successful = [r for r in successful if _get_attr(r, "row_count", 0) == 0]
 
-    # Si TODO falló y no hay research
-    if errors and not successful and not research_findings:
+    # Si TODO falló y no hay research → error técnico (a menos que supervisor pida educated guess)
+    if errors and not successful and not research_findings and not wants_educated_guess:
         err_msgs = "; ".join([
             f"Tarea {_get_attr(e, 'task_id', '?')}: {_get_attr(e, 'error_message', '')}"
             for e in errors
@@ -229,33 +362,34 @@ REGLAS ABSOLUTAS:
         return {
             "final_answer": f"Encontré problemas técnicos en las consultas: {err_msgs}",
             "last_agent": "analyst",
-            "messages": [AIMessage(content="[Analyst] Reportando errores técnicos.")]
+            "messages": [AIMessage(content="[Analyst] Reportando errores técnicos.")],
+            "next_agent_instruction": None,  # ← NUEVO
         }
 
     # ------------------------------------------------------------------
-    # 3. Prompt según disponibilidad de research_findings
+    # 3. Selección de prompt según modo de respuesta
     # ------------------------------------------------------------------
-    if research_findings:
-        # ========== FLUJO DEEP RESEARCH ==========
-        system = SystemMessage(content="""
-Eres un Consultor de Negocio Senior. Recibes un informe de investigación profunda generado por un agente interno (Researcher) respaldado por datos crudos de múltiples consultas SQL.
+    research_mode = bool(research_findings)
 
-ESTRUCTURA OBLIGATORIA DEL INFORME:
-- **Resumen Ejecutivo:** Conclusión principal en 1 o 2 frases.
-- **Hallazgos Clave:** Puntos más destacados apoyados por las métricas.
-- **Desglose y Comparativas:** Análisis de las dimensiones evaluadas.
-- **Conclusiones y Recomendaciones:** Acciones prácticas sugeridas para el negocio.
+    if wants_educated_guess:
+        system = _build_educated_guess_system()
+        mode_label = "EDUCATED_GUESS"
+    elif wants_partial_answer or objective_partial:
+        system = _build_partial_answer_system()
+        mode_label = "PARTIAL_ANSWER"
+    else:
+        system = _build_normal_answer_system(research_mode=research_mode)
+        mode_label = "FINAL_ANSWER"
 
-REGLAS ABSOLUTAS:
-1. CERO ALUCINACIONES: Usa ÚNICAMENTE los datos provistos. Si una consulta devolvió 0 filas, indícalo sin inventar explicaciones.
-2. NO RECALCULES: No calcules porcentajes, sumas o promedios manuales si el SQL no los devolvió ya calculados.
-3. VERIFICA EL INFORME: Contrasta el informe del Researcher con los "Datos crudos de apoyo (SQL results)". Si hay discrepancias o queries fallidas, menciónalas con transparencia.
-4. FORMATO EJECUTIVO: Usa **negritas** para resaltar KPIs clave y tablas Markdown para comparaciones de múltiples valores.
-5. TONO: Profesional, persuasivo y orientado a la toma de decisiones.
-""")
-
+    if research_mode:
         data_context = f"""
 Pregunta original: {question}
+
+--- INSTRUCCIÓN DEL SUPERVISOR ---
+{instruction or "Ninguna instrucción adicional."}
+
+--- MODO DE RESPUESTA ---
+{mode_label}
 
 --- INFORME DEL RESEARCHER ---
 {research_findings}
@@ -263,26 +397,18 @@ Pregunta original: {question}
 --- DATOS CRUDOS DE APOYO (SQL results) ---
 {_build_sql_context(results, question)}
 """
-
     else:
-        # ========== FLUJO NORMAL DE KPIs ==========
-        system = SystemMessage(content="""
-Eres un Analista de Negocio Senior. Recibes datos estructurados de MÚLTIPLES consultas SQL independientes.
-Debes redactar UNA respuesta coherente que integre todos los hallazgos y responda directamente la pregunta del usuario.
+        data_context = f"""
+Pregunta original: {question}
 
-REGLAS ABSOLUTAS:
-1. CERO ALUCINACIONES: Utiliza ÚNICAMENTE los datos provistos. Si una consulta devolvió 0 filas (lista vacía []), indícalo claramente: "No se registraron registros para los criterios solicitados".
-2. NO RECALCULES: No calcules porcentajes, sumas o promedios manuales. Cíñete a las métricas que el SQL ya devolvió.
-3. RESPUESTA DIRECTA: Comienza con la respuesta directa a la pregunta en la primera oración.
-4. FORMATO EJECUTIVO:
-   - Usa **negritas** para resaltar KPIs clave (ej. **$1,250,000**, **14%**).
-   - Si hay comparación de múltiples valores o dimensiones, usa tablas Markdown breves.
-   - No escribas párrafos gigantescos llenos de números crudos.
-5. TONO: Profesional, analítico y conversacional orientado a decisiones ("Esto sugiere que...", "El volumen se concentra en...").
-6. ADVERTENCIAS: Si los resultados incluyen warnings del sistema, menciónalos solo si afectan la interpretación de los datos.
-""")
+--- INSTRUCCIÓN DEL SUPERVISOR ---
+{instruction or "Ninguna instrucción adicional."}
 
-        data_context = _build_sql_context(results, question)
+--- MODO DE RESPUESTA ---
+{mode_label}
+
+{_build_sql_context(results, question)}
+"""
 
         # Caso especial: todas las consultas exitosas devolvieron 0 filas
         if empty_successful and not any(_get_attr(r, "row_count", 0) > 0 for r in results):
@@ -303,5 +429,6 @@ REGLAS ABSOLUTAS:
     return {
         "final_answer": response.content,
         "last_agent": "analyst",
-        "messages": [AIMessage(content=response.content, name="analyst")]
+        "messages": [AIMessage(content=response.content, name="analyst")],
+        "next_agent_instruction": None,  # ← NUEVO
     }

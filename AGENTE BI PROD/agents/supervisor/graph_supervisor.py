@@ -1,20 +1,11 @@
 # agents/supervisor/graph_supervisor.py
 # -------------------------------------------------
 
-# agents/supervisor/graph_supervisor.py
-# -------------------------------------------------
-
-import json
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Optional
 from langchain_core.messages import AIMessage, HumanMessage
-from core.llm import LLM
-from core.contracts import SupervisorDecision
 from core.config import logger
 
 from langsmith import traceable
-
-
-MAX_ITERATIONS = 30
 
 
 def _get(obj: Any, attr: str, default: Any = None) -> Any:
@@ -57,28 +48,20 @@ def _extract_last_user_question(messages: List[Any]) -> Optional[str]:
 
 @traceable(name="Supervisor: Route Next Agent")
 def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    current_iter = state.get("iteration_count", 0)
-    next_iter = current_iter + 1
+    """
+    Supervisor de routing puro. NO gestiona límite de iteraciones ni guards;
+    esa responsabilidad ahora reside en safe_supervisor_node (orchestrator.py).
+    """
     render_attempts = state.get("render_attempts", 0)
 
     def make_update(next_node: str, **extra) -> Dict[str, Any]:
         base = {
             "next": next_node,
             "last_agent": "supervisor",
-            "iteration_count": next_iter,
             "render_attempts": render_attempts,
         }
         base.update(extra)
         return base
-
-    # 1. Límite de iteraciones
-    if current_iter >= MAX_ITERATIONS:
-        logger.warning(f"[Supervisor] Límite de iteraciones ({MAX_ITERATIONS}) alcanzado.")
-        return make_update(
-            "__end__",
-            final_answer=state.get("final_answer") or "No pude completar la consulta tras varios intentos.",
-            messages=[AIMessage(content=f"[Supervisor] Iteración límite ({MAX_ITERATIONS}) alcanzado. Cerrando.")]
-        )
 
     # Lectura de estado
     plan = state.get("plan")
@@ -93,7 +76,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     question = state.get("question", "")
     messages = state.get("messages", [])
 
-    # NUEVO: Detectar cambio de tema y reiniciar plan si aplica
+    # Detectar cambio de tema y reiniciar plan si aplica
     previous_question = _extract_last_user_question(messages[:-1]) if messages else None
     if plan and previous_question and _is_new_topic(question, previous_question):
         logger.info(
@@ -112,7 +95,12 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
             forecast_request=None,
             forecast_results=None,
             forecast_error=None,
-            messages=messages + [
+            next_agent_instruction=(
+                "El usuario cambió de tema. Genera un plan completamente nuevo "
+                "para la nueva pregunta, descartando el contexto anterior."
+            ),
+            # FIX: devolver solo el mensaje nuevo para no duplicar con add_messages
+            messages=[
                 AIMessage(content="[Supervisor] Nuevo tema detectado; reiniciando planificación.")
             ]
         )
@@ -136,6 +124,10 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return make_update(
             "analyst",
             viz_rendered=True,
+            next_agent_instruction=(
+                "La especificación de visualización no fue viable. "
+                "Genera una respuesta basada únicamente en los datos SQL disponibles."
+            ),
             messages=[AIMessage(content="[Supervisor] Spec de visualización inválida, se omite render y se continúa.")]
         )
 
@@ -147,12 +139,17 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 return make_update(
                     "analyst",
                     viz_rendered=True,
+                    next_agent_instruction=(
+                        "La renderización de la visualización falló. "
+                        "Continúa con la respuesta textual basada en los datos SQL."
+                    ),
                     messages=[AIMessage(content="[Supervisor] Render no disponible, se omite visualización.")]
                 )
             logger.info(f"[Supervisor] Reintentando render (intento {render_attempts + 1})")
             return make_update(
                 "render_plotly",
                 render_attempts=render_attempts + 1,
+                next_agent_instruction="Reintentar la renderización de la visualización en Plotly.",
                 messages=[AIMessage(content="[Supervisor] Reintentando render...")]
             )
         else:
@@ -163,6 +160,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         return make_update(
             "analyst",
             viz_rendered=True,
+            next_agent_instruction="Continúa al analista tras fallo de render previo.",
             messages=[AIMessage(content="[Supervisor] Render previo no aplicable, continuando.")]
         )
 
@@ -171,7 +169,10 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     # 1. Sin plan → Planner
     if not plan:
         logger.info("[Supervisor] Ruteando a Planner - no hay plan")
-        return make_update("planner")
+        return make_update(
+            "planner",
+            next_agent_instruction="Genera un plan de ejecución para responder la pregunta del usuario."
+        )
 
     # ------------------------------------------------------------------
     # 2. Ruta de predicción de demanda (PRIORIDAD MÁXIMA)
@@ -179,15 +180,24 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
     if _get(plan, "question_type") == "demand_forecast":
         if not forecast_results and not forecast_error:
             logger.info("[Supervisor] Ruteando a Forecaster - predicción de demanda solicitada")
-            return make_update("forecaster")
+            return make_update(
+                "forecaster",
+                next_agent_instruction="Ejecuta el pronóstico de demanda con los parámetros estructurados del plan."
+            )
 
         if forecast_error and not final_answer:
             logger.info("[Supervisor] Forecast falló, ruteando a Analyst para explicar el error")
-            return make_update("analyst")
+            return make_update(
+                "analyst",
+                next_agent_instruction="Explica el error del pronóstico de demanda al usuario."
+            )
 
         if forecast_results and not final_answer:
             logger.info("[Supervisor] Forecast completado, ruteando a Analyst para redactar respuesta")
-            return make_update("analyst")
+            return make_update(
+                "analyst",
+                next_agent_instruction="Resume los resultados del pronóstico de demanda en lenguaje claro y accionable."
+            )
 
         logger.info("[Supervisor] Forecast y respuesta final listos, finalizando")
         return make_update("__end__")
@@ -200,7 +210,10 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         and state.get("research_findings") is None
     ):
         logger.info("[Supervisor] Ruteando a Researcher - informe profundo solicitado")
-        return make_update("researcher")
+        return make_update(
+            "researcher",
+            next_agent_instruction="Realiza una exploración profunda con múltiples queries SQL autocontenidas y genera un informe ejecutivo completo."
+        )
 
     # 4. Con plan pero sin resultados SQL → SQL Agent
     if not sql_results:
@@ -208,6 +221,7 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning("[Supervisor] SQL Agent ya ejecutó pero no hay resultados. Forzando analyst.")
             return make_update(
                 "analyst",
+                next_agent_instruction="El SQL Agent no devolvió resultados tras intentar. Genera una respuesta explicativa.",
                 messages=[AIMessage(
                     content="[Supervisor] SQL Agent no devolvió resultados tras intentar. "
                             "Se genera respuesta explicativa."
@@ -215,22 +229,34 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
             )
 
         logger.info("[Supervisor] Ruteando a SQL Agent - no hay resultados")
-        return make_update("sql_agent")
+        return make_update(
+            "sql_agent",
+            next_agent_instruction="Ejecuta las tareas SQL del plan actual y devuelve un contrato por cada una."
+        )
 
     # 5. Plan pide visualización y aún no hemos corrido el viz_agent
     if _get(plan, "visualization_candidate", False) and viz_result is None:
         logger.info("[Supervisor] Ruteando a Viz Agent - visualización solicitada (sin spec previa)")
-        return make_update("viz_agent")
+        return make_update(
+            "viz_agent",
+            next_agent_instruction="Genera una especificación de visualización adecuada para los datos SQL obtenidos."
+        )
 
     # 6. Hay spec VÁLIDA y aún no renderizada → Render Plotly
     if viz_is_valid and not viz_rendered:
         logger.info("[Supervisor] Ruteando a Render Plotly")
-        return make_update("render_plotly")
+        return make_update(
+            "render_plotly",
+            next_agent_instruction="Renderiza la especificación de visualización en una figura Plotly."
+        )
 
     # 7. Sin respuesta final → Analyst
     if not final_answer:
         logger.info("[Supervisor] Ruteando a Analyst - no hay respuesta final")
-        return make_update("analyst")
+        return make_update(
+            "analyst",
+            next_agent_instruction="Genera la respuesta final en lenguaje natural a partir de los resultados disponibles."
+        )
 
     # 8. Viz ya resuelto y hay datos → Viz Approval (si aplica)
     if viz_is_valid and viz_rendered and viz_approved is None:
@@ -240,7 +266,10 @@ def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
         ]
         if suitable_results:
             logger.info("[Supervisor] Ruteando a Viz Approval")
-            return make_update("viz_approval")
+            return make_update(
+                "viz_approval",
+                next_agent_instruction="Presenta la visualización al usuario para aprobación o rechazo."
+            )
 
     # 9. Todo listo → Fin
     logger.info("[Supervisor] Todo completado, finalizando")
