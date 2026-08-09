@@ -300,18 +300,13 @@ class OrchestratorState(TypedDict):
 # Decorador de resiliencia para nodos worker
 # ------------------------------------------------------------------
 def resilient_node(node_name: str):
-    """
-    Envuelve un nodo para capturar excepciones inesperadas.
-    En caso de fallo, registra el error y devuelve un mensaje explicativo
-    para que el supervisor decida cómo continuar.
-    """
     def decorator(
         fn: Callable[[OrchestratorState], OrchestratorState]
     ) -> Callable[[OrchestratorState], OrchestratorState]:
         @wraps(fn)
-        def wrapper(state: OrchestratorState) -> OrchestratorState:
+        def wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:  # ← acepta kwargs
             try:
-                return fn(state)
+                return fn(state, **kwargs)  # ← pasa kwargs
             except Exception as e:
                 logger.exception(f"[{node_name}] Nodo falló inesperadamente")
                 return {
