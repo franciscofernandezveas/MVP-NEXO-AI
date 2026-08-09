@@ -11,11 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN echo force-rebuild-20250722-001
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Asegurar __init__.py en AGENTE BI PROD y subpaquetes
 RUN touch "AGENTE BI PROD/__init__.py" && \
     touch "AGENTE BI PROD/core/__init__.py" && \
     touch "AGENTE BI PROD/agents/__init__.py" && \
@@ -28,4 +28,5 @@ ENV VIZ_DIR=/data/visualizations
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+
