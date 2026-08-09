@@ -47,7 +47,7 @@ def _extract_last_user_question(messages: List[Any]) -> Optional[str]:
 
 
 @traceable(name="Supervisor: Route Next Agent")
-def supervisor_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     """
     Supervisor de routing puro. NO gestiona límite de iteraciones ni guards;
     esa responsabilidad ahora reside en safe_supervisor_node (orchestrator.py).

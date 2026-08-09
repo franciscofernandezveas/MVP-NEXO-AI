@@ -135,7 +135,7 @@ def _validate_columns_in_sql(sql: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
+def sql_fetch_schema(state: SQLAgentState, **kwargs) -> Dict[str, Any]:
     if state.get("schema_info") and state["schema_info"].strip():
         schema = state["schema_info"]
         logger.debug("[SQL] Usando schema inyectado por orquestador (filtrado)")
@@ -148,7 +148,7 @@ def sql_fetch_schema(state: SQLAgentState) -> Dict[str, Any]:
     }
 
 
-def sql_generate_query(state: SQLAgentState) -> Dict[str, Any]:
+def sql_generate_query(state: SQLAgentState, **kwargs) -> Dict[str, Any]:
     preferred = state.get("preferred_view")
     allowed = state.get("allowed_views", [])
     instruction = state.get("supervisor_instruction")
@@ -315,7 +315,7 @@ ERROR PREVIO / INSTRUCCIÓN DE CORRECCIÓN:
     }
 
 
-def sql_execute_query(state: SQLAgentState) -> Dict[str, Any]:
+def sql_execute_query(state: SQLAgentState, **kwargs) -> Dict[str, Any]:
     sql = state.get("generated_sql", "")
     if not sql:
         return {
@@ -376,7 +376,7 @@ def _enrich_error_with_valid_columns(error: str, sql: str) -> str:
     return error
 
 
-def sql_validate_and_package(state: SQLAgentState) -> Dict[str, Any]:
+def sql_validate_and_package(state: SQLAgentState, **kwargs) -> Dict[str, Any]:
     rows_raw = state.get("query_result")
     err = state.get("error_message", "")
     sql = state.get("generated_sql", "")

@@ -284,7 +284,7 @@ REGLAS ABSOLUTAS:
 
 
 @traceable(name="Analyst: Generate Final Answer")
-def analyst_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def analyst_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     question = state["question"]
     results = state.get("sql_results", []) or []
     research_findings = state.get("research_findings")

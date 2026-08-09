@@ -421,7 +421,7 @@ def _select_view_for_task(
 # ------------------------------------------------------------------
 # Nodo principal
 # ------------------------------------------------------------------
-def planner_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def planner_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     harness = state.get("harness_context", {})
     allowed_views = harness.get("allowed_views", [])
     ambiguity_notes = harness.get("ambiguity_notes", [])

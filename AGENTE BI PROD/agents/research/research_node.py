@@ -77,7 +77,7 @@ def make_research_node(
 ) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
     structured_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
 
-    def research_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    def research_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         question = state["question"]
         harness = state.get("harness_context", {})
         allowed_views = harness.get("allowed_views", [])

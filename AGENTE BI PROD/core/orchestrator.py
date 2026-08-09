@@ -326,11 +326,11 @@ def resilient_node(node_name: str):
 # ------------------------------------------------------------------
 # Nodos del Grafo
 # ------------------------------------------------------------------
-def detect_chitchat_node(state: OrchestratorState) -> OrchestratorState:
+def detect_chitchat_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
     return {"is_chitchat": _is_chitchat(state.get("question"))}
 
 
-def chitchat_node(state: OrchestratorState) -> OrchestratorState:
+def chitchat_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
     question = state.get("question", "")
     response = _generate_chitchat_response(question)
     logger.info(f"[Chitchat] Pregunta='{question}' → Respuesta predefinida")
@@ -343,7 +343,7 @@ def chitchat_node(state: OrchestratorState) -> OrchestratorState:
 
 
 @traceable(name="Orchestrator: Build Harness Context")
-def build_harness_context_node(state: OrchestratorState) -> OrchestratorState:
+def build_harness_context_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
     question = state.get("question", "")
     harness = build_harness_context_cached(_normalize_question(question))
 
@@ -364,7 +364,7 @@ def build_harness_context_node(state: OrchestratorState) -> OrchestratorState:
 
 
 @traceable(name="Orchestrator: Execute SQL Tasks")
-def sql_agent_wrapper(state: OrchestratorState) -> OrchestratorState:
+def sql_agent_wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:
     logger.info(f"[SQL Agent Wrapper] Iniciando. Plan presente: {state.get('plan') is not None}")
 
     instruction = state.get("next_agent_instruction")
@@ -471,7 +471,7 @@ def sql_agent_wrapper(state: OrchestratorState) -> OrchestratorState:
     }
 
 
-def viz_agent_node(state: OrchestratorState) -> OrchestratorState:
+def viz_agent_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
     sql_results = state.get("sql_results", []) or []
     plan = state.get("plan")
 
@@ -551,7 +551,7 @@ def viz_agent_node(state: OrchestratorState) -> OrchestratorState:
 
 
 @traceable(name="Orchestrator: Execute Demand Forecast")
-def forecaster_node(state: OrchestratorState) -> OrchestratorState:
+def forecaster_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
     from agents.forecasting_agent.graph_demand_forecaster import run_forecast
 
     instruction = state.get("next_agent_instruction")
@@ -610,14 +610,14 @@ def forecaster_node(state: OrchestratorState) -> OrchestratorState:
 _RESEARCHER_NODE = make_research_node(SQL_SUBGRAPH, LLM)
 
 
-def researcher_node(state: OrchestratorState) -> OrchestratorState:
+def researcher_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
     instruction = state.get("next_agent_instruction")
     if instruction:
         logger.info(f"[Researcher] Instrucción recibida: {instruction}")
     return _RESEARCHER_NODE(state)
 
 
-def safe_supervisor_node(state: OrchestratorState) -> OrchestratorState:
+def safe_supervisor_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
     """
     Supervisor envuelto con:
     - Task Ledger y Progress Ledger
