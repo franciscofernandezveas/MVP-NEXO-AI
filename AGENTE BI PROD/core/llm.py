@@ -25,7 +25,7 @@ OPENAI_API_KEY = OPENAI_API_KEY.strip().strip('"').strip("'") if OPENAI_API_KEY 
 
 # Configurar LLM con valores por defecto razonables
 LLM = ChatOpenAI(
-    model="gpt-4o-mini",  # Modelo más económico para pruebas
+    model="gpt-5.4-mini",  # Modelo más económico para pruebas
     temperature=0.0,      # Para respuestas más determinísticas
     max_tokens=2048,      # Límite de tokens
     api_key=OPENAI_API_KEY,
