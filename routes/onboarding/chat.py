@@ -196,6 +196,57 @@ def _sql_rows_returned(sql_results: list) -> int:
     return len(rows) if isinstance(rows, list) else 0
 
 
+def _extract_token(chunk: Any) -> str:
+    """
+    Extrae texto visible de un AIMessageChunk / ToolMessageChunk / dict / objeto.
+    Ignora tool_call_chunks sin contenido textual.
+    """
+    if chunk is None:
+        return ""
+
+    if isinstance(chunk, dict):
+        return chunk.get("content") or ""
+
+    if hasattr(chunk, "content"):
+        content = chunk.content
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        # A veces content es una lista de dicts (tool_call_chunks); filtrar texto
+        texts = []
+        for item in content if isinstance(content, list) else []:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content") or ""
+                if text:
+                    texts.append(text)
+            elif isinstance(item, str):
+                texts.append(item)
+        return "".join(texts)
+
+    return str(chunk) if chunk else ""
+
+
+def _is_answer_node(node: Optional[str]) -> bool:
+    """
+    Heurística para decidir si los tokens de un nodo son la respuesta final
+    visible para el usuario. Ajusta según los nombres reales de tu grafo.
+    """
+    if not node:
+        return True  # Si no sabemos el nodo, no filtramos por seguridad
+    visible = {
+        "analyst",
+        "supervisor",
+        "generate",
+        "final",
+        "responder",
+        "answer",
+        "answer_agent",
+        "response_agent",
+    }
+    return node in visible or "answer" in node.lower() or "final" in node.lower()
+
+
 @router.post("/{session_id}/chat")
 async def stream_chat(request: Request, session_id: str, body: ChatRequest):
     from core.orchestrator import BI_ORCHESTRATOR
@@ -257,7 +308,6 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                 final_answer = None
                 chart_url = None
                 chart_emitted = False
-                final_answer_emitted = False
                 final_state = None
                 assistant_message_id = None
                 response_id = None
@@ -265,6 +315,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                 sql_success = None
                 error_type = None
                 sql_results_serializable = None
+                streamed_tokens: list[str] = []
 
                 try:
                     _cleanup_residual_charts()
@@ -294,37 +345,96 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                     yield sse_event("start")
                     last_agent = None
 
-                    async for state in BI_ORCHESTRATOR.astream(
-                        initial_state, config, stream_mode="values"
-                    ):
-                        final_state = state
-                        agent = state.get("last_agent")
-                        iteration = state.get("iteration_count", 0)
+                    # ═══════════════════════════════════════════════════════
+                    # STREAMING REAL DE TOKENS (LangGraph 0.1.x)
+                    # ═══════════════════════════════════════════════════════
+                    events_supported = True
+                    try:
+                        # Verificamos que el orquestador soporte astream_events
+                        _ = BI_ORCHESTRATOR.astream_events
+                    except AttributeError:
+                        events_supported = False
+                        logger.warning(
+                            "[chat] BI_ORCHESTRATOR no expone astream_events; "
+                            "fallback a stream_mode='values'"
+                        )
 
-                        if agent and agent != last_agent:
-                            yield sse_event(
-                                "progress",
-                                node=agent,
-                                iteration=iteration,
-                                message=_node_message(agent),
-                            )
-                            last_agent = agent
+                    if events_supported:
+                        async for event in BI_ORCHESTRATOR.astream_events(
+                            initial_state, config, version="v2"
+                        ):
+                            # Cliente cerró la conexión: cancelar inmediatamente
+                            if await request.is_disconnected():
+                                logger.info(f"[chat] cliente desconectado durante stream: {session_id}")
+                                break
 
-                        answer = state.get("final_answer")
-                        if answer and not final_answer_emitted:
-                            final_answer = answer
-                            async for chunk in sse_stream_text(final_answer, sleep_time=0.003):
-                                yield chunk
-                            final_answer_emitted = True
+                            kind = event.get("event")
+                            data = event.get("data", {})
+                            metadata = event.get("metadata", {})
+                            node = metadata.get("langgraph_node")
+
+                            # ── Progreso de nodos ──
+                            if kind == "on_chain_start" and node and node != last_agent:
+                                yield sse_event(
+                                    "progress",
+                                    node=node,
+                                    iteration=0,
+                                    message=_node_message(node),
+                                )
+                                last_agent = node
+
+                            # ── Tokens reales del modelo de lenguaje ──
+                            if kind == "on_chat_model_stream":
+                                token = _extract_token(data.get("chunk"))
+                                if token and _is_answer_node(node):
+                                    yield sse_event("chunk", content=token)
+                                    streamed_tokens.append(token)
+
+                            # ── Capturar estado final si está disponible ──
+                            if (
+                                kind == "on_chain_end"
+                                and event.get("name") in ("LangGraph", "__root__", None, "")
+                            ):
+                                output = data.get("output")
+                                if isinstance(output, dict):
+                                    final_state = output
+
+                        # Si astream_events no devolvió estado final, fallback a values
+                        if final_state is None:
+                            async for state in BI_ORCHESTRATOR.astream(
+                                initial_state, config, stream_mode="values"
+                            ):
+                                final_state = state
+                                if await request.is_disconnected():
+                                    break
+
+                    else:
+                        # Fallback: solo snapshots de estado + final_answer
+                        async for state in BI_ORCHESTRATOR.astream(
+                            initial_state, config, stream_mode="values"
+                        ):
+                            if await request.is_disconnected():
+                                break
+                            final_state = state
+                            agent = state.get("last_agent")
+                            if agent and agent != last_agent:
+                                yield sse_event(
+                                    "progress",
+                                    node=agent,
+                                    iteration=0,
+                                    message=_node_message(agent),
+                                )
+                                last_agent = agent
 
                     response_time_ms = int((time.time() - t_start) * 1000)
 
+                    # Recuperar respuesta final del estado
                     if final_state:
+                        final_answer = final_state.get("final_answer")
                         viz_rendered = final_state.get("viz_rendered", False)
                         viz_result = final_state.get("viz_result") or {}
                         sql_results = final_state.get("sql_results") or []
 
-                        # Convertir resultados a algo serializable
                         sql_results_serializable = _sql_result_to_dict(sql_results)
 
                         if sql_results:
@@ -343,22 +453,34 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                                 yield sse_event("chart", url=chart_url, format="png")
                                 chart_emitted = True
 
+                    # Si NO logramos stream de tokens reales, enviar final_answer como typing
+                    # (para no romper el fallback y mantener compatibilidad)
+                    if not streamed_tokens and final_answer:
+                        async for chunk in sse_stream_text(final_answer, sleep_time=0.003):
+                            yield chunk
+
+                    # Si hubo tokens reales pero el final_answer difiere (p.ej. prefijo/sufijo),
+                    # podemos enviar la diferencia. Por ahora confiamos en los tokens.
+
                     # Guardar mensaje del asistente
-                    if final_answer:
+                    answer_to_save = final_answer
+                    if not answer_to_save and streamed_tokens:
+                        answer_to_save = "".join(streamed_tokens)
+
+                    if answer_to_save:
                         try:
                             msg_data, _ = _safe_execute(
                                 supabase.table("messages").insert({
                                     "session_id": session_id,
                                     "user_id": user_id,
                                     "role": "assistant",
-                                    "content": final_answer[:4000],
+                                    "content": answer_to_save[:4000],
                                     "message_type": "answer",
                                 })
                             )
                             if msg_data and isinstance(msg_data, list) and len(msg_data) > 0:
                                 assistant_message_id = msg_data[0]["id"]
 
-                            # Guardar respuesta del agente
                             ar_data, _ = _safe_execute(
                                 supabase.table("agent_responses").insert({
                                     "message_id": assistant_message_id,
@@ -405,10 +527,10 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                             },
                         )
 
-                    # Insight: cuando hay respuesta final con datos/visualización
-                    if final_answer and (chart_emitted or sql_generated):
+                    # Insight
+                    if answer_to_save and (chart_emitted or sql_generated):
                         try:
-                            query_count = 1  # en este MVP contamos la pregunta actual
+                            query_count = 1
                             reached_at = datetime.now(timezone.utc)
                             seconds_to_insight = int((reached_at - first_query_at).total_seconds())
 
@@ -422,7 +544,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                                     "query_count": query_count,
                                     "successful": True,
                                     "self_served": True,
-                                    "description": final_answer[:500],
+                                    "description": answer_to_save[:500],
                                 })
                             )
 
@@ -449,7 +571,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
 
                     PENDING_ACTIONS[session_id] = {
                         "action_type": "ask_detailed",
-                        "result": {"response": final_answer, "chart_url": chart_url},
+                        "result": {"response": answer_to_save, "chart_url": chart_url},
                         "timestamp": time.time(),
                     }
 
