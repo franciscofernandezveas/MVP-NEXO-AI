@@ -42,7 +42,7 @@ if env_file.exists():
 os.environ["OPENAI_API_KEY"] = os.getenv("DEMO_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 
 # Desactivar LangSmith
-os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
+os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
 
 # Variables críticas del MVP
 required_vars = [
