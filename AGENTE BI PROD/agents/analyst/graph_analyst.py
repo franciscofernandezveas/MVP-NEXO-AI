@@ -3,6 +3,7 @@
 
 import json
 import logging
+import math
 from typing import Any, Dict, List, Optional
 from datetime import datetime, date
 
@@ -27,25 +28,18 @@ def _get_attr(obj: Any, attr: str, default: Any = None) -> Any:
 
 
 def _fmt_value(val: Any) -> str:
-    """
-    Formatea valores para tablas Markdown con locale español/chileno:
-    1234.56 → 1.234,56
-    1234567 → 1.234.567
-    """
+    """Formatea valores para tablas Markdown con locale español/chileno."""
     if val is None:
         return ""
     if isinstance(val, bool):
         return "Sí" if val else "No"
     if isinstance(val, (int, float)):
-        # Manejar infinitos/NaN
         if isinstance(val, float):
-            import math
             if math.isnan(val):
                 return "N/A"
             if math.isinf(val):
                 return "∞"
         num_str = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
-        # Transformar 1,234.56 → 1.234,56 y 1,234,567 → 1.234.567
         return num_str.replace(",", "X").replace(".", ",").replace("X", ".")
     if isinstance(val, (datetime, date)):
         return val.isoformat()
@@ -55,11 +49,26 @@ def _fmt_value(val: Any) -> str:
 # ------------------------------------------------------------------
 # Compactación inteligente de resultados SQL
 # ------------------------------------------------------------------
-MAX_ROWS_PER_TASK = 30
+BASE_MAX_ROWS_PER_TASK = 20
+ABSOLUTE_MAX_ROWS_PER_TASK = 30
+
+
+def _compute_max_rows(n_tasks: int) -> int:
+    """
+    Límite dinámico: a más subtareas, menos filas por subtarea.
+    1 tarea → 30 filas, 5 tareas → 12 filas, 10+ tareas → 6 filas.
+    """
+    if n_tasks <= 1:
+        return ABSOLUTE_MAX_ROWS_PER_TASK
+    if n_tasks <= 3:
+        return BASE_MAX_ROWS_PER_TASK
+    # Disminución suave
+    limit = max(6, int(BASE_MAX_ROWS_PER_TASK * 3 / n_tasks))
+    return min(limit, ABSOLUTE_MAX_ROWS_PER_TASK)
 
 
 def _format_rows_markdown(rows: List[Dict[str, Any]], columns: List[str]) -> str:
-    """Formatea filas como tabla Markdown usando únicamente las columnas reportadas."""
+    """Formatea filas como tabla Markdown."""
     if not rows or not columns:
         return ""
 
@@ -74,10 +83,45 @@ def _format_rows_markdown(rows: List[Dict[str, Any]], columns: List[str]) -> str
     return "\n".join(lines)
 
 
-def _compact_task_summary(contract: Any, idx: int) -> str:
+def _compute_numeric_summary(rows: List[Dict[str, Any]], columns: List[str]) -> str:
     """
-    Genera un resumen compacto pero informativo de una subtarea SQL.
-    Incluye metadatos clave + tabla Markdown truncada. Sin JSON duplicado.
+    Calcula min/max/promedio para columnas numéricas detectadas.
+    Solo se usa cuando se truncan filas, para que el analista no pierda el panorama.
+    """
+    summaries = []
+    for col in columns:
+        values = []
+        for row in rows:
+            v = row.get(col)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                values.append(v)
+
+        if not values:
+            continue
+
+        try:
+            col_min = min(values)
+            col_max = max(values)
+            col_avg = sum(values) / len(values)
+            summaries.append(
+                f"- {col}: min={_fmt_value(col_min)}, "
+                f"max={_fmt_value(col_max)}, "
+                f"promedio={_fmt_value(col_avg)}, "
+                f"muestras={len(values)}"
+            )
+        except Exception:
+            continue
+
+    if not summaries:
+        return ""
+
+    return "Resumen numérico de la muestra completa:\n" + "\n".join(summaries)
+
+
+def _compact_task_summary(contract: Any, idx: int, max_rows: int) -> str:
+    """
+    Genera un resumen compacto de una subtarea SQL.
+    Incluye dependencias, metadatos, tabla Markdown truncada y resumen numérico.
     """
     task_id = _get_attr(contract, "task_id", str(idx + 1))
     status = _get_attr(contract, "status", "unknown")
@@ -91,22 +135,24 @@ def _compact_task_summary(contract: Any, idx: int) -> str:
     execution_strategy = _get_attr(contract, "execution_strategy", "N/A")
     generated_sql = _get_attr(contract, "generated_sql", "")
     reasoning = _get_attr(contract, "reasoning", "")
+    depends_on = _get_attr(contract, "depends_on", []) or []
 
-    # Detectar truncamiento
-    is_truncated = len(rows) > MAX_ROWS_PER_TASK
-    sample_rows = rows[:MAX_ROWS_PER_TASK]
+    # Truncamiento inteligente
+    is_truncated = len(rows) > max_rows
+    sample_rows = rows[:max_rows]
 
     parts = [
-        f"--- Subtarea {task_id} ---",
-        f"Estado: {status} | Puede responder: {'Sí' if can_answer else 'No'} | Filas: {row_count}",
-        f"Vista: {preferred_view} | Estrategia: {execution_strategy}",
+        f"=== Subtarea {task_id} ===",
+        f"Depende de subtareas: {depends_on if depends_on else 'Ninguna'}",
+        f"Estado: {status} | Puede responder: {'Sí' if can_answer else 'No'} | Filas totales: {row_count}",
+        f"Vista principal: {preferred_view} | Estrategia: {execution_strategy}",
     ]
 
     if generated_sql:
         parts.append(f"SQL ejecutado: {generated_sql}")
 
     if reasoning:
-        parts.append(f"Razonamiento: {reasoning}")
+        parts.append(f"Razonamiento técnico: {reasoning}")
 
     if warnings:
         parts.append("Advertencias:\n" + "\n".join(f"  - {w}" for w in warnings))
@@ -120,14 +166,20 @@ def _compact_task_summary(contract: Any, idx: int) -> str:
         )
 
     if sample_rows and columns:
-        parts.append(f"Muestra de datos (primeras {len(sample_rows)} de {row_count} filas):")
+        parts.append(f"Muestra de datos ({len(sample_rows)} de {row_count} filas):")
         parts.append(_format_rows_markdown(sample_rows, columns))
+
         if is_truncated:
             parts.append(
-                f"[Se omitieron {row_count - MAX_ROWS_PER_TASK} filas adicionales por brevedad]"
+                f"[... Se truncaron {row_count - max_rows} filas para eficiencia de tokens ...]"
             )
+            # Añadir resumen estadístico solo si truncamos
+            numeric_summary = _compute_numeric_summary(rows, columns)
+            if numeric_summary:
+                parts.append(numeric_summary)
+
     elif not sample_rows:
-        parts.append("Sin filas devueltas.")
+        parts.append("Sin registros devueltos.")
 
     return "\n".join(parts)
 
@@ -137,18 +189,20 @@ def _build_sql_context(results: list, question: str) -> str:
     if not results:
         return "No hay resultados SQL disponibles."
 
-    tasks_context = [_compact_task_summary(r, idx) for idx, r in enumerate(results)]
+    max_rows = _compute_max_rows(len(results))
+    tasks_context = [
+        _compact_task_summary(r, idx, max_rows) for idx, r in enumerate(results)
+    ]
 
     return f"""
 Pregunta original: {question}
 
-Resultados de {len(results)} subtarea(s) SQL:
+Resultados de {len(results)} subtarea(s) SQL (límite de muestra: {max_rows} filas por subtarea):
 {chr(10).join(tasks_context)}
 """
 
 
 def _format_forecast_table(forecast_results: List[Dict[str, Any]]) -> str:
-    """Formatea los resultados del forecast como tabla markdown."""
     lineas = [
         "| Fecha | Predicción | Con buffer |",
         "|-------|-----------:|-----------:|",
@@ -290,11 +344,17 @@ def _build_normal_answer_system(multi_query: bool = False, research_mode: bool =
     multi_query_section = ""
     if multi_query:
         multi_query_section = """
---- MODO MULTI-QUERY ---
-La pregunta fue dividida en múltiples consultas SQL independientes (subtareas).
-Debes integrar los hallazgos de TODAS las subtareas en un único relato analítico coherente.
-Si una subtarea no aportó datos, menciónalo explícitamente.
-No combines métricas que no sean comparables (por ejemplo, ventas totales vs ticket promedio).
+--- GUÍA AVANZADA PARA MULTI-QUERY Y TAREAS COMPLEJAS ---
+La respuesta del usuario requirió descomponer el problema en múltiples consultas independientes o encadenadas.
+Tus responsabilidades para integrar esta información son:
+
+1. **Correlación Cruzada:** Conecta los hallazgos de cada subtarea. Ejemplos:
+   - Si Subtarea 1 consultó ventas de un producto por sede y Subtarea 2 consultó stock/merma del mismo producto, explica la relación entre ambas.
+   - Si Subtarea A obtuvo un ranking/top-N y Subtarea B detalló esos mismos ítems, usa A para el panorama y B para el detalle.
+2. **Coherencia Global:** Presenta una narrativa unificada. No separes la respuesta en compartimentos estancos por cada subtarea a menos que el usuario lo haya pedido explícitamente.
+3. **Dependencias:** Si una subtarea depende de otra (campo `depends_on`), respeta ese orden lógico en tu explicación (primero causa, luego consecuencia o detalle).
+4. **Transparencia en Vacíos:** Si una subtarea falló o no dio resultados, indícalo claramente, pero no dejes que eso opaque los datos exitosos.
+5. **No Compares Manzanas con Naranjas:** No combines métricas de distinta naturaleza como si fueran la misma cosa (por ejemplo, ventas totales vs ticket promedio). Sé explícito sobre qué representa cada métrica.
 """
 
     if research_mode:
@@ -376,7 +436,6 @@ REGLAS ABSOLUTAS:
 - Lenguaje claro: Explica conceptos técnicos (como safety stock) en lenguaje de negocio accesible para operarios.
 - Destaca máximos y mínimos usando **negritas**.
 """)
-
         data_context = _build_forecast_context(question, forecast_results, forecast_error)
 
         try:
@@ -450,11 +509,10 @@ No incluyas detalles técnicos internos, stack traces ni nombres de vistas. Expl
         system = _build_normal_answer_system(multi_query=is_multi_query, research_mode=research_mode)
         mode_label = "FINAL_ANSWER"
 
-    # Notas contextuales
     multi_query_note = ""
     if is_multi_query:
         multi_query_note = (
-            f"\n--- MODO MULTI-QUERY ---\n"
+            f"\n--- NOTA DE MULTI-QUERY ---\n"
             f"La pregunta fue dividida en {len(results)} subtareas SQL independientes. "
             f"Integra sus resultados en una respuesta coherente. "
             f"Menciona explícitamente si alguna subtarea no aportó datos.\n"
@@ -502,7 +560,7 @@ Pregunta original: {question}
 """
 
     # ------------------------------------------------------------------
-    # 4. Invocar LLM con control de errores
+    # 4. Invocar LLM con control de errores por tokens/rate limit
     # ------------------------------------------------------------------
     try:
         response = LLM.invoke([system, HumanMessage(content=data_context)])
@@ -511,7 +569,8 @@ Pregunta original: {question}
         logger.error(f"[Analyst] Error en LLM: {e}")
         final_text = (
             "Ocurrió un error al procesar y sintetizar los datos analíticos para tu consulta. "
-            "Esto puede deberse a que la respuesta fue demasiado grande. Intenta reformular la pregunta de forma más específica."
+            "Esto puede deberse a que la respuesta fue demasiado grande. "
+            "Intenta reformular la pregunta de forma más específica o con menos dimensiones."
         )
 
     # ------------------------------------------------------------------
