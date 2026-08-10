@@ -2,18 +2,21 @@
 # -------------------------------------------------
 
 import json
-import logging  # ← NUEVO: import requerido por logger
+import logging
 from typing import Any, Dict, List, Optional
+from datetime import datetime, date
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from core.llm import LLM
 from langsmith import traceable
 
-# ← NUEVO: logger del módulo
 logger = logging.getLogger(__name__)
 
 
+# ------------------------------------------------------------------
+# Helpers genéricos
+# ------------------------------------------------------------------
 def _get_attr(obj: Any, attr: str, default: Any = None) -> Any:
     """Lee atributo o clave, soportando objetos Pydantic y dicts."""
     if obj is None:
@@ -21,6 +24,38 @@ def _get_attr(obj: Any, attr: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(attr, default)
     return getattr(obj, attr, default)
+
+
+def _fmt_value(val: Any) -> str:
+    """
+    Formatea valores para tablas Markdown con locale español/chileno:
+    1234.56 → 1.234,56
+    1234567 → 1.234.567
+    """
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "Sí" if val else "No"
+    if isinstance(val, (int, float)):
+        # Manejar infinitos/NaN
+        if isinstance(val, float):
+            import math
+            if math.isnan(val):
+                return "N/A"
+            if math.isinf(val):
+                return "∞"
+        num_str = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
+        # Transformar 1,234.56 → 1.234,56 y 1,234,567 → 1.234.567
+        return num_str.replace(",", "X").replace(".", ",").replace("X", ".")
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    return str(val)
+
+
+# ------------------------------------------------------------------
+# Compactación inteligente de resultados SQL
+# ------------------------------------------------------------------
+MAX_ROWS_PER_TASK = 30
 
 
 def _format_rows_markdown(rows: List[Dict[str, Any]], columns: List[str]) -> str:
@@ -33,74 +68,81 @@ def _format_rows_markdown(rows: List[Dict[str, Any]], columns: List[str]) -> str
     lines = [header, separator]
 
     for row in rows:
-        values = []
-        for col in columns:
-            val = row.get(col, "")
-            if isinstance(val, float):
-                val = f"{val:,.2f}"
-            elif isinstance(val, int):
-                val = f"{val:,}"
-            values.append(str(val))
+        values = [_fmt_value(row.get(col, "")) for col in columns]
         lines.append("| " + " | ".join(values) + " |")
 
     return "\n".join(lines)
 
 
+def _compact_task_summary(contract: Any, idx: int) -> str:
+    """
+    Genera un resumen compacto pero informativo de una subtarea SQL.
+    Incluye metadatos clave + tabla Markdown truncada. Sin JSON duplicado.
+    """
+    task_id = _get_attr(contract, "task_id", str(idx + 1))
+    status = _get_attr(contract, "status", "unknown")
+    can_answer = _get_attr(contract, "can_answer", False)
+    row_count = _get_attr(contract, "row_count", 0)
+    rows = _get_attr(contract, "rows", []) or []
+    columns = _get_attr(contract, "columns", []) or []
+    warnings = _get_attr(contract, "warnings", []) or []
+    error_message = _get_attr(contract, "error_message", "")
+    preferred_view = _get_attr(contract, "preferred_view", "N/A")
+    execution_strategy = _get_attr(contract, "execution_strategy", "N/A")
+    generated_sql = _get_attr(contract, "generated_sql", "")
+    reasoning = _get_attr(contract, "reasoning", "")
+
+    # Detectar truncamiento
+    is_truncated = len(rows) > MAX_ROWS_PER_TASK
+    sample_rows = rows[:MAX_ROWS_PER_TASK]
+
+    parts = [
+        f"--- Subtarea {task_id} ---",
+        f"Estado: {status} | Puede responder: {'Sí' if can_answer else 'No'} | Filas: {row_count}",
+        f"Vista: {preferred_view} | Estrategia: {execution_strategy}",
+    ]
+
+    if generated_sql:
+        parts.append(f"SQL ejecutado: {generated_sql}")
+
+    if reasoning:
+        parts.append(f"Razonamiento: {reasoning}")
+
+    if warnings:
+        parts.append("Advertencias:\n" + "\n".join(f"  - {w}" for w in warnings))
+
+    if status == "error" and error_message:
+        parts.append(f"Error: {error_message}")
+
+    if status == "success" and row_count == 0:
+        parts.append(
+            "Nota: consulta ejecutada correctamente pero sin registros para los filtros indicados."
+        )
+
+    if sample_rows and columns:
+        parts.append(f"Muestra de datos (primeras {len(sample_rows)} de {row_count} filas):")
+        parts.append(_format_rows_markdown(sample_rows, columns))
+        if is_truncated:
+            parts.append(
+                f"[Se omitieron {row_count - MAX_ROWS_PER_TASK} filas adicionales por brevedad]"
+            )
+    elif not sample_rows:
+        parts.append("Sin filas devueltas.")
+
+    return "\n".join(parts)
+
+
 def _build_sql_context(results: list, question: str) -> str:
-    """Construye el contexto crudo de resultados SQL para el prompt, incluyendo warnings y datos vacíos."""
+    """Construye contexto compacto de resultados SQL para el prompt."""
     if not results:
         return "No hay resultados SQL disponibles."
 
-    tasks_context = []
-    for contract in results:
-        task_id = _get_attr(contract, "task_id", "?")
-        status = _get_attr(contract, "status", "unknown")
-        row_count = _get_attr(contract, "row_count", 0)
-        rows = _get_attr(contract, "rows", []) or []
-        columns = _get_attr(contract, "columns", []) or []
-        warnings = _get_attr(contract, "warnings", []) or []
-        error_message = _get_attr(contract, "error_message", "")
-
-        empty_note = ""
-        if status == "success" and row_count == 0:
-            empty_note = (
-                "\n⚠️ ESTA CONSULTA SE EJECUTÓ CORRECTAMENTE PERO NO DEVOLVIÓ NINGUNA FILA "
-                "(posiblemente no hay registros para los filtros solicitados).\n"
-            )
-
-        warnings_note = ""
-        if warnings:
-            warnings_note = (
-                "\n⚠️ ADVERTENCIAS DEL SISTEMA:\n"
-                + "\n".join(f"  - {w}" for w in warnings)
-                + "\n"
-            )
-
-        error_note = ""
-        if status == "error" and error_message:
-            error_note = f"\n❌ ERROR EN TAREA: {error_message}\n"
-
-        task_ctx = f"""
---- TAREA {task_id} ---
-Estrategia: {_get_attr(contract, "execution_strategy", "N/A")}
-Vista usada: {_get_attr(contract, "preferred_view", "N/A")}
-SQL ejecutado: {_get_attr(contract, "generated_sql", "")}
-Estado: {status}
-Filas: {row_count}
-Columnas: {columns}
-{empty_note}{warnings_note}{error_note}
-Datos:
-{_format_rows_markdown(rows, columns) if rows else "(sin filas)"}
-
-JSON raw:
-{json.dumps(rows, indent=2, ensure_ascii=False, default=str)}
-"""
-        tasks_context.append(task_ctx)
+    tasks_context = [_compact_task_summary(r, idx) for idx, r in enumerate(results)]
 
     return f"""
 Pregunta original: {question}
 
-Resultados de {len(results)} tarea(s) SQL:
+Resultados de {len(results)} subtarea(s) SQL:
 {chr(10).join(tasks_context)}
 """
 
@@ -113,12 +155,12 @@ def _format_forecast_table(forecast_results: List[Dict[str, Any]]) -> str:
     ]
     for r in forecast_results:
         lineas.append(
-            f"| {r.get('fecha', 'N/A')} | {r.get('prediccion', 'N/A')} | {r.get('prediccion_con_buffer', 'N/A')} |"
+            f"| {r.get('fecha', 'N/A')} | {_fmt_value(r.get('prediccion'))} | {_fmt_value(r.get('prediccion_con_buffer'))} |"
         )
     return "\n".join(lineas)
 
 
-def _build_forecast_context(question: str, forecast_results: List[Dict[str, Any]], forecast_error: str = None) -> str:
+def _build_forecast_context(question: str, forecast_results: List[Dict[str, Any]], forecast_error: Optional[str] = None) -> str:
     if forecast_error:
         return f"""
 Pregunta original: {question}
@@ -139,7 +181,7 @@ Redacta una respuesta honesta indicando que no hay datos suficientes para proyec
 
     primer = forecast_results[0]
     metricas = _get_attr(primer, "metricas", {})
-    metricas_str = ", ".join([f"{k}={v:.3f}" for k, v in metricas.items()])
+    metricas_str = ", ".join([f"{k}={_fmt_value(v)}" for k, v in metricas.items()])
 
     return f"""
 Pregunta original: {question}
@@ -151,7 +193,7 @@ El sistema ha generado un pronóstico de demanda con los siguientes datos:
 - Días pronosticados: {len(forecast_results)}
 - Modelo usado: {_get_attr(primer, 'modelo_version', 'N/A')}
 - Métricas del modelo: {metricas_str}
-- Buffer de seguridad (safety stock): {_get_attr(primer, 'safety_stock', 0):.1f} unidades
+- Buffer de seguridad (safety stock): {_fmt_value(_get_attr(primer, 'safety_stock', 0))} unidades
 
 Tabla de predicciones:
 {_format_forecast_table(forecast_results)}
@@ -167,7 +209,6 @@ Instrucciones:
 
 
 def _is_educated_guess_instruction(instruction: Optional[str]) -> bool:
-    """Detecta si el supervisor pide una estimación razonada."""
     if not instruction:
         return False
     markers = [
@@ -179,7 +220,6 @@ def _is_educated_guess_instruction(instruction: Optional[str]) -> bool:
 
 
 def _is_partial_answer_instruction(instruction: Optional[str]) -> bool:
-    """Detecta si el supervisor pide una respuesta parcial sin educated guess explícito."""
     if not instruction:
         return False
     markers = [
@@ -190,7 +230,6 @@ def _is_partial_answer_instruction(instruction: Optional[str]) -> bool:
 
 
 def _has_partial_data(results: list) -> bool:
-    """Determina si hay datos parciales (algunas tareas fallaron o devolvieron vacío pero otras sí tienen datos)."""
     if not results:
         return False
     has_success_with_data = any(
@@ -247,10 +286,22 @@ REGLAS ABSOLUTAS:
 """)
 
 
-def _build_normal_answer_system(research_mode: bool = False) -> SystemMessage:
+def _build_normal_answer_system(multi_query: bool = False, research_mode: bool = False) -> SystemMessage:
+    multi_query_section = ""
+    if multi_query:
+        multi_query_section = """
+--- MODO MULTI-QUERY ---
+La pregunta fue dividida en múltiples consultas SQL independientes (subtareas).
+Debes integrar los hallazgos de TODAS las subtareas en un único relato analítico coherente.
+Si una subtarea no aportó datos, menciónalo explícitamente.
+No combines métricas que no sean comparables (por ejemplo, ventas totales vs ticket promedio).
+"""
+
     if research_mode:
-        return SystemMessage(content="""
+        content = f"""
 Eres un Consultor de Negocio Senior. Recibes un informe de investigación profunda generado por un agente interno (Researcher) respaldado por datos crudos de múltiples consultas SQL.
+
+{multi_query_section}
 
 ESTRUCTURA OBLIGATORIA DEL INFORME:
 - **Resumen Ejecutivo:** Conclusión principal en 1 o 2 frases.
@@ -261,44 +312,46 @@ ESTRUCTURA OBLIGATORIA DEL INFORME:
 REGLAS ABSOLUTAS:
 1. CERO ALUCINACIONES: Usa ÚNICAMENTE los datos provistos. Si una consulta devolvió 0 filas, indícalo sin inventar explicaciones.
 2. NO RECALCULES: No calcules porcentajes, sumas o promedios manuales si el SQL no los devolvió ya calculados.
-3. VERIFICA EL INFORME: Contrasta el informe del Researcher con los "Datos crudos de apoyo (SQL results)". Si hay discrepancias o queries fallidas, menciónalas con transparencia.
+3. VERIFICA EL INFORME: Contrasta el informe del Researcher con los "Datos crudos de apoyo (SQL results)". Si hay discrepancias o queries fallidas, menciónalas con transparencia. Prevalecen los datos crudos sobre el informe si hay contradicción.
 4. FORMATO EJECUTIVO: Usa **negritas** para resaltar KPIs clave y tablas Markdown para comparaciones de múltiples valores.
 5. TONO: Profesional, persuasivo y orientado a la toma de decisiones.
-""")
+"""
     else:
-        return SystemMessage(content="""
-Eres un Analista de Negocio Senior. Recibes datos estructurados de MÚLTIPLES consultas SQL independientes.
+        content = f"""
+Eres un Analista de Negocio Senior. Recibes datos estructurados de una o varias consultas SQL independientes.
 Debes redactar UNA respuesta coherente que integre todos los hallazgos y responda directamente la pregunta del usuario.
 
+{multi_query_section}
+
 REGLAS ABSOLUTAS:
-1. CERO ALUCINACIONES: Utiliza ÚNICAMENTE los datos provistos. Si una consulta devolvió 0 filas (lista vacía []), indícalo claramente: "No se registraron registros para los criterios solicitados".
+1. CERO ALUCINACIONES: Utiliza ÚNICAMENTE los datos provistos. Si una consulta devolvió 0 filas, indícalo claramente: "No se registraron registros para los criterios solicitados".
 2. NO RECALCULES: No calcules porcentajes, sumas o promedios manuales. Cíñete a las métricas que el SQL ya devolvió.
 3. RESPUESTA DIRECTA: Comienza con la respuesta directa a la pregunta en la primera oración.
 4. FORMATO EJECUTIVO:
-   - Usa **negritas** para resaltar KPIs clave (ej. **$1,250,000**, **14%**).
+   - Usa **negritas** para resaltar KPIs clave (ej. **$1.250.000**, **14%**).
    - Si hay comparación de múltiples valores o dimensiones, usa tablas Markdown breves.
    - No escribas párrafos gigantescos llenos de números crudos.
 5. TONO: Profesional, analítico y conversacional orientado a decisiones ("Esto sugiere que...", "El volumen se concentra en...").
 6. ADVERTENCIAS: Si los resultados incluyen warnings del sistema, menciónalos solo si afectan la interpretación de los datos.
-""")
+"""
+
+    return SystemMessage(content=content)
 
 
 @traceable(name="Analyst: Generate Final Answer")
 def analyst_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    question = state["question"]
+    question = state.get("question", "")
     results = state.get("sql_results", []) or []
     research_findings = state.get("research_findings")
     plan = state.get("plan")
     forecast_results = state.get("forecast_results")
     forecast_error = state.get("forecast_error")
 
-    # NUEVO: leer instrucción del supervisor
     instruction = state.get("next_agent_instruction") or state.get("supervisor_instruction")
     wants_educated_guess = _is_educated_guess_instruction(instruction)
     wants_partial_answer = _is_partial_answer_instruction(instruction)
-
-    # Detectar si la situación objetivamente amerita respuesta parcial
     objective_partial = _has_partial_data(results)
+    is_multi_query = bool(plan and _get_attr(plan, "question_type") == "multi_query")
 
     if instruction:
         logger.info(f"[Analyst] Instrucción del supervisor: {instruction[:200]}...")
@@ -326,13 +379,18 @@ REGLAS ABSOLUTAS:
 
         data_context = _build_forecast_context(question, forecast_results, forecast_error)
 
-        response = LLM.invoke([system, HumanMessage(content=data_context)])
+        try:
+            response = LLM.invoke([system, HumanMessage(content=data_context)])
+            final_text = response.content
+        except Exception as e:
+            logger.error(f"[Analyst] Error en LLM (forecast): {e}")
+            final_text = "Ocurrió un error al procesar el pronóstico de demanda. Por favor, intenta nuevamente."
 
         return {
-            "final_answer": response.content,
+            "final_answer": final_text,
             "last_agent": "analyst",
-            "messages": [AIMessage(content=response.content, name="analyst")],
-            "next_agent_instruction": None,  # ← NUEVO: limpiar instrucción consumida
+            "messages": [AIMessage(content=final_text, name="analyst")],
+            "next_agent_instruction": None,
         }
 
     # ------------------------------------------------------------------
@@ -343,7 +401,7 @@ REGLAS ABSOLUTAS:
             "final_answer": "No fue posible obtener datos para responder tu consulta.",
             "last_agent": "analyst",
             "messages": [AIMessage(content="[Analyst] Sin datos ni research findings para analizar.")],
-            "next_agent_instruction": None,  # ← NUEVO
+            "next_agent_instruction": None,
         }
 
     # ------------------------------------------------------------------
@@ -353,17 +411,28 @@ REGLAS ABSOLUTAS:
     successful = [r for r in results if _get_attr(r, "status") == "success"]
     empty_successful = [r for r in successful if _get_attr(r, "row_count", 0) == 0]
 
-    # Si TODO falló y no hay research → error técnico (a menos que supervisor pida educated guess)
     if errors and not successful and not research_findings and not wants_educated_guess:
         err_msgs = "; ".join([
             f"Tarea {_get_attr(e, 'task_id', '?')}: {_get_attr(e, 'error_message', '')}"
             for e in errors
         ])
+
+        system = SystemMessage(content="""
+Eres un Analista de Negocio Senior. Las consultas SQL fallaron todas. Redacta una respuesta breve, profesional y útil para el usuario.
+No incluyas detalles técnicos internos, stack traces ni nombres de vistas. Explica de forma general qué ocurrió y qué puede intentar.
+""")
+        try:
+            response = LLM.invoke([system, HumanMessage(content=f"Pregunta: {question}\nError técnico interno: {err_msgs}")])
+            final_text = response.content
+        except Exception as e:
+            logger.error(f"[Analyst] Error en LLM (error técnico): {e}")
+            final_text = "Hubo un problema técnico al consultar los datos. Por favor, verifica la pregunta o intenta más tarde."
+
         return {
-            "final_answer": f"Encontré problemas técnicos en las consultas: {err_msgs}",
+            "final_answer": final_text,
             "last_agent": "analyst",
-            "messages": [AIMessage(content="[Analyst] Reportando errores técnicos.")],
-            "next_agent_instruction": None,  # ← NUEVO
+            "messages": [AIMessage(content=final_text, name="analyst")],
+            "next_agent_instruction": None,
         }
 
     # ------------------------------------------------------------------
@@ -378,8 +447,26 @@ REGLAS ABSOLUTAS:
         system = _build_partial_answer_system()
         mode_label = "PARTIAL_ANSWER"
     else:
-        system = _build_normal_answer_system(research_mode=research_mode)
+        system = _build_normal_answer_system(multi_query=is_multi_query, research_mode=research_mode)
         mode_label = "FINAL_ANSWER"
+
+    # Notas contextuales
+    multi_query_note = ""
+    if is_multi_query:
+        multi_query_note = (
+            f"\n--- MODO MULTI-QUERY ---\n"
+            f"La pregunta fue dividida en {len(results)} subtareas SQL independientes. "
+            f"Integra sus resultados en una respuesta coherente. "
+            f"Menciona explícitamente si alguna subtarea no aportó datos.\n"
+        )
+
+    empty_note = ""
+    if empty_successful and not any(_get_attr(r, "row_count", 0) > 0 for r in results):
+        empty_note = (
+            "\n\nNOTA IMPORTANTE: Todas las consultas SQL se ejecutaron correctamente, "
+            "pero ninguna devolvió registros para los filtros indicados. "
+            "Responde con honestidad que no hay datos disponibles para el período o criterios solicitados."
+        )
 
     if research_mode:
         data_context = f"""
@@ -390,12 +477,14 @@ Pregunta original: {question}
 
 --- MODO DE RESPUESTA ---
 {mode_label}
+{multi_query_note}
 
 --- INFORME DEL RESEARCHER ---
 {research_findings}
 
 --- DATOS CRUDOS DE APOYO (SQL results) ---
 {_build_sql_context(results, question)}
+{empty_note}
 """
     else:
         data_context = f"""
@@ -406,29 +495,31 @@ Pregunta original: {question}
 
 --- MODO DE RESPUESTA ---
 {mode_label}
+{multi_query_note}
 
 {_build_sql_context(results, question)}
+{empty_note}
 """
 
-        # Caso especial: todas las consultas exitosas devolvieron 0 filas
-        if empty_successful and not any(_get_attr(r, "row_count", 0) > 0 for r in results):
-            data_context += (
-                "\n\nNOTA IMPORTANTE: Todas las consultas SQL se ejecutaron correctamente, "
-                "pero ninguna devolvió registros para los filtros indicados. "
-                "Responde con honestidad que no hay datos disponibles para el período o criterios solicitados."
-            )
-
     # ------------------------------------------------------------------
-    # 4. Invocar LLM
+    # 4. Invocar LLM con control de errores
     # ------------------------------------------------------------------
-    response = LLM.invoke([system, HumanMessage(content=data_context)])
+    try:
+        response = LLM.invoke([system, HumanMessage(content=data_context)])
+        final_text = response.content
+    except Exception as e:
+        logger.error(f"[Analyst] Error en LLM: {e}")
+        final_text = (
+            "Ocurrió un error al procesar y sintetizar los datos analíticos para tu consulta. "
+            "Esto puede deberse a que la respuesta fue demasiado grande. Intenta reformular la pregunta de forma más específica."
+        )
 
     # ------------------------------------------------------------------
     # 5. Retornar estado
     # ------------------------------------------------------------------
     return {
-        "final_answer": response.content,
+        "final_answer": final_text,
         "last_agent": "analyst",
-        "messages": [AIMessage(content=response.content, name="analyst")],
-        "next_agent_instruction": None,  # ← NUEVO
+        "messages": [AIMessage(content=final_text, name="analyst")],
+        "next_agent_instruction": None,
     }
