@@ -9,10 +9,6 @@ from langsmith import traceable
 
 
 def _get(obj: Any, attr: str, default: Any = None) -> Any:
-    """
-    Lee atributos de objetos Pydantic o claves de diccionarios.
-    Esencial porque LangGraph serializa el estado a dicts entre nodos.
-    """
     if obj is None:
         return default
     if isinstance(obj, dict):
@@ -21,11 +17,6 @@ def _get(obj: Any, attr: str, default: Any = None) -> Any:
 
 
 def _is_new_topic(question: str, previous_question: Optional[str]) -> bool:
-    """
-    Heurística simple para detectar si el usuario quiere cambiar de tema.
-    Útil para reiniciar el plan en el mismo thread cuando el contexto previo
-    ya no es relevante.
-    """
     if not previous_question:
         return False
 
@@ -37,7 +28,6 @@ def _is_new_topic(question: str, previous_question: Optional[str]) -> bool:
 
 
 def _extract_last_user_question(messages: List[Any]) -> Optional[str]:
-    """Extrae la última pregunta del usuario del historial."""
     if not messages:
         return None
     for msg in reversed(messages):
@@ -48,10 +38,6 @@ def _extract_last_user_question(messages: List[Any]) -> Optional[str]:
 
 @traceable(name="Supervisor: Route Next Agent")
 def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-    """
-    Supervisor de routing puro. NO gestiona límite de iteraciones ni guards;
-    esa responsabilidad ahora reside en safe_supervisor_node (orchestrator.py).
-    """
     render_attempts = state.get("render_attempts", 0)
 
     def make_update(next_node: str, **extra) -> Dict[str, Any]:
@@ -99,7 +85,6 @@ def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
                 "El usuario cambió de tema. Genera un plan completamente nuevo "
                 "para la nueva pregunta, descartando el contexto anterior."
             ),
-            # FIX: devolver solo el mensaje nuevo para no duplicar con add_messages
             messages=[
                 AIMessage(content="[Supervisor] Nuevo tema detectado; reiniciando planificación.")
             ]
@@ -215,7 +200,50 @@ def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             next_agent_instruction="Realiza una exploración profunda con múltiples queries SQL autocontenidas y genera un informe ejecutivo completo."
         )
 
-    # 4. Con plan pero sin resultados SQL → SQL Agent
+    # ------------------------------------------------------------------
+    # 4. Con plan: ejecutar subtareas SQL pendientes
+    # ------------------------------------------------------------------
+    plan_tasks = _get(plan, "tasks", []) or []
+
+    if plan_tasks:
+        # Índice de resultados existentes por task_id
+        results_by_task: Dict[str, Any] = {}
+        for r in (sql_results or []):
+            tid = str(_get(r, "task_id", ""))
+            if tid:
+                results_by_task[tid] = r
+
+        pending_tasks = []
+        for t in plan_tasks:
+            tid = str(_get(t, "task_id", ""))
+            res = results_by_task.get(tid)
+
+            # Si no hay resultado o no es útil, la tarea está pendiente
+            if res is None:
+                pending_tasks.append(t)
+                continue
+
+            status_ok = _get(res, "status") in ("success", "partial")
+            useful = _get(res, "can_answer", False)
+            if not (status_ok and useful):
+                pending_tasks.append(t)
+
+        if pending_tasks:
+            pending_ids = [str(_get(t, "task_id")) for t in pending_tasks]
+            logger.info(
+                f"[Supervisor] Ruteando a SQL Agent - "
+                f"Faltan {len(pending_tasks)} tareas por ejecutar/validar de {len(plan_tasks)} "
+                f"(ids: {pending_ids})"
+            )
+            return make_update(
+                "sql_agent",
+                next_agent_instruction=(
+                    f"Ejecuta las tareas pendientes del plan. "
+                    f"Quedan {len(pending_tasks)} subtareas por procesar: {', '.join(pending_ids)}."
+                )
+            )
+
+    # Fallback legacy: plan sin tasks explícitas
     if not sql_results:
         if last_agent == "sql_agent":
             logger.warning("[Supervisor] SQL Agent ya ejecutó pero no hay resultados. Forzando analyst.")

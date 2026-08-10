@@ -358,8 +358,11 @@ def build_harness_context_node(state: OrchestratorState, **kwargs) -> Orchestrat
     }
 
 
+# core/orchestrator.py
+# Reemplaza la función sql_agent_wrapper por esta versión
+
 @traceable(name="Orchestrator: Execute SQL Tasks")
-def sql_agent_wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:
+def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorState":
     logger.info(f"[SQL Agent Wrapper] Iniciando. Plan presente: {state.get('plan') is not None}")
 
     instruction = state.get("next_agent_instruction")
@@ -378,7 +381,7 @@ def sql_agent_wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:
         }
 
     plan = state["plan"]
-    tasks = plan.tasks if hasattr(plan, "tasks") else plan.get("tasks", [])
+    tasks = _get(plan, "tasks", []) or []
 
     if not tasks:
         return {
@@ -391,11 +394,53 @@ def sql_agent_wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:
             "messages": [AIMessage(content="[SQL Agent] Plan sin tareas SQL.")]
         }
 
-    results: List[SQLContract] = []
+    # ------------------------------------------------------------------
+    # MULTI_QUERY: reutilizar resultados previos exitosos
+    # ------------------------------------------------------------------
+    existing_results = state.get("sql_results", []) or []
+    results_by_id: Dict[str, SQLContract] = {}
+
+    for r in existing_results:
+        tid = str(_get(r, "task_id", ""))
+        if tid:
+            results_by_id[tid] = r
+
+    tasks_to_run = []
+    for t in tasks:
+        tid = str(_get(t, "task_id", ""))
+        res = results_by_id.get(tid)
+
+        is_successful = (
+            res is not None
+            and _get(res, "status") in ("success", "partial")
+            and _get(res, "can_answer", False)
+        )
+
+        if not is_successful:
+            tasks_to_run.append(t)
+
     harness_ctx = state.get("harness_context", {})
     global_semantic_context = state.get("semantic_context", harness_ctx.get("semantic_context", ""))
 
-    for idx, task in enumerate(tasks):
+    # Si no hay nada pendiente, devolver los resultados existentes
+    if not tasks_to_run:
+        all_success = all(
+            _get(r, "status") in ("success", "partial") and _get(r, "can_answer", False)
+            for r in results_by_id.values()
+        )
+        summary = " | ".join([
+            f"T{tid}:{_get(r, 'status')}({_get(r, 'row_count', 0)})"
+            for tid, r in results_by_id.items()
+        ])
+        return {
+            "sql_results": list(results_by_id.values()),
+            "last_agent": "sql_agent",
+            "messages": [
+                AIMessage(content=f"[SQL Agent] 0 tareas nuevas. OK={all_success} | {summary}")
+            ]
+        }
+
+    for idx, task in enumerate(tasks_to_run):
         payload = task.dict() if hasattr(task, "dict") else dict(task)
         candidate_views = getattr(task, "candidate_views", None) or state.get("allowed_views", [])
         preferred = getattr(task, "preferred_view", None) or state.get("preferred_view")
@@ -439,7 +484,8 @@ def sql_agent_wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:
                 needs_followup=True
             )
 
-        contract.task_id = getattr(task, "task_id", idx + 1)
+        task_id = getattr(task, "task_id", idx + 1)
+        contract.task_id = task_id
         contract.allowed_views = candidate_views
         contract.preferred_view = preferred
         contract.semantic_context_used = (
@@ -448,22 +494,28 @@ def sql_agent_wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:
             else global_semantic_context
         )
 
-        results.append(contract)
+        results_by_id[str(task_id)] = contract
         logger.info(
-            f"[SQL Agent Wrapper] Tarea {idx + 1} finalizada: "
+            f"[SQL Agent Wrapper] Tarea {task_id} finalizada: "
             f"status={contract.status} can_answer={contract.can_answer} rows={contract.row_count}"
         )
 
-    all_success = all(r.status in ("success", "partial") and r.can_answer for r in results)
-    summary = " | ".join([f"T{r.task_id}:{r.status}({r.row_count})" for r in results])
+    final_results = [results_by_id[str(_get(t, "task_id"))] for t in tasks if str(_get(t, "task_id")) in results_by_id]
+
+    all_success = all(
+        _get(r, "status") in ("success", "partial") and _get(r, "can_answer", False)
+        for r in final_results
+    )
+    summary = " | ".join([f"T{r.task_id}:{r.status}({r.row_count})" for r in final_results])
 
     return {
-        "sql_results": results,
+        "sql_results": final_results,
         "last_agent": "sql_agent",
         "messages": [
-            AIMessage(content=f"[SQL Agent] {len(results)} tareas ejecutadas. OK={all_success} | {summary}")
+            AIMessage(content=f"[SQL Agent] {len(final_results)} tareas en total. OK={all_success} | {summary}")
         ]
     }
+
 
 
 def viz_agent_node(state: OrchestratorState, **kwargs) -> OrchestratorState:

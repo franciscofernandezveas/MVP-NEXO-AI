@@ -23,6 +23,10 @@ class SQLPayload(BaseModel):
         default=None,
         description="Vista elegida por el planner como principal (debe estar en candidate_views)"
     )
+    depends_on: List[str] = Field(
+        default_factory=list,
+        description="IDs de tareas previas cuyos resultados requiere esta subtarea"
+    )
 
 
 class ResearchPlan(BaseModel):
@@ -47,7 +51,7 @@ class PlannerContract(BaseModel):
     goal: str
     question_type: Literal[
         "aggregation", "comparison", "trend", "lookup", "unknown",
-        "multi_query", "deep_research", "demand_forecast"  # <-- NUEVO
+        "multi_query", "deep_research", "demand_forecast"
     ]
     metrics: List[str]
     dimensions: List[str]
@@ -78,7 +82,6 @@ class SQLContract(BaseModel):
     needs_followup: bool = False
     warnings: List[str] = Field(default_factory=list)
 
-    # Trazabilidad de la decisión de vista
     allowed_views: List[str] = Field(
         default_factory=list,
         description="Vistas que el harness/planner autorizaron para esta ejecución"
@@ -120,14 +123,10 @@ class SupervisorDecision(BaseModel):
     next_agent: Literal[
         "planner", "sql_agent", "analyst", "viz_agent",
         "render_plotly", "viz_approval", "researcher",
-        "forecaster",  # <-- NUEVO
+        "forecaster",
         "FINISH"
     ]
 
-
-# ------------------------------------------------------------------
-# NUEVOS CONTRATOS PARA DEMAND FORECASTING
-# ------------------------------------------------------------------
 
 class ForecastRequest(BaseModel):
     """Parámetros para solicitar una predicción de demanda."""
@@ -145,10 +144,6 @@ class ForecastResult(BaseModel):
     safety_stock: float = 0.0
     error: Optional[str] = None
 
-
-# ------------------------------------------------------------------
-# CONTRATO DE VISUALIZACIÓN
-# ------------------------------------------------------------------
 
 class VizSpecContract(BaseModel):
     """Contrato de salida del Viz Agent."""
@@ -172,14 +167,8 @@ class VizSpecContract(BaseModel):
     suitable_for_visualization: bool = True
 
 
-# ------------------------------------------------------------------
-# HARNESS CONTEXT
-# ------------------------------------------------------------------
-
 class HarnessContext(BaseModel):
-    """
-    Paquete de contexto que la capa de harness construye antes del planner.
-    """
+    """Paquete de contexto que la capa de harness construye antes del planner."""
     question: str
     intent: str = ""
     task_type: str = "single_view"
@@ -204,6 +193,7 @@ class HarnessContext(BaseModel):
         description="Reglas estables parseadas desde AGENTS.md"
     )
 
+
 class FactItem(BaseModel):
     """Hecho o suposición razonada con trazabilidad."""
     content: str
@@ -213,8 +203,6 @@ class FactItem(BaseModel):
     ]
     verified: bool = False
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-
-
 
 
 class TaskLedger(BaseModel):
@@ -240,6 +228,3 @@ class ProgressLedger(BaseModel):
     next_agent: Optional[str] = None
     instruction: Optional[str] = None
     unproductive_loop_detected: bool = False
-
-
-    
