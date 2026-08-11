@@ -1,5 +1,5 @@
 from typing import Any, List, Optional, Literal, Dict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SQLPayload(BaseModel):
@@ -165,6 +165,23 @@ class VizSpecContract(BaseModel):
     reasoning: str
     error_message: Optional[str] = None
     suitable_for_visualization: bool = True
+
+    @field_validator("orientation", mode="before")
+    @classmethod
+    def default_orientation(cls, v):
+        """Si el LLM envía None o un valor vacío, se fuerza a 'v' por defecto."""
+        if v is None or v not in ["v", "h"]:
+            return "v"
+        return v
+
+    @field_validator("figure_spec", mode="before")
+    @classmethod
+    def ensure_figure_spec_orientation(cls, v, values):
+        """Asegura que el diccionario figure_spec también tenga la orientación correcta."""
+        if isinstance(v, dict):
+            orientation = values.data.get("orientation", "v")
+            v["orientation"] = orientation
+        return v
 
 
 class HarnessContext(BaseModel):

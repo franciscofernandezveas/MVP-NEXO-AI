@@ -149,6 +149,19 @@ def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             messages=[AIMessage(content="[Supervisor] Render previo no aplicable, continuando.")]
         )
 
+    # === PREVENCIÓN DE REPLANIFICACIÓN ANTE ERROR DE VIZ AGENT (NUEVO) ===
+    if viz_result and _get(viz_result, "status") == "error" and not viz_rendered:
+        logger.warning("[Supervisor] Viz Agent devolvió error. Derivando directo a analyst.")
+        return make_update(
+            "analyst",
+            viz_rendered=True,
+            next_agent_instruction=(
+                "El subsistema de visualización reportó un error generando el gráfico. "
+                "Entrega la respuesta final en formato texto o tabla basándote exclusivamente en los resultados SQL disponibles."
+            ),
+            messages=[AIMessage(content="[Supervisor] Error en Viz Agent, omitiendo gráficos y derivando a analista.")]
+        )
+
     # === RUTAS DE FLUJO ===
 
     # 1. Sin plan → Planner
