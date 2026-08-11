@@ -241,7 +241,7 @@ def _is_chitchat(question: Optional[str]) -> bool:
 def _generate_chitchat_response(question: str) -> str:
     q = question.lower().strip()
     if re.search(r'^(hola|buenos días|buenas tardes|buenas noches|hey|hi|hello)', q):
-        return "¡Hola! Soy tu asistente de análisis de datos. ¿En qué puedo ayudarte hoy?"
+        return "¡Hola! Soy tu Capo. ¿En qué puedo ayudarte hoy?"
     if re.search(r'^(cómo estás|como estas|qué tal|que tal)', q):
         return "¡Estoy listo para ayudarte! ¿Qué información necesitas consultar?"
     if re.search(r'^(quién eres|quien eres|qué eres|que eres|qué puedes hacer|que puedes hacer|para qué sirves)', q):
