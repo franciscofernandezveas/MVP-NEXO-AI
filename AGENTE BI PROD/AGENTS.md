@@ -8,8 +8,10 @@
 
 ## 1. Directivas de Comportamiento (Reglas de Oro)
 
-### 1.1 Prioridad de Vistas
-- `_latest` / `_day` / `current`: Snapshot actual. **NO filtrar por fecha**.
+### 1.1 Prioridad de Vistas y Filtrado por Fecha (CRÍTICO)
+- **Regla de Rangos de Fecha:** Si el usuario menciona un rango explícito (ej. "junio 2026", "últimos 90 días", "último mes", "ayer", "fines de semana"), **SIEMPRE** debes usar una vista `historical` (ej. `sales_review_locales`, `sales_producto_daily`, `mart_operacion_hora`). 
+- **PROHIBIDO usar vistas `_latest`, `sales_review_day`, o `_week`** cuando se solicita un periodo diferente a "hoy" o "el snapshot actual". 
+- `_latest` / `_day` / `current`: Snapshot actual. **NO filtrar por fecha**. Solo para "hoy" o "resumen actual".
 - `_history` / `_historical`: Siempre requiere filtro por rango de fechas.
 - `dashboard_*`: Vistas pre-agrupadas con lógica de negocio embebida. Verificar si fijan el periodo.
 - `compare_periods` (`sales_week`): No requiere filtro; la comparativa ya está calculada.
@@ -22,14 +24,13 @@
   - Métricas de productos/unidades (`unidades_vendidas`, `cantidad`, `producto`) vienen de `dw.fact_ventas`.
 
 ### 1.3 Anti-patrones (PROHIBIDO)
+- Usar `sales_review_locales_latest` para consultar meses pasados o rangos de fechas (ej. "junio 2026" o "últimos 90 días"). Para rangos históricos, usa obligatoriamente `sales_review_locales`.
 - Filtrar por fecha vistas `_latest`, `sales_review_day`, `sales_week` o `dashboard_canjes_resumen`.
 - Usar `sales_review_day_history` para "hoy". Para hoy usar `sales_review_day`.
 - Usar una columna `franja_horaria` en `mart_operacion_hora`; no existe. Usar `hora`.
 - Usar `dashboard_participacion_categorias` como si tuviera las mismas columnas que `kpi_categorias_diario`.
 
 ---
-
-## 2. Taxonomía de Vistas (Mapeo por Intención)
 
 ## 2. Taxonomía de Vistas (Diccionario de Intenciones y Mapeo Semántico)
 
@@ -151,6 +152,12 @@ Cuando el usuario formule una pregunta, mapea su intención a la vista técnica 
   - `transacciones`: Cantidad de transacciones en esa hora.
   - `ingreso`: Suma monetaria de transacciones en esa hora.
   - `ticket_promedio`: Promedio de venta por transacción en esa hora.
+- **Reglas de SQL para intenciones comunes (POSTGRESQL)**:
+  - **"Horas pico"**: Usar `ORDER BY transacciones DESC LIMIT N`.
+  - **"Fines de semana" (Sábado/Domingo)**: Filtrar usando `EXTRACT(ISODOW FROM fecha) IN (6, 0)`.
+  - **"Días de semana" (Lunes-Viernes)**: Filtrar usando `EXTRACT(ISODOW FROM fecha) IN (1, 2, 3, 4, 5)`.
+  - **"Ayer"**: Filtrar usando `fecha = CURRENT_DATE - INTERVAL '1 day'`.
+  - **"Último mes"**: Filtrar usando `fecha >= CURRENT_DATE - INTERVAL '1 month'`.
 
 ### dashboard_canjes_resumen
 - **Descripción**: Resumen mensual de canjes del programa de fidelización.
@@ -250,5 +257,5 @@ Cuando el usuario formule una pregunta, mapea su intención a la vista técnica 
 - Formato: `YYYY-MM-DD`.
 - Rango mensual recomendado:
   ```sql
-  WHERE fecha >= '2024-06-01'
-    AND fecha < '2024-07-01'
+  WHERE fecha >= '2026-06-01'
+    AND fecha < '2026-07-01'

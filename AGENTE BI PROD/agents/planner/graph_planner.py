@@ -584,20 +584,29 @@ REGLAS CRÍTICAS DE SELECCIÓN DE VISTA:
 4. Si la pregunta pide desglose por SEDE/LOCAL, elige vistas que tengan 'sucursal', 'nombre_sede' o similar.
 5. Si la pregunta pide desglose por CATEGORÍA, elige vistas que tengan 'categoria'.
 6. SEGURIDAD: Usa ÚNICAMENTE vistas presentes en el catálogo de arriba. NO inventes vistas.
+7. **REGLA TEMPORAL CRÍTICA:** Si el usuario menciona un rango de fechas explícito (ej. "junio 2026", "últimos 90 días", "ayer", "fines de semana"), DEBES seleccionar una vista de tipo `historical` (como `sales_review_locales` o `mart_operacion_hora`). NUNCA uses vistas `_latest`, `_day` o `current` si se solicita un periodo histórico.
 
 REGLAS DE MULTI-QUERY / DESCOMPOSICIÓN:
-7. Cuando la pregunta involucre comparar métricas de distintas fuentes, cruzar datos temporales complejos o requiera buscar en múltiples tablas/vistas, configura `question_type = "multi_query"` y genera **múltiples `SQLPayload` independientes** en `tasks`.
-8. Ejemplo: *"las ventas de café en Merced y además el ticket promedio en Tajamar en junio"* → tarea 1 (ventas café en Merced) y tarea 2 (ticket promedio Tajamar en junio), cada una con su `preferred_view`, métricas y filtros.
-9. Si una subtarea necesita el resultado de otra (por ejemplo, filtrar los top 10 productos de la primera), anota `depends_on` con los `task_id` previos.
-10. NO DESCOMPONGAS si es la misma intención, misma granularidad y misma temporalidad.
-11. Si la pregunta del usuario no requiere generar consulta, no digas que ha fallado el plan.
-12. Si el usuario hace preguntas como 'Hola', 'cómo estás?' o 'quién eres?' responde cordialmente; no se necesitan consultas para estas preguntas.
-13. Si el supervisor solicita REPLANIFICACIÓN (instrucción de replan arriba), genera un plan ALTERNO: cambia de vista, simplifica la pregunta, o divide en subtareas más pequeñas. NO repitas el plan anterior.
+8. Cuando la pregunta involucre comparar métricas de distintas fuentes, cruzar datos temporales complejos o requiera buscar en múltiples tablas/vistas, configura `question_type = "multi_query"` y genera **múltiples `SQLPayload` independientes** en `tasks`.
+9. Ejemplo: *"las ventas de café en Merced y además el ticket promedio en Tajamar en junio"* → tarea 1 (ventas café en Merced) y tarea 2 (ticket promedio Tajamar en junio), cada una con su `preferred_view`, métricas y filtros.
+10. Si una subtarea necesita el resultado de otra (por ejemplo, filtrar los top 10 productos de la primera), anota `depends_on` con los `task_id` previos.
+11. NO DESCOMPONGAS si es la misma intención, misma granularidad y misma temporalidad.
+12. Si la pregunta del usuario no requiere generar consulta, no digas que ha fallado el plan.
+13. Si el usuario hace preguntas como 'Hola', 'cómo estás?' o 'quién eres?' responde cordialmente; no se necesitan consultas para estas preguntas.
+14. Si el supervisor solicita REPLANIFICACIÓN (instrucción de replan arriba), genera un plan ALTERNO: cambia de vista, simplifica la pregunta, o divide en subtareas más pequeñas. NO repitas el plan anterior.
 
 REGLAS DE NEGOCIO:
 - "Se han vendido" / "ventas" / "unidades vendidas" → vistas de VENTAS NORMALES.
 - "Canjes", "fidelización", "puntos" → vistas de FIDELIZACIÓN.
 - "Cortesías", "gratis", "regalos" → vistas de CORTESÍA.
+
+REGLAS DE DEMANDA POR HORA:
+- Para preguntas sobre "horas pico", "fines de semana", o volumen por hora, usa obligatoriamente `mart_operacion_hora`.
+- En el campo `task` o `filters_description`, indica explícitamente al SQL Agent cómo construir la query:
+  - "Fines de semana": Filtrar usando `EXTRACT(ISODOW FROM fecha) IN (6, 0)`.
+  - "Días de semana": Filtrar usando `EXTRACT(ISODOW FROM fecha) IN (1, 2, 3, 4, 5)`.
+  - "Horas pico": Ordenar por `transacciones DESC LIMIT N`.
+  - "Ayer": `fecha = CURRENT_DATE - INTERVAL '1 day'`.
 
 OUTPUT: JSON con schema PlannerContract.
 - tasks: lista de SQLPayload con task_id, task, execution_strategy, metrics, dimensions, candidate_views, preferred_view, depends_on (si aplica).
