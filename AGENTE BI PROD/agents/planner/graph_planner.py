@@ -577,6 +577,11 @@ INSTRUCCIÓN DEL SUPERVISOR:
 {replan_context if is_replan else ""}
 {"=" * 60 if is_replan else ""}
 
+REGLA DE PREDICCIÓN (FORECAST) - CRÍTICO:
+- SOLO usa `question_type="demand_forecast"` si el usuario pide explícitamente PREDECIR EL FUTURO (ej. "pronosticar", "predecir ventas", "cómo van a ir las ventas la próxima semana", "demanda futura").
+- NUNCA uses `demand_forecast` para consultas históricas. 
+- "Horas de mayor demanda", "Demanda por hora", "Volumen de transacciones por hora" son consultas HISTÓRICAS. Usa `mart_operacion_hora` para esto y `question_type="aggregation"` o `"multi_query"`.
+
 REGLAS CRÍTICAS DE SELECCIÓN DE VISTA:
 1. ANTES de asignar una vista a una tarea, verifica en el catálogo de arriba que esa vista contenga EXPLÍCITAMENTE las columnas que la tarea requiere.
 2. NUNCA asignes una vista si la columna requerida no aparece en su lista de métricas/columnas.
@@ -601,10 +606,11 @@ REGLAS DE NEGOCIO:
 - "Cortesías", "gratis", "regalos" → vistas de CORTESÍA.
 
 REGLAS DE DEMANDA POR HORA:
-- Para preguntas sobre "horas pico", "fines de semana", o volumen por hora, usa obligatoriamente `mart_operacion_hora`.
+- Para preguntas sobre "horas pico", "días martes", "fines de semana", o volumen por hora, usa obligatoriamente `mart_operacion_hora`.
 - En el campo `task` o `filters_description`, indica explícitamente al SQL Agent cómo construir la query:
   - "Fines de semana": Filtrar usando `EXTRACT(ISODOW FROM fecha) IN (6, 0)`.
-  - "Días de semana": Filtrar usando `EXTRACT(ISODOW FROM fecha) IN (1, 2, 3, 4, 5)`.
+  - "Días de semana" (Lunes-Viernes): Filtrar usando `EXTRACT(ISODOW FROM fecha) IN (1, 2, 3, 4, 5)`.
+  - "Días Martes": Filtrar usando `EXTRACT(ISODOW FROM fecha) = 2`.
   - "Horas pico": Ordenar por `transacciones DESC LIMIT N`.
   - "Ayer": `fecha = CURRENT_DATE - INTERVAL '1 day'`.
 
@@ -626,6 +632,14 @@ REGLAS ADICIONALES:
         plan = PlannerContract(**plan_raw)
     else:
         plan = plan_raw
+
+    # ============================================================
+    # SAFEGUARD: Evitar alucinación de Forecasting en queries históricas
+    # ============================================================
+    if plan.question_type == "demand_forecast" and not _is_demand_forecast_question(contextual_question):
+        logger.warning("[Planner] LLM clasificó como demand_forecast erróneamente. Forzando replanificación normal.")
+        plan.question_type = "multi_query"
+        plan.tasks = []  # Forzamos al fallback a crear tareas reales usando vistas históricas
 
     # ============================================================
     # VALIDACIÓN Y ENRIQUECIMIENTO SEMÁNTICO POST-LLM
