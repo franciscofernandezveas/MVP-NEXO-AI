@@ -31,22 +31,31 @@
 
 ## 2. Taxonomía de Vistas (Mapeo por Intención)
 
-| Intención del usuario | Vista a usar | Filtro de fecha |
-|:---|:---|:---:|
-| **Hoy / Ayer / Resumen actual** | `sales_review_day` | **N/A** |
-| **Ventas por sede (snapshot actual)** | `sales_review_locales_latest` | **N/A** |
-| **Comparativa semanal** | `sales_week` | **N/A** |
-| **Tendencias / histórico diario** | `sales_review_day_history` | Rango |
-| **Ventas por local histórico** | `sales_review_locales` | Rango |
-| **Productos / categorías / subcategorías** | `sales_producto_daily` | Rango |
-| **Demanda por hora / hora pico** | `mart_operacion_hora` | Rango / `CURRENT_DATE` |
-| **Fidelización - mes actual** | `dashboard_canjes_resumen` | **N/A** |
-| **Fidelización - histórico/detalle** | `kpi_fidelizacion_detalle` | Rango |
-| **Cortesías - resumen mensual** | `dashboard_cortesias_resumen` | Opcional por `mes` |
-| **Cortesías - histórico/detalle** | `kpi_cortesia_detalle` | Rango |
-| **Categorías diarias** | `kpi_categorias_diario` | Rango |
-| **Participación / subtotal diario por categoría** | `dashboard_participacion_categorias` | Rango |
-| **Categoría + producto + sede** | `kpi_categorias_productos_sede` | Rango |
+## 2. Taxonomía de Vistas (Diccionario de Intenciones y Mapeo Semántico)
+
+Cuando el usuario formule una pregunta, mapea su intención a la vista técnica correcta utilizando la siguiente tabla. La columna "Palabras clave / Preguntas típicas" te ayudará a contextualizar el lenguaje natural del usuario.
+
+| Intención Analítica | Palabras clave / Preguntas típicas del usuario | Vista a usar | Filtro de fecha | Columna de fecha |
+|:---|:---|:---|:---:|:---:|
+| **Resumen del día actual** | "¿Cómo vamos hoy?", "Ventas de ayer", "Resumen actual", "Transacciones de hoy" | `sales_review_day` | **N/A** | N/A |
+| **Snapshot de sedes actual** | "Ventas por sucursal hoy", "¿Cómo van los locales hoy?", "Snapshot actual de sedes" | `sales_review_locales_latest` | **N/A** | N/A |
+| **Comparativa semanal** | "Comparativa semanal", "Esta semana vs la pasada", "Cómo vamos esta semana" | `sales_week` | **N/A** | N/A |
+| **Tendencias diarias globales** | "Tendencia de ventas", "Histórico diario", "Evolución de ventas", "Ventas de los últimos X días" | `sales_review_day_history` | Rango | `fecha` |
+| **Histórico por sede** | "Ventas por sucursal históricas", "Desempeño por local en [mes/rango]", "Qué sucursal vendió más en [periodo]" | `sales_review_locales` | Rango | `fecha_completa` |
+| **Ventas por producto / categoría** | "Qué producto se vendió más", "Ventas por categoría", "Unidades vendidas de [producto]", "Desempeño de [producto] en [sucursal]" | `sales_producto_daily` | Rango | `fecha` |
+| **Demanda por hora (Hora Pico)** | "Hora pico", "Demanda por hora", "A qué hora vendemos más", "Transacciones por hora" | `mart_operacion_hora` | Rango / `CURRENT_DATE` | `fecha` |
+| **Fidelización (Mes actual)** | "Canjes de este mes", "Fidelización actual", "Puntos canjeados" | `dashboard_canjes_resumen` | **N/A** | N/A |
+| **Fidelización (Histórico)** | "Detalle de canjes", "Qué productos se han canjeado", "Histórico de fidelización en [rango]" | `kpi_fidelizacion_detalle` | Rango | `fecha` |
+| **Cortesías (Resumen mensual)** | "Cortesías de este mes", "Productos regalados", "Impacto de cortesías por sucursal" | `dashboard_cortesias_resumen` | Opcional (`mes`) | `mes` |
+| **Cortesías (Histórico)** | "Detalle de cortesías", "Qué se ha regalado", "Histórico de cortesías en [rango]" | `kpi_cortesia_detalle` | Rango | `fecha` |
+| **Categorías (Diario)** | "Ventas por categoría diarias", "Desempeño de categorías a lo largo del tiempo", "Evolución de [categoria]" | `kpi_categorias_diario` | Rango | `fecha` |
+| **Participación por categoría** | "Participación porcentual por categoría", "Porcentaje por categoría", "Subtotal diario por categoría" | `dashboard_participacion_categorias` | Rango | `fecha_completa` |
+| **Desglose completo (Cat+Prod+Sede)** | "Ventas por categoría, producto y sede", "Desglose completo de ventas en [rango]", "Análisis cruzado de categoría y producto por sucursal" | `kpi_categorias_productos_sede` | Rango | `fecha_venta` |
+
+### Reglas de Desambiguación
+- Si el usuario dice **"hoy"** o **"ayer"** pero pregunta por un **desglose por sucursal**, usa `sales_review_locales_latest` (no `sales_review_day`, ya que este último no tiene la dimensión sucursal).
+- Si el usuario pide **"comparativa de ventas de hoy vs ayer"** a nivel global, usa `sales_review_day` (ya expone `variacion_diaria_pct`).
+- Si el usuario pregunta por **"unidades"** o **"productos"** específicos, casi siempre requerirá un rango de fechas (`sales_producto_daily` o `kpi_categorias_productos_sede`). No uses `_latest` para esto.
 
 ---
 

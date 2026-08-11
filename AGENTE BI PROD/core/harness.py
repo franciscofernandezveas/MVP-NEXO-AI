@@ -442,14 +442,13 @@ def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optiona
     q = _normalize_question(question)
 
     keyword_map = [
-        (["venta", "vendido", "vendidos", "unidades vendidas", "ingreso"], [
-            "sales_producto_daily",
+        (["venta", "vendido", "vendidos", "unidades vendidas", "ingreso", "ingresos"], [
             "sales_review_day",
             "sales_review_day_history",
             "kpi_categorias_diario",
             "sales_week",
         ]),
-        (["producto", "categoria", "categoría", "familia", "articulo", "artículo"], [
+        (["producto", "categoria", "categoría", "familia", "articulo", "artículo", "productos"], [
             "sales_producto_daily",
             "kpi_categorias_productos_sede",
             "kpi_categorias_diario",
@@ -457,7 +456,7 @@ def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optiona
         (["sede", "local", "tienda", "sucursal", "plaza"], [
             "sales_review_locales",
             "sales_review_locales_latest",
-            "kpi_categorias_productos_sede",
+            
         ]),
         (["fidelizacion", "canje", "puntos", "fidelización"], [
             "kpi_fidelizacion_detalle",
