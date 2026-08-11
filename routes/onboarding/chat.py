@@ -339,7 +339,7 @@ async def stream_chat(request: Request, session_id: str, body: ChatRequest):
                     initial_state = _build_initial_state(question)
                     config = {
                         "configurable": {"thread_id": session_id},
-                        "recursion_limit": 50
+                        "recursion_limit": 100
                     }
 
                     yield sse_event("start")
