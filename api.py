@@ -1,9 +1,83 @@
 #!/usr/bin/env python3
-# api.py - FastAPI Server con Agente BI integrado + Auth propio + Streaming
-# v6.0.0 - Agente BI embebido, warm-up de DB, streaming real del grafo
+# api.py - FastAPI Server con Agente BI integrado + Auth propio + Streaming + LangSmith tracing
+# v6.2.0 - Variables LANGSMITH_*, decorador @traceable, instrumentación de funciones clave
+
+# ============================================================================
+# 0. CARGAR .env ANTES DE CUALQUIER IMPORT DE LANGCHAIN / LANGSMITH
+# ============================================================================
 
 import os
 import sys
+from pathlib import Path
+
+BACKEND_DIR = Path(__file__).parent.absolute()
+
+# Insertar paths PRIMERO
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
+AGENTE_BI_PATH = BACKEND_DIR / "AGENTE BI PROD"
+if AGENTE_BI_PATH.exists():
+    sys.path.insert(0, str(AGENTE_BI_PATH))
+
+# Cargar .env ANTES de imports pesados
+try:
+    from dotenv import load_dotenv
+    env_file = BACKEND_DIR / ".env"
+    if env_file.exists():
+        load_dotenv(env_file, override=True)
+        print("✅ .env cargado")
+except Exception as e:
+    print(f"⚠️ .env error: {e}")
+
+# DEBUG: Verificar que las variables de LangSmith están presentes
+print(f"🔍 LANGSMITH_TRACING    = {os.getenv('LANGSMITH_TRACING')}")
+print(f"🔍 LANGSMITH_PROJECT    = {os.getenv('LANGSMITH_PROJECT')}")
+print(f"🔍 LANGSMITH_API_KEY set= {bool(os.getenv('LANGSMITH_API_KEY'))}")
+print(f"🔍 LANGSMITH_ENDPOINT   = {os.getenv('LANGSMITH_ENDPOINT')}")
+
+# ============================================================================
+# HELPER: Configuración explícita de LangSmith
+# ============================================================================
+
+def configure_langsmith():
+    """Activa LangSmith tracing y valida configuración (prefijo LANGSMITH_*)."""
+    tracing = os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes")
+    api_key = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY")
+    project = os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT") or "default"
+    endpoint = (
+        os.getenv("LANGSMITH_ENDPOINT")
+        or os.getenv("LANGCHAIN_ENDPOINT")
+        or "https://api.smith.langchain.com"
+    )
+
+    if tracing and api_key:
+        # Seteamos tanto LANGSMITH_* como LANGCHAIN_* (compatibilidad)
+        os.environ["LANGSMITH_TRACING"] = "true"
+        os.environ["LANGSMITH_API_KEY"] = api_key
+        os.environ["LANGSMITH_PROJECT"] = project
+        os.environ["LANGSMITH_ENDPOINT"] = endpoint
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_API_KEY"] = api_key
+        os.environ["LANGCHAIN_PROJECT"] = project
+        os.environ["LANGCHAIN_ENDPOINT"] = endpoint
+        print(f"✅ LangSmith tracing ACTIVO | project={project} | endpoint={endpoint}")
+        return True
+    else:
+        missing = []
+        if not tracing:
+            missing.append("LANGSMITH_TRACING")
+        if not api_key:
+            missing.append("LANGSMITH_API_KEY")
+        print(f"⚠️ LangSmith tracing INACTIVO. Faltan: {missing}")
+        return False
+
+LANGSMITH_ENABLED = configure_langsmith()
+
+# ============================================================================
+# IMPORTS DESPUÉS DE load_dotenv()
+# ============================================================================
+
 import logging
 import shutil
 import re
@@ -14,32 +88,26 @@ import traceback
 from datetime import datetime, date, time as dt_time
 from typing import Dict, Optional, Any, List, AsyncGenerator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from uuid import uuid4, UUID
 from decimal import Decimal
 from urllib.parse import quote_plus
 
-BACKEND_DIR = Path(__file__).parent.absolute()
-if str(BACKEND_DIR) not in sys.path:
-    sys.path.insert(0, str(BACKEND_DIR))
-
-# PYTHONPATH para submódulos
-PROJECT_ROOT = BACKEND_DIR
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-AGENTE_BI_PATH = BACKEND_DIR / "AGENTE BI PROD"
-if AGENTE_BI_PATH.exists():
-    sys.path.insert(0, str(AGENTE_BI_PATH))
-
+# LangSmith SDK (decorador @traceable)
 try:
-    from dotenv import load_dotenv
-    env_file = BACKEND_DIR / ".env"
-    if env_file.exists():
-        load_dotenv(env_file, override=True)
-        print("✅ .env cargado")
+    from langsmith import traceable
+    LANGSMITH_SDK_AVAILABLE = True
+    print("✅ langsmith SDK importado")
 except Exception as e:
-    print(f"⚠️ .env error: {e}")
+    print(f"⚠️ langsmith SDK no disponible: {e}")
+    # Fallback: decorador no-op
+    def traceable(*dargs, **dkwargs):
+        def decorator(func):
+            return func
+        # Soporta uso como @traceable o @traceable(...)
+        if len(dargs) == 1 and callable(dargs[0]) and not dkwargs:
+            return dargs[0]
+        return decorator
+    LANGSMITH_SDK_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -48,7 +116,7 @@ logging.basicConfig(
 logger = logging.getLogger("api")
 
 logger.info("=" * 70)
-logger.info("🚀 INICIANDO API.PY v6.0.0 - AGENTE BI INTEGRADO")
+logger.info("🚀 INICIANDO API.PY v6.2.0 - AGENTE BI + LANGSMITH @traceable")
 logger.info("=" * 70)
 
 # ============================================================================
@@ -189,13 +257,13 @@ logger.info(f"ALLOWED_ORIGINS CORS: {ALLOWED_ORIGINS}")
 
 app = FastAPI(
     title="Nexo AI - API",
-    version="6.0.0",
-    description="API con Agente BI integrado + Auth propio + Streaming real del grafo",
+    version="6.2.0",
+    description="API con Agente BI integrado + Auth propio + Streaming + LangSmith @traceable",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -325,10 +393,21 @@ def print_event(agent, iteration: int, event: dict):
 
 
 # ============================================================================
-# 5. EJECUCIÓN DEL ORQUESTADOR (main.py adaptado)
+# 5. EJECUCIÓN DEL ORQUESTADOR (main.py adaptado) - INSTRUMENTADO
 # ============================================================================
 
-def run_bi_query(question: str, thread_id: str = "cli-session-001", silent: bool = False) -> Optional[str]:
+@traceable(
+    name="bi_query_pipeline",
+    run_type="chain",
+    tags=["bi-agent", "api", "orchestrator"]
+)
+def run_bi_query(
+    question: str,
+    thread_id: str = "cli-session-001",
+    user_id: Optional[str] = None,
+    silent: bool = False,
+) -> Optional[str]:
+    """Pipeline BI completo instrumentado con @traceable."""
     initial_state = {
         "question": question,
         "messages": [HumanMessage(content=question)],
@@ -352,7 +431,18 @@ def run_bi_query(question: str, thread_id: str = "cli-session-001", silent: bool
     }
 
     config = RunnableConfig(
-        configurable={"thread_id": thread_id},
+        configurable={
+            "thread_id": thread_id,
+            "langsmith_project": os.getenv("LANGSMITH_PROJECT", "capo"),
+        },
+        tags=["bi-agent", f"thread:{thread_id}"],
+        metadata={
+            "thread_id": thread_id,
+            "user_id": str(user_id) if user_id else "cli",
+            "service": "nexo-ai-api",
+            "environment": os.getenv("ENVIRONMENT", "production"),
+            "langsmith_enabled": LANGSMITH_ENABLED,
+        },
         recursion_limit=100
     )
 
@@ -398,7 +488,7 @@ def run_bi_query(question: str, thread_id: str = "cli-session-001", silent: bool
 
 
 # ============================================================================
-# 6. AUXILIARES DE SESIÓN, ESTADO Y SSE
+# 6. AUXILIARES DE SESIÓN, ESTADO Y SSE - INSTRUMENTADOS
 # ============================================================================
 
 class QueryRequest(BaseModel):
@@ -479,7 +569,9 @@ def detect_yes_no_response(text: str) -> Optional[bool]:
     return None
 
 
+@traceable(name="publish_chart", run_type="tool")
 def publish_generated_chart(user_id: str) -> Optional[str]:
+    """Copia el chart.png generado por el orquestador al directorio público."""
     possible_paths = [
         AGENTE_BI_PATH / "chart.png",
         BACKEND_DIR / "chart.png",
@@ -543,6 +635,35 @@ async def debug_ping():
     return {"status": "ok"}
 
 
+@app.get("/api/debug/langsmith")
+async def debug_langsmith():
+    """Endpoint de diagnóstico para verificar configuración de LangSmith."""
+    api_key = os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY") or ""
+    return {
+        "tracing_enabled": (
+            os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1", "yes")
+            or os.getenv("LANGCHAIN_TRACING_V2", "").lower() in ("true", "1", "yes")
+        ),
+        "project": os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT"),
+        "endpoint": (
+            os.getenv("LANGSMITH_ENDPOINT")
+            or os.getenv("LANGCHAIN_ENDPOINT")
+            or "https://api.smith.langchain.com"
+        ),
+        "api_key_present": bool(api_key),
+        "api_key_prefix": api_key[:10] + "..." if api_key else None,
+        "langsmith_active": LANGSMITH_ENABLED,
+        "langsmith_sdk_available": LANGSMITH_SDK_AVAILABLE,
+        "env_vars_detected": {
+            "LANGSMITH_TRACING": os.getenv("LANGSMITH_TRACING"),
+            "LANGSMITH_PROJECT": os.getenv("LANGSMITH_PROJECT"),
+            "LANGSMITH_ENDPOINT": os.getenv("LANGSMITH_ENDPOINT"),
+            "LANGCHAIN_TRACING_V2": os.getenv("LANGCHAIN_TRACING_V2"),
+            "LANGCHAIN_PROJECT": os.getenv("LANGCHAIN_PROJECT"),
+        },
+    }
+
+
 @app.get("/api/v1/system/status")
 async def get_system_status(user: User = Depends(get_current_user)):
     return JSONResponse(content={
@@ -551,7 +672,7 @@ async def get_system_status(user: User = Depends(get_current_user)):
             "extractor_available": False,
             "supabase_available": bool(supabase),
             "multiagent_available": AGENTE_BI_AVAILABLE,
-            "version": "6.0.0"
+            "version": "6.2.0"
         }
     })
 
@@ -584,9 +705,32 @@ async def stream_chat(
     base_url = str(request.base_url).rstrip('/')
     thread_id = get_or_create_thread_id(user.id)
 
+    # Config enriquecido para LangSmith (tags + metadata por usuario)
+    langsmith_config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "langsmith_project": os.getenv("LANGSMITH_PROJECT", "capo"),
+        },
+        "tags": [
+            "bi-agent",
+            "api-stream",
+            f"user:{user.id}",
+            f"thread:{thread_id}",
+        ],
+        "metadata": {
+            "user_id": str(user.id),
+            "user_email": getattr(user, "email", None),
+            "thread_id": thread_id,
+            "service": "nexo-ai-api",
+            "environment": os.getenv("ENVIRONMENT", "production"),
+            "langsmith_enabled": LANGSMITH_ENABLED,
+            "endpoint": "/api/v1/chat/stream",
+        },
+        "recursion_limit": 100,
+    }
+
     async def async_graph_stream() -> AsyncGenerator[str, None]:
         initial_state = _build_initial_state(body.question)
-        config = {"configurable": {"thread_id": thread_id}}
 
         yield sse_event("start")
 
@@ -597,7 +741,7 @@ async def stream_chat(
         final_answer_emitted = False
 
         async for state in BI_ORCHESTRATOR.astream(
-            initial_state, config, stream_mode="values"
+            initial_state, langsmith_config, stream_mode="values"
         ):
             agent = state.get("last_agent")
             iteration = state.get("iteration_count", 0)
@@ -649,11 +793,22 @@ async def stream_chat(
         yield sse_event("end", intent="BI_QUERY", success=True)
 
 
+    @traceable(
+        name="sync_bi_query_fallback",
+        run_type="chain",
+        tags=["bi-agent", "api", "fallback-sync"]
+    )
+    def run_sync_bi_query() -> Optional[str]:
+        return run_bi_query(
+            body.question,
+            thread_id=thread_id,
+            user_id=str(user.id),
+            silent=True,
+        )
+
     async def sync_fallback_stream() -> AsyncGenerator[str, None]:
         loop = asyncio.get_event_loop()
-        response_text = await loop.run_in_executor(
-            None, lambda: run_bi_query(body.question, thread_id=thread_id, silent=True)
-        )
+        response_text = await loop.run_in_executor(None, run_sync_bi_query)
 
         yield sse_event("start")
         yield sse_event("progress", node="agent", message="Procesando...")
@@ -714,11 +869,11 @@ async def stream_chat(
                     del PENDING_ACTIONS[user.id]
 
             if hasattr(BI_ORCHESTRATOR, "astream"):
-                logger.info(f"▶️ Chat stream (astream) | user={user.id} | thread={thread_id}")
+                logger.info(f"▶️ Chat stream (astream) | user={user.id} | thread={thread_id} | langsmith={LANGSMITH_ENABLED}")
                 async for payload in async_graph_stream():
                     yield payload
             else:
-                logger.info(f"▶️ Chat stream (fallback sync) | user={user.id} | thread={thread_id}")
+                logger.info(f"▶️ Chat stream (fallback sync) | user={user.id} | thread={thread_id} | langsmith={LANGSMITH_ENABLED}")
                 async for payload in sync_fallback_stream():
                     yield payload
 
@@ -766,6 +921,11 @@ async def general_exception_handler(request, exc):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🟢 API iniciada")
+    logger.info(f"🔍 LangSmith tracing: {'ACTIVO' if LANGSMITH_ENABLED else 'INACTIVO'}")
+    if LANGSMITH_ENABLED:
+        logger.info(f"🔍 LangSmith project: {os.getenv('LANGSMITH_PROJECT', 'default')}")
+        logger.info(f"🔍 LangSmith endpoint: {os.getenv('LANGSMITH_ENDPOINT')}")
+        logger.info(f"🔍 LangSmith SDK: {'disponible' if LANGSMITH_SDK_AVAILABLE else 'no disponible'}")
     if AGENTE_BI_AVAILABLE:
         loop = asyncio.get_event_loop()
         try:
