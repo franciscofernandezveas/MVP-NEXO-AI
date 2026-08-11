@@ -564,9 +564,6 @@ def planner_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         replan_context = _build_replan_context(state)
         logger.info(f"[Planner] Contexto de replanificación:\n{replan_context[:500]}...")
 
-    # core/graph_planner.py
-# (fragmento: system_prompt dentro de planner_node)
-
     system_prompt = f"""
 Eres un Planner BI avanzado. Transformas preguntas de negocio en planes operacionales estructurados.
 
@@ -676,10 +673,21 @@ REGLAS ADICIONALES:
             plan.needs_followup = True
             plan.followup_reason = "No hay vistas disponibles para responder la pregunta."
 
+    # ============================================================
+    # CORRECCIÓN DETERMINISTA DE FOLLOWUP (NUEVO)
+    # ============================================================
     if validation_errors:
         plan.needs_followup = True
         plan.followup_reason = " | ".join(validation_errors)
         logger.warning(f"[Planner] Errores de validación: {validation_errors}")
+    else:
+        # Si tenemos tareas ejecutables y todas tienen vista preferida clara, 
+        # forzamos needs_followup = False para evitar bucles del supervisor.
+        has_executable_tasks = all(t.preferred_view in allowed_views for t in plan.tasks) if plan.tasks else False
+        if has_executable_tasks or plan.question_type == "demand_forecast":
+            plan.needs_followup = False
+            plan.followup_reason = ""
+            logger.info(f"[Planner] Plan validado correctamente. Se fuerza needs_followup = False.")
 
     task_summary = " | ".join([f"{t.task_id}:{t.task}" for t in plan.tasks])
     prefs = [t.preferred_view for t in plan.tasks]
