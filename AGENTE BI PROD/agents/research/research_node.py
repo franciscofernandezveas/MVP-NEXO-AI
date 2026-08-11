@@ -94,12 +94,22 @@ def make_research_node(
         if instruction:
             logger.info(f"[Researcher] Instrucción recibida: {instruction[:200]}...")
 
+        # ============================================================
+        # ENRIQUECIMIENTO DE HINT DE REPLANIFICACIÓN
+        # ============================================================
         replan_hint = ""
         if is_replan:
+            failed_tasks_summary = [
+                f"- Tarea {r.task_id} ({r.preferred_view}): error={r.error_message}"
+                for r in existing_sql_results if r.status == "error"
+            ]
+            failed_text = "\n".join(failed_tasks_summary) if failed_tasks_summary else "Ninguna registrada"
+            
             replan_hint = (
-                "\nIMPORTANTE: Esta es una REPLANIFICACIÓN. Los intentos previos no generaron progreso. "
-                "Diseña un plan de investigación ALTERNO: cambia el enfoque, las dimensiones, "
-                "las métricas o las temporalidades. NO repitas el plan anterior."
+                f"\nIMPORTANTE: Esta es una REPLANIFICACIÓN por estancamiento (stall_count={stall_count}). "
+                f"Intentos previos con errores:\n{failed_text}\n"
+                "Diseña un plan de investigación ALTERNO: cambia drásticamente el enfoque, las dimensiones, "
+                "las métricas o las temporalidades. NO repitas las mismas consultas."
             )
 
         system_prompt = f"""
@@ -203,6 +213,33 @@ REGLAS:
             task_results.append(contract)
 
         combined_sql_results = existing_sql_results + task_results
+
+        # ============================================================
+        # VALIDACIÓN DE TAREAS EXITOSAS
+        # ============================================================
+        any_success = any(t.status == "success" for t in task_results)
+        if not any_success:
+            logger.error("[Researcher] Todas las queries fallaron. Evitando síntesis basada en errores.")
+            
+            error_summaries = "\n".join([f"- {t.task_id}: {t.error_message}" for t in task_results])
+            findings = (
+                "No fue posible obtener datos para generar el informe solicitado. "
+                "Todos los intentos de consulta fallaron con los siguientes errores:\n\n"
+                f"{error_summaries}\n\n"
+                "Por favor, replantea la consulta o verifica la disponibilidad de las vistas en el catálogo."
+            )
+            
+            return {
+                "sql_results": combined_sql_results,
+                "research_findings": findings,
+                "last_agent": "researcher",
+                "messages": [
+                    AIMessage(
+                        content=f"[Researcher] {len(task_results)} queries ejecutadas, todas fallaron. Abortando síntesis."
+                    )
+                ],
+                "next_agent_instruction": None,
+            }
 
         result_summaries = []
         for c in task_results:
