@@ -673,7 +673,7 @@ def safe_supervisor_node(state: OrchestratorState, **kwargs) -> OrchestratorStat
     - Educated guess como salida válida
     - Instrucciones dinámicas para el siguiente agente
     """
-    max_iterations = 8
+    max_iterations = 20
     current_count = state.get("iteration_count", 0)
 
     # Recuperar o inicializar ledgers
