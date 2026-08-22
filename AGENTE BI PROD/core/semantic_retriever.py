@@ -736,3 +736,4 @@ def seleccionar_vista_principal(
                             return candidate
 
     return vista_principal
+
