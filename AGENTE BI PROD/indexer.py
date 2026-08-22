@@ -18,8 +18,8 @@ from langchain_openai import OpenAIEmbeddings
 
 # === CONFIGURACIÓN DE RUTAS ===
 BASE_DIR = Path(__file__).resolve().parent
-DATA_PATH = BASE_DIR / "AGENTS.md"
-CHROMA_DIR = BASE_DIR / "chroma_db"
+DATA_PATH = Path(os.getenv("AGENTS_MD_PATH", str(BASE_DIR / "AGENTS.md")))
+CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
 COLLECTION_NAME = "semantic_views"
 
 # Lista de vistas válidas según la taxonomía del AGENTS.md
@@ -42,26 +42,17 @@ VALID_VIEWS = {
 
 
 def _make_id(view_name: str) -> str:
-    # Usar el hash completo para evitar colisiones
+    """Genera un ID único usando SHA-256 completo."""
     return hashlib.sha256(view_name.encode()).hexdigest()
 
 
 def _extract_field(text: str, field_name: str) -> str:
-    """Extrae un campo del markdown tipo **Campo**: valor o - **Campo**: valor."""
+    """Extrae un campo del markdown tipo **Campo**: valor."""
     pattern = rf'(?:-\s*)?\*\*{re.escape(field_name)}\*\*[:：]\s*(.*?)(?=\n\s*(?:-\s*)?\*\*|\Z)'
     match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
     if match:
         return match.group(1).strip()
     return ""
-
-
-def _extract_list(text: str, field_name: str) -> list[str]:
-    """Extrae una lista separada por comas de un campo markdown."""
-    raw = _extract_field(text, field_name)
-    if not raw:
-        return []
-    items = [item.strip() for item in raw.replace("\n", " ").split(",") if item.strip()]
-    return items
 
 
 def _extract_metrics_from_bullets(description: str) -> list[str]:
@@ -73,8 +64,10 @@ def _extract_metrics_from_bullets(description: str) -> list[str]:
     
     # Filtrar palabras que no son métricas
     non_metric_words = {
-        'descripción', 'tipo', 'granularidad', 'filtro fecha', 'grano',
-        'filas', 'nota', 'fecha', 'fecha_key'
+        'descripción', 'descripcion', 'tipo', 'granularidad', 'filtro fecha',
+        'grano', 'filas', 'nota', 'fecha', 'fecha_key', 'fecha_completa',
+        'fecha_venta', 'nombre_sede', 'sucursal', 'nombre_dia_semana',
+        'nombre_dia', 'hora', 'mes'
     }
     
     for match in matches:
@@ -84,7 +77,73 @@ def _extract_metrics_from_bullets(description: str) -> list[str]:
     return metrics
 
 
+def _infer_dimensions(metrics: list[str], description: str) -> list[str]:
+    """Infiere dimensiones basándose en métricas y descripción."""
+    dimensions = set()
+    
+    # Palabras clave para dimensiones
+    dim_keywords = {
+        'sede': ['sede', 'sucursal', 'local', 'tienda', 'plaza', 'ubicacion', 'ubicación', 'store', 'branch'],
+        'producto': ['producto', 'sku', 'articulo', 'artículo', 'item', 'descripcion'],
+        'categoria': ['categoria', 'categoría', 'categoria_nueva', 'subcategoria'],
+        'fecha': ['fecha', 'fecha_completa', 'fecha_venta', 'fecha_key', 'mes', 'periodo'],
+        'hora': ['hora', 'franja_horaria', 'horario'],
+    }
+    
+    # Buscar en métricas
+    for metric in metrics:
+        metric_lower = metric.lower()
+        for dim, keywords in dim_keywords.items():
+            if any(kw in metric_lower for kw in keywords):
+                dimensions.add(dim)
+    
+    # Buscar en descripción
+    description_lower = description.lower()
+    for dim, keywords in dim_keywords.items():
+        if any(kw in description_lower for kw in keywords):
+            dimensions.add(dim)
+    
+    # Si no se encontraron dimensiones, usar 'general'
+    if not dimensions:
+        dimensions.add('general')
+    
+    return list(dimensions)
+
+
+def _infer_temporal_type(view_name: str, description: str) -> str:
+    """Determina el tipo temporal de la vista."""
+    combined = f"{view_name} {description}".lower()
+    
+    if any(w in combined for w in ["latest", "hoy", "actual", "today", "snapshot", "current"]):
+        return "current"
+    elif any(w in combined for w in ["histor", "history", "tendencia", "evolución", "time_series", "histórico"]):
+        return "historical"
+    elif any(w in combined for w in ["week", "semana", "comparativa", "compare"]):
+        return "periodic"
+    elif any(w in combined for w in ["dashboard"]):
+        return "dashboard"
+    else:
+        return "general"
+
+
+def _infer_time_scope(description: str) -> str:
+    """Determina el alcance temporal de la vista."""
+    desc_lower = description.lower()
+    
+    if any(w in desc_lower for w in ["hora", "horaria", "hourly"]):
+        return "hourly"
+    elif any(w in desc_lower for w in ["día", "diario", "fecha", "daily", "dia"]):
+        return "daily"
+    elif any(w in desc_lower for w in ["semana", "semanal", "weekly"]):
+        return "weekly"
+    elif any(w in desc_lower for w in ["mes", "mensual", "monthly"]):
+        return "monthly"
+    else:
+        return "unknown"
+
+
 def _parse_agents_md(file_path: Path) -> list[Document]:
+    """Parsea el archivo AGENTS.md y crea documentos para Chroma."""
     if not file_path.exists():
         raise FileNotFoundError(f"No se encontró el archivo de catálogo: {file_path}")
 
@@ -135,76 +194,32 @@ def _parse_agents_md(file_path: Path) -> list[Document]:
         # Extraer métricas de las viñetas
         metrics = _extract_metrics_from_bullets(description)
         
-        # Si no hay métricas de viñetas, intentar con listas
-        if not metrics:
-            metrics = _extract_list(description, "Métricas") or _extract_list(description, "Metricas")
-        
-        # Garantizar que metrics nunca esté vacío
+        # Si no hay métricas, usar un placeholder
         if not metrics:
             metrics = [f"metrica_{view_name}"]
         
-        # Extraer dimensiones (para vistas que las tienen)
-        dimensions = _extract_list(description, "Dimensiones") or _extract_list(description, "Cols")
+        # Inferir dimensiones
+        dimensions = _infer_dimensions(metrics, description)
         
-        # Si no hay dimensiones explícitas, inferir de las métricas
-        if not dimensions:
-            # Buscar dimensiones en las métricas
-            dimension_candidates = []
-            for metric in metrics:
-                if any(dim_word in metric.lower() for dim_word in ['sede', 'sucursal', 'local', 'producto', 'categoria', 'fecha']):
-                    if 'sede' in metric.lower() or 'sucursal' in metric.lower():
-                        dimension_candidates.append('sede')
-                    if 'producto' in metric.lower():
-                        dimension_candidates.append('producto')
-                    if 'categoria' in metric.lower():
-                        dimension_candidates.append('categoria')
-                    if 'fecha' in metric.lower():
-                        dimension_candidates.append('fecha')
-            
-            if not dimension_candidates:
-                dimensions = ['general']
-            else:
-                dimensions = list(set(dimension_candidates))
-        
-        # Valores por defecto para campos vacíos
+        # Valores por defecto
         if not purpose:
             purpose = f"Vista {view_name}"
         if not grain:
             grain = "general"
         
-        view_lower = view_name.lower()
-        purpose_lower = purpose.lower()
-        grain_lower = grain.lower()
-        dims_lower = [d.lower() for d in dimensions]
-        
         # Clasificación temporal
-        temporal_type = "general"
-        if any(w in view_lower for w in ["latest", "hoy", "actual", "today", "_day"]):
-            temporal_type = "current"
-        elif any(w in view_lower for w in ["history", "historico", "histórico", "tendencia"]):
-            temporal_type = "historical"
-        elif any(w in view_lower for w in ["week", "semana", "comparativa"]):
-            temporal_type = "periodic"
-        elif any(w in view_lower for w in ["dashboard"]):
-            temporal_type = "dashboard"
-        
-        # Clasificación de granularidad temporal
-        time_scope = "unknown"
-        if any(w in grain_lower for w in ["día", "diario", "fecha", "daily"]):
-            time_scope = "daily"
-        elif any(w in grain_lower for w in ["semana", "semanal", "weekly"]):
-            time_scope = "weekly"
-        elif any(w in grain_lower for w in ["mes", "mensual", "monthly"]):
-            time_scope = "monthly"
-        elif any(w in grain_lower for w in ["hora", "horaria", "hourly"]):
-            time_scope = "hourly"
+        temporal_type = _infer_temporal_type(view_name, description)
+        time_scope = _infer_time_scope(description)
         
         # Detección de filtros
-        supports_date_filter = any(d in dims_lower for d in ["fecha", "date", "periodo", "mes", "año", "dia", "día"])
+        dims_lower = [d.lower() for d in dimensions]
+        supports_date_filter = any(d in dims_lower for d in ["fecha", "date", "periodo", "mes", "año", "dia", "día", "hora"])
         supports_location_filter = any(d in dims_lower for d in ["sede", "local", "sucursal", "ubicacion", "ubicación", "store", "branch"])
         
-        keywords_str = f"{view_name} {purpose} " + " ".join(metrics)
+        # Construir keywords
+        keywords_str = f"{view_name} {purpose} " + " ".join(metrics[:5])
         
+        # Crear contenido
         page_content = (
             f"VISTA SEMÁNTICA: semantic.{view_name}\n"
             f"NOMBRE TÉCNICO: {view_name}\n"
@@ -212,17 +227,24 @@ def _parse_agents_md(file_path: Path) -> list[Document]:
             f"KEYWORDS PARA BÚSQUEDA: {keywords_str}"
         )
         
+        # *** IMPORTANTE: Convertir listas a strings para Chroma ***
+        metrics_str = ", ".join(metrics[:15])
+        dimensions_str = ", ".join(dimensions[:10])
+        
+        # Crear ID único
         doc_id = _make_id(f"semantic.{view_name}")
+        
+        # Crear documento con metadatos válidos
         documents.append(Document(
             page_content=page_content,
             metadata={
                 "view_name": f"semantic.{view_name}",
                 "schema": "semantic",
                 "keywords": keywords_str,
-                "purpose": purpose,
+                "purpose": purpose[:500],
                 "grain": grain,
-                "metrics": metrics[:10],  # Limitar a 10 métricas para evitar sobrecarga
-                "dimensions": dimensions[:10],  # Limitar a 10 dimensiones
+                "metrics": metrics_str,  # String en lugar de lista
+                "dimensions": dimensions_str,  # String en lugar de lista
                 "notes": "",
                 "temporal_type": temporal_type,
                 "time_scope": time_scope,
@@ -243,6 +265,7 @@ def _parse_agents_md(file_path: Path) -> list[Document]:
 
 
 def indexar():
+    """Función principal para indexar las vistas semánticas en Chroma."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise EnvironmentError(
@@ -252,6 +275,8 @@ def indexar():
         )
 
     print(f"📖 Leyendo catálogo desde: {DATA_PATH}")
+    print(f"📁 Directorio Chroma: {CHROMA_DIR}")
+    
     docs = _parse_agents_md(DATA_PATH)
     print(f"🧩 Vistas parseadas: {len(docs)}")
 
@@ -264,6 +289,7 @@ def indexar():
         persist_directory=str(CHROMA_DIR)
     )
     
+    # Agregar documentos
     vector_store.add_documents(documents=docs, ids=[d.id for d in docs])
     
     # Limpieza de obsoletos
@@ -279,6 +305,18 @@ def indexar():
     
     count = vector_store._collection.count()
     print(f"✅ Indexación completada. Total documentos en Chroma: {count}")
+    
+    # Verificación rápida
+    if count > 0:
+        print("\n📊 Verificación de documentos indexados:")
+        try:
+            all_docs = vector_store._collection.get()
+            for i, (doc_id, metadata) in enumerate(zip(all_docs["ids"], all_docs["metadatas"])):
+                view_name = metadata.get("view_name", "unknown")
+                metrics_count = len(metadata.get("metrics", "").split(",")) if metadata.get("metrics") else 0
+                print(f"  {i+1}. {view_name} | ID: {doc_id[:12]}... | métricas: {metrics_count}")
+        except Exception as e:
+            print(f"  [WARN] No se pudo verificar: {e}")
 
 
 if __name__ == "__main__":
