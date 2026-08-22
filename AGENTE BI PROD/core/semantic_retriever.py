@@ -36,6 +36,117 @@ except Exception as e:
 
 
 # ============================================================================
+# DICCIONARIO DE SINÓNIMOS DE MÉTRICAS
+# ============================================================================
+
+METRIC_SYNONYMS = {
+    "ventas": [
+        "ventas", "venta", "ventas_totales", "venta_total", "total_ventas",
+        "ingresos", "ingreso", "revenue", "sales", "subtotal_diario",
+        "valor_total", "valor_neto", "valor"
+    ],
+    "transacciones": [
+        "transacciones", "transaccion", "total_transacciones", "num_transacciones",
+        "cantidad_transacciones", "transacciones_dia", "transacciones_hoy",
+        "transacciones_mes", "transacciones_semana"
+    ],
+    "unidades": [
+        "unidades", "unidad", "cantidad", "unidades_vendidas", "unidades_totales",
+        "unidades_fidelizacion", "unidades_cortesia", "qty", "quantity"
+    ],
+    "ticket_promedio": [
+        "ticket_promedio", "ticket_medio", "promedio_venta", "average_ticket",
+        "ticket"
+    ],
+    "categoria": [
+        "categoria", "categoría", "categoria_nueva", "categorias", "category"
+    ],
+    "producto": [
+        "producto", "productos", "nombre_producto", "descripcion", "descripción",
+        "sku", "articulo", "artículo", "item"
+    ],
+    "sucursal": [
+        "sucursal", "sede", "local", "tienda", "plaza", "nombre_sede",
+        "ubicacion", "ubicación", "store", "branch"
+    ],
+    "fecha": [
+        "fecha", "fecha_completa", "fecha_venta", "fecha_key", "date",
+        "mes", "año", "ano", "periodo", "fecha_calendario"
+    ],
+    "hora": [
+        "hora", "horario", "franja_horaria", "hour", "time"
+    ],
+    "variacion": [
+        "variacion", "variación", "variacion_diaria_pct", "variacion_pct",
+        "cambio_porcentual", "crecimiento"
+    ],
+}
+
+DIMENSION_KEYWORDS = {
+    'sede': ['sede', 'sucursal', 'local', 'tienda', 'plaza', 'ubicacion', 'ubicación', 'store', 'branch'],
+    'producto': ['producto', 'sku', 'articulo', 'artículo', 'item', 'descripcion', 'descripción'],
+    'categoria': ['categoria', 'categoría', 'categoria_nueva', 'subcategoria', 'category'],
+    'fecha': ['fecha', 'fecha_completa', 'fecha_venta', 'fecha_key', 'mes', 'periodo', 'date'],
+    'hora': ['hora', 'franja_horaria', 'horario', 'hour'],
+}
+
+
+def _normalize_metric_name(metric: str) -> str:
+    """Normaliza un nombre de métrica a su forma canónica."""
+    if not metric:
+        return ""
+    
+    metric_lower = metric.lower().strip()
+    
+    # Buscar en sinónimos
+    for canonical, synonyms in METRIC_SYNONYMS.items():
+        if metric_lower in synonyms:
+            return canonical
+        # Verificar si contiene algún sinónimo
+        for syn in synonyms:
+            if syn in metric_lower or metric_lower in syn:
+                return canonical
+    
+    return metric_lower
+
+
+def _metric_exists(available_metrics: List[str], requested_metric: str) -> bool:
+    """Verifica si una métrica solicitada existe en las métricas disponibles."""
+    if not requested_metric or not available_metrics:
+        return False
+    
+    requested_normalized = _normalize_metric_name(requested_metric)
+    
+    for available in available_metrics:
+        available_str = str(available)
+        available_normalized = _normalize_metric_name(available_str)
+        
+        if requested_normalized == available_normalized:
+            return True
+        
+        # Verificar similitud parcial
+        if requested_normalized in available_normalized or available_normalized in requested_normalized:
+            return True
+        
+        # Verificar sinónimos cruzados
+        requested_synonyms = METRIC_SYNONYMS.get(requested_normalized, [requested_normalized])
+        available_synonyms = METRIC_SYNONYMS.get(available_normalized, [available_normalized])
+        
+        if any(rs in available_str.lower() for rs in requested_synonyms):
+            return True
+        if any(as_ in requested_metric.lower() for as_ in available_synonyms):
+            return True
+    
+    return False
+
+
+def _get_metric_aliases(metric: str) -> List[str]:
+    """Devuelve todos los alias conocidos para una métrica."""
+    metric_normalized = _normalize_metric_name(metric)
+    return METRIC_SYNONYMS.get(metric_normalized, [metric])
+
+
+# ============================================================================
 # AUTO-INICIALIZACIÓN DE LA COLECCIÓN
 # ============================================================================
 
@@ -72,22 +183,14 @@ def _infer_dimensions_from_metrics(metrics: List[str], description: str) -> List
     """Infiere dimensiones basándose en las métricas y la descripción."""
     dimensions = set()
     
-    dim_keywords = {
-        'sede': ['sede', 'sucursal', 'local', 'tienda', 'plaza', 'ubicacion', 'ubicación', 'store', 'branch'],
-        'producto': ['producto', 'sku', 'articulo', 'artículo', 'item', 'descripcion'],
-        'categoria': ['categoria', 'categoría', 'categoria_nueva', 'subcategoria'],
-        'fecha': ['fecha', 'fecha_completa', 'fecha_venta', 'fecha_key', 'mes', 'periodo'],
-        'hora': ['hora', 'franja_horaria', 'horario'],
-    }
-    
     for metric in metrics:
         metric_lower = metric.lower()
-        for dim, keywords in dim_keywords.items():
+        for dim, keywords in DIMENSION_KEYWORDS.items():
             if any(kw in metric_lower for kw in keywords):
                 dimensions.add(dim)
     
     description_lower = description.lower()
-    for dim, keywords in dim_keywords.items():
+    for dim, keywords in DIMENSION_KEYWORDS.items():
         if any(kw in description_lower for kw in keywords):
             dimensions.add(dim)
     
@@ -223,8 +326,11 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
         supports_date_filter = any(d in dims_lower for d in ["fecha", "date", "periodo", "mes", "año", "dia", "día", "hora"])
         supports_location_filter = any(d in dims_lower for d in ["sede", "local", "sucursal", "ubicacion", "ubicación", "store", "branch"])
         
-        # Construir keywords
-        keywords_str = f"{view_name} {purpose} " + " ".join(metrics[:5])
+        # Construir keywords con sinónimos
+        keywords_parts = [view_name, purpose]
+        for metric in metrics[:5]:
+            keywords_parts.extend(_get_metric_aliases(metric)[:3])
+        keywords_str = " ".join(keywords_parts)
         
         # Crear contenido
         page_content = (
@@ -250,8 +356,8 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
                 "keywords": keywords_str,
                 "purpose": purpose[:500],
                 "grain": grain,
-                "metrics": metrics_str,      # ✅ String
-                "dimensions": dimensions_str, # ✅ String
+                "metrics": metrics_str,
+                "dimensions": dimensions_str,
                 "notes": "",
                 "temporal_type": temporal_type,
                 "time_scope": time_scope,
@@ -433,7 +539,8 @@ def _detect_temporal_context(query: str) -> Dict[str, Any]:
 
     historical_keywords = [
         "histórico", "historico", "históricas", "historicas", "pasado", "anterior",
-        "histórica", "mes pasado", "año anterior", "tendencia", "evolución"
+        "histórica", "mes pasado", "año anterior", "tendencia", "evolución",
+        "evolucion", "cada mes", "mensual", "por mes"
     ]
     if any(kw in q for kw in historical_keywords):
         context["is_historical"] = True
@@ -479,7 +586,7 @@ def _detect_dimensions_in_query(query: str) -> List[str]:
     ]):
         dims.extend(["sucursal", "nombre_sede", "sede", "local", "tienda"])
 
-    if any(k in q for k in ["categoria", "categoría", "categorias", "categorías"]):
+    if any(k in q for k in ["categoria", "categoría", "categorias", "categorías", "cafe", "café"]):
         dims.extend(["categoria", "categoría", "categoria_nueva"])
 
     if any(k in q for k in [
@@ -639,14 +746,15 @@ def _calculate_metadata_score(
     requested_dims = required["dimensions"] or _detect_dimensions_in_query(query)
     requested_metrics = required["metrics"]
 
-    # Usar funciones auxiliares para manejar strings y listas
     metrics = _get_metrics_list(meta)
     dimensions = _get_dimensions_list(meta)
     available_columns = [str(d) for d in dimensions] + [str(m) for m in metrics]
 
+    # Verificar dimensiones con sinónimos
     for dim in requested_dims:
         has_dim = any(
-            _column_matches(avail_col, dim)
+            _column_matches(avail_col, dim) or 
+            _metric_exists([avail_col], dim)
             for avail_col in available_columns
         )
         if not has_dim:
@@ -654,11 +762,9 @@ def _calculate_metadata_score(
         else:
             score += 1.0
 
+    # Verificar métricas con sinónimos
     for met in requested_metrics:
-        has_metric = any(
-            _column_matches(avail_col, met)
-            for avail_col in available_columns
-        )
+        has_metric = _metric_exists(metrics, met) if metrics else False
         if not has_metric:
             score -= 1.5
         else:
@@ -684,7 +790,6 @@ def _calculate_compatibility_score(
     query_temporal = _detect_temporal_context(safe_hints.get("original_query", ""))
     adjusted_meta = _apply_implicit_temporal_rules(query_temporal, view_metadata)
 
-    # Usar funciones auxiliares para manejar strings y listas
     metrics = _get_metrics_list(adjusted_meta)
     dimensions = _get_dimensions_list(adjusted_meta)
     available_columns = [str(d).lower() for d in dimensions] + [str(m).lower() for m in metrics]
@@ -693,29 +798,24 @@ def _calculate_compatibility_score(
     requested_dims = required["dimensions"] or _detect_dimensions_in_query(safe_hints.get("original_query", ""))
     requested_metrics = required["metrics"]
 
+    # Verificar métrica con sinónimos
     metric_hint = requested_metrics[0] if requested_metrics else safe_hints.get("metric", "")
     if metric_hint:
         if metrics:
-            metric_found = any(
-                isinstance(view_metric, str)
-                and (
-                    metric_hint.lower() in view_metric.lower()
-                    or view_metric.lower() in metric_hint.lower()
-                )
-                for view_metric in metrics
-            )
+            metric_found = _metric_exists(metrics, metric_hint)
             if not metric_found:
                 compatibility["metric"] = "missing"
         else:
             compatibility["metric"] = "missing"
 
+    # Verificar ubicación
     location_hint = safe_hints.get("location", "")
     if location_hint:
         supports_location = adjusted_meta.get("supports_location_filter", False)
         if not supports_location:
             compatibility["location"] = "missing"
         elif dimensions:
-            location_keywords = ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"]
+            location_keywords = DIMENSION_KEYWORDS.get('sede', [])
             has_location = any(
                 any(keyword in str(dim).lower() for keyword in location_keywords)
                 for dim in dimensions
@@ -723,8 +823,9 @@ def _calculate_compatibility_score(
             if not has_location:
                 compatibility["location"] = "missing"
 
-    product_keywords = ["producto", "descripcion", "descripción", "nombre_producto", "sku", "articulo", "artículo", "item"]
-    if any(d in requested_dims for d in ["producto", "descripcion", "descripción", "sku", "articulo", "artículo", "item"]):
+    # Verificar producto
+    product_keywords = DIMENSION_KEYWORDS.get('producto', [])
+    if any(d in requested_dims for d in product_keywords):
         has_product = any(
             any(pk in col for pk in product_keywords)
             for col in available_columns
@@ -732,14 +833,16 @@ def _calculate_compatibility_score(
         if not has_product:
             compatibility["product"] = "missing"
 
-    if "categoria" in requested_dims or "categoría" in requested_dims:
+    # Verificar categoría
+    if "categoria" in requested_dims or "categoría" in requested_dims or "cafe" in requested_dims:
         has_category = any(
-            "categoria" in col or "categoría" in col
+            any(kw in col for kw in ["categoria", "categoría", "category"])
             for col in available_columns
         )
         if not has_category:
             compatibility["category"] = "missing"
 
+    # Verificar filtro de fecha
     date_hint = safe_hints.get("date_range", "")
     if not date_hint and query_temporal.get("is_current"):
         date_hint = "current"
@@ -748,19 +851,18 @@ def _calculate_compatibility_score(
 
     if date_hint:
         supports_date = adjusted_meta.get("supports_date_filter", False)
+        
+        # Si la vista tiene columnas de fecha, asumir que soporta filtros
+        if dimensions:
+            has_date_column = any(
+                any(keyword in str(dim).lower() for keyword in DIMENSION_KEYWORDS.get('fecha', []))
+                for dim in dimensions
+            )
+            if has_date_column:
+                supports_date = True
+        
         if not supports_date:
             compatibility["date_range"] = "missing"
-        else:
-            implicit_scope = adjusted_meta.get("implicit_date_scope", "none")
-            if implicit_scope not in ("current_day", "historical_range"):
-                if dimensions:
-                    time_keywords = ["fecha", "date", "time", "periodo", "mes", "año", "dia", "día", "hora"]
-                    has_time = any(
-                        any(keyword in str(dim).lower() for keyword in time_keywords)
-                        for dim in dimensions
-                    )
-                    if not has_time:
-                        compatibility["date_range"] = "missing"
 
     return compatibility
 
@@ -872,7 +974,6 @@ def obtener_candidatas_detalles(
     for candidate in candidates:
         metadata = candidate["view_metadata"]
 
-        # Usar funciones auxiliares para manejar strings y listas
         metrics = _get_metrics_list(metadata)
         dimensions = _get_dimensions_list(metadata)
         usage_examples = metadata.get("usage_examples", []) if isinstance(metadata.get("usage_examples"), list) else []
