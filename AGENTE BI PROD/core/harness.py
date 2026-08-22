@@ -1,5 +1,18 @@
 # core/harness.py
 # -------------------------------------------------
+# Cambios aplicados (alineación temporal del harness):
+#  H1 Intención temporal estructurada compartida: _temporal_intent/_is_snapshot_view/
+#     _is_historical_view/_historical_variants_for — el detector y la escalada usan
+#     el mismo criterio (dejan de divergir)
+#  H2 Promoción de vista histórica al allowlist: la ambigüedad se RESUELVE
+#     (antes: nota "considera su versión _history" advisory-only que nadie ejecutaba).
+#     Si no existe variante documentada → capability_gap estructurado
+#  H3 Nota temporal silenciada cuando la promoción la resolvió; nota explícita de
+#     gap de capacidad cuando no hay vista histórica disponible
+#  H4 Fallbacks temporal-aware: _fallback_preferred_view prefiere _history cuando
+#     corresponde; trio mínimo (FIX 5) y fallback profundo ya no son ciegos al tiempo
+#  Salida: + capability_gap / temporal_intent (consumidos por planner_node, fragmento H5)
+# -------------------------------------------------
 
 from __future__ import annotations
 
@@ -58,6 +71,70 @@ def _with_semantic_prefix(view_name: str) -> Optional[str]:
         return None
     clean = _clean_view_name(view_name)
     return f"semantic.{clean}"
+
+
+# ============================================================================
+# NUEVO (H1): Intención temporal estructurada — criterio ÚNICO compartido
+# por AmbiguityDetector, la escalada histórica y los fallbacks.
+# El año explícito ("2026") cuenta como histórico.
+# ============================================================================
+
+_SNAPSHOT_KEYWORDS = ["hoy", "ayer", "actual", "snapshot", "dia actual", "en curso"]
+
+_HISTORICAL_KEYWORDS = [
+    "mes", "ano", "anio", "historico", "historial", "tendencia", "rango", "ultimos",
+    "semana pasada", "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+    "agosto", "septiembre", "octubre", "noviembre", "diciembre", "trimestre", "semestre",
+]
+
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+
+def _temporal_intent(question: str) -> Optional[str]:
+    """'historical' | 'snapshot' | None."""
+    q = _normalize_question(question)
+    asks_hist = any(k in q for k in _HISTORICAL_KEYWORDS) or bool(_YEAR_RE.search(q))
+    asks_snap = any(k in q for k in _SNAPSHOT_KEYWORDS)
+    if asks_hist and not asks_snap:
+        return "historical"
+    if asks_snap and not asks_hist:
+        return "snapshot"
+    return None
+
+
+def _is_snapshot_view(view_info: Optional["ViewInfo"]) -> bool:
+    if not view_info:
+        return False
+    tipo = _normalize_question(view_info.tipo or "")
+    filtro = _normalize_question(view_info.filtro_fecha or "")
+    return (
+        "current" in tipo
+        or "snapshot" in tipo
+        or "compare periods" in tipo
+        or "no aplica" in filtro
+    )
+
+
+def _is_historical_view(view_info: Optional["ViewInfo"]) -> bool:
+    if not view_info:
+        return False
+    tipo = _normalize_question(view_info.tipo or "")
+    filtro = _normalize_question(view_info.filtro_fecha or "")
+    return "historical" in tipo or "rango" in filtro
+
+
+def _historical_variants_for(view_name: str, biz_mem: "BusinessMemory") -> List[str]:
+    """
+    Deriva candidatas históricas documentadas a partir de una vista snapshot.
+    sales_review_day → sales_review_history / sales_review_day_history / sales_review_historical...
+    """
+    base = _clean_view_name(view_name)
+    for suffix in ("_latest", "_current", "_day"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    candidatas = [f"{base}_history", f"{base}_historical", f"{_clean_view_name(view_name)}_history"]
+    return [c for c in dict.fromkeys(candidatas) if biz_mem.get_view(c)]
 
 
 # ============================================================================
@@ -386,43 +463,23 @@ class AmbiguityDetector:
         return notes
 
     def _temporal_ambiguity(self, user_question: str, candidatas: List[str]) -> List[str]:
+        """H1: usa el criterio compartido _temporal_intent/_is_*_view
+        (antes: listas locales divergentes de la escalada)."""
         notes: List[str] = []
-        q_norm = _normalize_question(user_question)
-
-        snapshot_keywords = [
-            "hoy", "ayer", "actual", "snapshot", "dia actual", "en curso"
-        ]
-        historical_keywords = [
-            "mes", "ano", "anio", "historico", "tendencia", "rango", "ultimos",
-            "semana pasada", "junio", "julio", "agosto", "septiembre", "octubre",
-        ]
-
-        asks_snapshot = any(k in q_norm for k in snapshot_keywords)
-        asks_historical = any(k in q_norm for k in historical_keywords)
+        intent = _temporal_intent(user_question)
 
         for view_name in candidatas:
             view = self.biz_mem.get_view(view_name)
             if not view:
                 continue
 
-            filtro_norm = _normalize_question(view.filtro_fecha)
-            tipo_norm = _normalize_question(view.tipo)
-
-            is_snapshot = (
-                "no aplica" in filtro_norm
-                or "current" in tipo_norm
-                or "snapshot" in tipo_norm
-                or "compare periods" in tipo_norm
-            )
-            needs_history = "rango" in filtro_norm or "historical" in tipo_norm
-
-            if asks_snapshot and needs_history and not asks_historical:
+            if intent == "snapshot" and _is_historical_view(view):
                 notes.append(
                     f"La pregunta parece pedir datos de hoy/ayer, pero `{view_name}` "
                     "requiere un rango de fechas histórico. Considera una vista `_latest` o `_day`."
                 )
 
-            if asks_historical and is_snapshot and not asks_snapshot:
+            if intent == "historical" and _is_snapshot_view(view):
                 notes.append(
                     f"La pregunta parece pedir histórico, pero `{view_name}` es un snapshot "
                     "sin filtro de fecha. Considera su versión `_history`."
@@ -438,8 +495,11 @@ class AmbiguityDetector:
 def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optional[str]:
     """
     Si el retriever no elige una vista principal, usamos reglas de keyword simples.
+    H4: con intención histórica, las variantes _history/_historical van PRIMERO
+    (antes ganaba por orden fijo de lista → snapshot para preguntas históricas).
     """
     q = _normalize_question(question)
+    prefer_history = _temporal_intent(question) == "historical"
 
     keyword_map = [
         (["venta", "vendido", "vendidos", "unidades vendidas", "ingreso", "ingresos"], [
@@ -456,7 +516,6 @@ def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optiona
         (["sede", "local", "tienda", "sucursal", "plaza"], [
             "sales_review_locales",
             "sales_review_locales_latest",
-            
         ]),
         (["fidelizacion", "canje", "puntos", "fidelización"], [
             "kpi_fidelizacion_detalle",
@@ -473,12 +532,22 @@ def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optiona
 
     for keywords, candidate_views in keyword_map:
         if any(k in q for k in keywords):
-            for cv in candidate_views:
+            ordered = candidate_views
+            if prefer_history:
+                ordered = sorted(
+                    candidate_views,
+                    key=lambda v: ("_history" not in v and "_historical" not in v),
+                )
+            for cv in ordered:
                 clean_cv = _clean_view_name(cv)
                 if clean_cv in [_clean_view_name(v) for v in allowed_views]:
                     return clean_cv
 
     sales_views = [v for v in allowed_views if "sales" in v or "kpi" in v]
+    if prefer_history:
+        history_sales = [v for v in sales_views if "_history" in v or "_historical" in v]
+        if history_sales:
+            return _clean_view_name(history_sales[0])
     if sales_views:
         return _clean_view_name(sales_views[0])
 
@@ -495,6 +564,11 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
     Implementación cacheada. Usa el retriever vectorial real.
     """
     biz_mem = BusinessMemory.from_file()
+
+    # H1/H2: intención temporal computada UNA vez, reutilizada por
+    # fallback (FIX 4), trio mínimo (FIX 5) y escalada histórica (H2)
+    temporal = _temporal_intent(normalized_question)
+    capability_gap_historical = False
 
     # FIX 1: Umbral razonable; no desactivar completamente la selección
     MIN_SCORE_THRESHOLD = -5.0
@@ -539,8 +613,12 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
             if v and biz_mem.get_view(v)
         ]
         if not fallback_views:
+            # H4: el fallback profundo tampoco es ciego al tiempo
+            base_fallback = ["sales_producto_daily", "sales_review_day", "sales_week"]
+            if temporal == "historical":
+                base_fallback = ["sales_review_day_history"] + base_fallback
             fallback_views = [
-                v for v in ["sales_producto_daily", "sales_review_day", "sales_week"]
+                v for v in base_fallback
                 if biz_mem.get_view(v)
             ][:MAX_FALLBACK_VIEWS]
 
@@ -567,8 +645,12 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
         allowed_views_set.add(_clean_view_name(preferred_view))
 
     # Asegurar un mínimo de contexto sin inyectar TODO el catálogo
+    # H4: el trio mínimo deja de ser ciego al tiempo
     if len(allowed_views_set) < 2:
-        for v in ["sales_producto_daily", "sales_review_day", "sales_review_locales_latest"]:
+        base_min = ["sales_producto_daily", "sales_review_day", "sales_review_locales_latest"]
+        if temporal == "historical":
+            base_min = ["sales_review_day_history", "sales_review_locales_history"] + base_min
+        for v in base_min:
             if biz_mem.get_view(v):
                 allowed_views_set.add(v)
 
@@ -576,10 +658,46 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
     # El catálogo completo ya se expone en all_documented_views para referencia.
     allowed_views_clean = sorted(allowed_views_set)
 
-    # FIX 7: Si no hay vista principal, usar fallback por keywords
+    # FIX 7: Si no hay vista principal, usar fallback por keywords (ya temporal-aware)
     if not preferred_view:
         preferred_view = _fallback_preferred_view(normalized_question, allowed_views_clean)
         logger.info(f"[Harness] Fallback preferred_view: {preferred_view}")
+
+    # ------------------------------------------------------------------
+    # NUEVO (H2): promoción de vista histórica — la ambigüedad se RESUELVE,
+    # no solo se anota. Antes: nota "considera su versión _history" advisory-only.
+    # ------------------------------------------------------------------
+    if temporal == "historical":
+        has_historical = any(
+            _is_historical_view(biz_mem.get_view(v)) for v in allowed_views_clean
+        )
+        if not has_historical:
+            promoted: List[str] = []
+            for v in list(allowed_views_clean):
+                promoted.extend(
+                    hv for hv in _historical_variants_for(v, biz_mem)
+                    if is_view_allowed(hv, biz_mem)
+                )
+            promoted = [p for p in dict.fromkeys(promoted)]
+
+            if promoted:
+                allowed_views_clean = sorted(set(allowed_views_clean) | set(promoted))
+                preferred_view = promoted[0]
+                logger.info(f"[Harness] Vistas históricas promovidas al allowlist: {promoted}")
+                # Re-inyectar al top para que el contexto semántico documente la vista promovida
+                candidatas_detalle = [
+                    {"view_name": preferred_view, "score": 1.0, "can_answer": True}
+                ] + [
+                    c for c in candidatas_detalle
+                    if _clean_view_name(c.get("view_name")) != preferred_view
+                ]
+            else:
+                # Señal estructurada: no existe vista histórica documentada
+                capability_gap_historical = True
+                logger.warning(
+                    "[Harness] Pregunta histórica sin vista _history/_historical documentada. "
+                    "capability_gap=True"
+                )
 
     # FIX 8: Contexto semántico solo sobre top relevantes
     top_candidates = candidatas_detalle[:5]
@@ -604,14 +722,33 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
     if preferred_view and preferred_view not in ambiguity_views:
         ambiguity_views.append(preferred_view)
 
+    # H3a: si la promoción resolvió la temporalidad, excluir los snapshots
+    # del análisis → la nota "considera _history" deja de dispararse (ya resuelto)
+    if temporal == "historical" and not capability_gap_historical:
+        ambiguity_views = [
+            v for v in ambiguity_views
+            if not _is_snapshot_view(biz_mem.get_view(v))
+        ] or ambiguity_views
+
     detector = AmbiguityDetector(biz_mem)
     ambiguity_notes = detector.analyze(normalized_question, ambiguity_views)
+
+    # H3b: si hay gap REAL de capacidad, decirlo explícitamente — el planner (H5)
+    # lo convierte en aclaración honesta ("solo tengo datos del día en curso"),
+    # no en una petición genérica de "más detalles".
+    if capability_gap_historical:
+        ambiguity_notes.append(
+            "La pregunta requiere un periodo histórico, pero NINGUNA vista documentada "
+            "ofrece histórico; las fuentes actuales son snapshots del día en curso."
+        )
 
     return {
         "semantic_context": semantic_context,
         "allowed_views": [_with_semantic_prefix(v) for v in allowed_views_clean],
         "preferred_view": _with_semantic_prefix(preferred_view),
         "ambiguity_notes": ambiguity_notes,
+        "capability_gap": capability_gap_historical,          # H3: señal estructurada
+        "temporal_intent": temporal,                          # H1: disponible para planner
         "all_documented_views": [_with_semantic_prefix(v) for v in biz_mem.list_views()],
     }
 
@@ -631,6 +768,8 @@ if __name__ == "__main__":
     pregunta = "productos mas vendidos en merced en junio de 2026"
     context_pack = build_harness_context_cached(pregunta)
 
+    print("temporal_intent:", context_pack["temporal_intent"])
+    print("capability_gap:", context_pack["capability_gap"])
     print("preferred_view:", context_pack["preferred_view"])
     print("allowed_views:", context_pack["allowed_views"])
     print("ambiguity_notes:", context_pack["ambiguity_notes"])

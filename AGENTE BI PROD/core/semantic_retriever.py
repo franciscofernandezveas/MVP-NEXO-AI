@@ -25,9 +25,25 @@ _vector_store = Chroma(
     persist_directory=str(CHROMA_DIR),
 )
 
+# ----------------------------------------------------------------------------
+# FIX 2: Health probe al importar (Fail loud / Warn si el índice está vacío)
+# ----------------------------------------------------------------------------
+try:
+    _DOC_COUNT = _vector_store._collection.count()
+except Exception:
+    _DOC_COUNT = -1
+
+if _DOC_COUNT <= 0:
+    logger.warning(
+        f"[Retriever] ⚠️ Colección '{COLLECTION_NAME}' vacía o inaccesible en {CHROMA_DIR}. "
+        f"La selección semántica está degradada: el sistema operará solo con fallback léxico."
+    )
+else:
+    logger.info(f"[Retriever] Colección '{COLLECTION_NAME}' lista: {_DOC_COUNT} vistas indexadas.")
+
 
 # ============================================================================
-# FIX 1: Normalización de prefijo "semantic." en filtros Chroma
+# Normalización de prefijo "semantic." en filtros Chroma
 # ============================================================================
 
 def _normalize_view_name(view: str) -> List[str]:
@@ -70,14 +86,16 @@ def _detect_temporal_context(query: str) -> Dict[str, Any]:
     years = re.findall(r'\b(20\d{2})\b', query)
     if years:
         context["year_mentioned"] = years
-        future_years = [int(y) for y in years if int(y) >= current_year + 1]
-        historical_years = [int(y) for y in years if int(y) < current_year]
-        if future_years:
-            context["is_future"] = True
-            context["needs_specific_date"] = True
-        if historical_years:
-            context["is_historical"] = True
-            context["needs_specific_date"] = True
+        for y in years:
+            yi = int(y)
+            if yi >= current_year + 1:
+                context["is_future"] = True
+                context["needs_specific_date"] = True
+            else:
+                # FIX 5: Año explícito (incluido el en curso) ⇒ consulta de rango, no snapshot.
+                # "Ventas del año 2026" pide agregación anual, no el estado del día de hoy.
+                context["is_historical"] = True
+                context["needs_specific_date"] = True
 
     month_names = [
         "enero", "febrero", "marzo", "abril", "mayo", "junio",
@@ -115,10 +133,7 @@ def _detect_temporal_context(query: str) -> Dict[str, Any]:
 
 
 def _detect_dimensions_in_query(query: str) -> List[str]:
-    """
-    Detecta dimensiones o columnas explícitamente solicitadas en la query.
-    Devuelve lista de nombres de columnas candidatas a buscar en la vista.
-    """
+    """Detecta dimensiones o columnas explícitamente solicitadas en la query."""
     if not query:
         return []
 
@@ -156,15 +171,8 @@ def _detect_dimensions_in_query(query: str) -> List[str]:
     return list(dict.fromkeys(dims))
 
 
-# ============================================================================
-# FIX 2: Extraer columnas requeridas desde column_hints / SQLPayload
-# ============================================================================
-
 def _extract_required_columns(column_hints: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
-    """
-    Extrae dimensiones y métricas requeridas de los column_hints.
-    Soporta payloads estructurados (SQLPayload) y hints planos.
-    """
+    """Extrae dimensiones y métricas requeridas de los column_hints."""
     if not column_hints:
         return {"dimensions": [], "metrics": []}
 
@@ -197,10 +205,7 @@ def _extract_required_columns(column_hints: Optional[Dict[str, Any]]) -> Dict[st
 
 
 def _column_matches(candidate: str, requested: str) -> bool:
-    """
-    Comprueba si una columna candidata satisface una dimensión solicitada.
-    Soporta coincidencia exacta, subcadena y variantes.
-    """
+    """Comprueba si una columna candidata satisface una dimensión solicitada."""
     c = candidate.lower().strip().replace("_", " ")
     r = requested.lower().strip().replace("_", " ")
     return r in c or c in r or r.replace(" ", "") == c.replace(" ", "")
@@ -238,16 +243,52 @@ def _apply_implicit_temporal_rules(
     return adjusted
 
 
+def _distance_to_similarity(distance: float) -> float:
+    """
+    FIX 3: Chroma devuelve DISTANCIA (menor = mejor). 
+    Convertimos a similitud ∈ (0, 1].
+    """
+    try:
+        d = max(float(distance), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return 1.0 / (1.0 + d)
+
+
+def _backfill_metadata_from_catalog(metadata: Dict[str, Any], biz_mem: Any) -> Dict[str, Any]:
+    """FIX 6: Rellena campos faltantes del índice vectorial con el catálogo de BusinessMemory."""
+    view = biz_mem.get_view(metadata.get("view_name", ""))
+    if not view:
+        return metadata
+    m = dict(metadata)
+    if not m.get("metrics"):
+        m["metrics"] = list(view.metricas.keys())
+    if not m.get("dimensions"):
+        m["dimensions"] = list(view.columnas_fecha)
+    if not m.get("temporal_type") or m.get("temporal_type") == "general":
+        tipo = (view.tipo or "").lower()
+        filtro = (view.filtro_fecha or "").lower()
+        if "historical" in tipo or "rango" in filtro:
+            m["temporal_type"] = "historical"
+        elif "current" in tipo or "snapshot" in tipo or "no aplica" in filtro:
+            m["temporal_type"] = "current"
+    if "supports_location_filter" not in m:
+        cols = [c.lower() for c in list(view.metricas.keys()) + list(view.columnas_fecha)]
+        m["supports_location_filter"] = any(
+            k in " ".join(cols) for k in ("sucursal", "sede", "local", "tienda", "plaza")
+        )
+    if not m.get("purpose"):
+        m["purpose"] = view.descripcion
+    return m
+
+
 def _calculate_metadata_score(
     query_temporal: Dict[str, Any],
     view_metadata: Dict[str, Any],
     query: str = "",
     column_hints: Optional[Dict[str, Any]] = None,
 ) -> float:
-    """
-    Calcula score adicional basado en metadata, contexto temporal y
-    dimensiones/métricas requeridas del payload o query.
-    """
+    """Calcula score adicional basado en metadata, contexto temporal y dimensiones."""
     score = 0.0
 
     meta = _apply_implicit_temporal_rules(query_temporal, view_metadata)
@@ -273,9 +314,6 @@ def _calculate_metadata_score(
     if "daily" in time_scope and query_temporal.get("day_mentioned"):
         score += 0.5
 
-    # ------------------------------------------------------------------------
-    # FIX 3: Penalizaciones proporcionales, usando column_hints cuando existan
-    # ------------------------------------------------------------------------
     required = _extract_required_columns(column_hints)
     requested_dims = required["dimensions"] or _detect_dimensions_in_query(query)
     requested_metrics = required["metrics"]
@@ -290,12 +328,12 @@ def _calculate_metadata_score(
             for avail_col in available_columns
         )
         if not has_dim:
-            score -= 2.0  # penalización proporcional (antes -5.0)
+            score -= 2.0
             logger.debug(
                 f"Penalizando vista '{meta.get('view_name')}' por falta de dimensión '{dim}'"
             )
         else:
-            score += 1.0  # bonus real por coincidencia
+            score += 1.0
 
     for met in requested_metrics:
         has_metric = any(
@@ -338,7 +376,6 @@ def _calculate_compatibility_score(
     requested_dims = required["dimensions"] or _detect_dimensions_in_query(safe_hints.get("original_query", ""))
     requested_metrics = required["metrics"]
 
-    # Validar métrica
     metric_hint = requested_metrics[0] if requested_metrics else safe_hints.get("metric", "")
     if metric_hint:
         if isinstance(metrics, list) and metrics:
@@ -355,7 +392,6 @@ def _calculate_compatibility_score(
         else:
             compatibility["metric"] = "missing"
 
-    # Validar ubicación
     location_hint = safe_hints.get("location", "")
     if location_hint:
         supports_location = adjusted_meta.get("supports_location_filter", False)
@@ -370,7 +406,6 @@ def _calculate_compatibility_score(
             if not has_location:
                 compatibility["location"] = "missing"
 
-    # Validar producto
     product_keywords = ["producto", "descripcion", "descripción", "nombre_producto", "sku", "articulo", "artículo", "item"]
     if any(d in requested_dims for d in ["producto", "descripcion", "descripción", "sku", "articulo", "artículo", "item"]):
         has_product = any(
@@ -380,7 +415,6 @@ def _calculate_compatibility_score(
         if not has_product:
             compatibility["product"] = "missing"
 
-    # Validar categoría
     if "categoria" in requested_dims or "categoría" in requested_dims:
         has_category = any(
             "categoria" in col or "categoría" in col
@@ -389,7 +423,6 @@ def _calculate_compatibility_score(
         if not has_category:
             compatibility["category"] = "missing"
 
-    # Validar fecha con reglas implícitas
     date_hint = safe_hints.get("date_range", "")
     if not date_hint and query_temporal.get("is_current"):
         date_hint = "current"
@@ -440,8 +473,9 @@ def obtener_candidatas_vistas(
     allowed_views: Optional[List[str]] = None,
     min_score_threshold: float = 0.0,
     column_hints: Optional[Dict[str, Any]] = None,
+    biz_mem: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
-    """Devuelve `k` vistas candidatas como diccionarios."""
+    """Devuelve `k` vistas candidatas como diccionarios con orden y similitud corregidos."""
     search_kwargs = {"k": k}
     filter_dict = _validate_chroma_filter(allowed_views)
     if filter_dict:
@@ -449,7 +483,7 @@ def obtener_candidatas_vistas(
 
     try:
         docs_with_scores = _vector_store.similarity_search_with_score(query, **search_kwargs)
-        logger.debug(f"Recuperados {len(docs_with_scores)} documentos con scores")
+        logger.debug(f"Recuperados {len(docs_with_scores)} documentos con scores crudos")
     except Exception as e:
         logger.warning(f"similarity_search_with_score falló: {e}")
         logger.info("Intentando con as_retriever...")
@@ -461,25 +495,36 @@ def obtener_candidatas_vistas(
 
     candidates = []
     for doc, score in docs_with_scores:
-        score_value = float(score) if score is not None else 0.0
+        # FIX 3: Conversión correcta de Distancia a Similitud ∈ (0, 1]
+        similarity = _distance_to_similarity(score)
+        
+        # Backfill opcional de metadata vacía
+        meta = doc.metadata
+        if biz_mem is not None:
+            meta = _backfill_metadata_from_catalog(meta, biz_mem)
+
         metadata_boost = _calculate_metadata_score(
-            temporal_context, doc.metadata, query, column_hints
+            temporal_context, meta, query, column_hints
         )
-        adjusted_score = score_value + metadata_boost
+        
+        # Escalar el boost para que sea proporcional a la similitud (0 a 1)
+        adjusted_score = similarity + (metadata_boost * 0.25)
 
         if adjusted_score < min_score_threshold:
             continue
 
         candidates.append({
-            "view_name": doc.metadata.get("view_name", ""),
+            "view_name": meta.get("view_name", ""),
             "context": doc.page_content,
             "score": adjusted_score,
-            "original_score": score_value,
+            "original_score": similarity,
+            "raw_distance": float(score) if score is not None else None,
             "metadata_boost": metadata_boost,
             "temporal_context": temporal_context,
-            "view_metadata": doc.metadata
+            "view_metadata": meta
         })
 
+    # FIX 3: Orden descendente correcto (mayor similitud y boost primero)
     candidates.sort(key=lambda x: x["score"] or 0.0, reverse=True)
     logger.debug(f"Retornando {len(candidates)} candidatos después de ajuste de scores")
     return candidates
@@ -491,6 +536,7 @@ def obtener_candidatas_detalles(
     allowed_views: Optional[List[str]] = None,
     min_score_threshold: float = 0.0,
     column_hints: Optional[Dict[str, Any]] = None,
+    biz_mem: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Devuelve vistas candidatas con metadata detallada y compatibilidad semántica."""
     candidates = obtener_candidatas_vistas(
@@ -499,6 +545,7 @@ def obtener_candidatas_detalles(
         allowed_views=allowed_views,
         min_score_threshold=min_score_threshold,
         column_hints=column_hints,
+        biz_mem=biz_mem,
     )
 
     enriched_hints = dict(column_hints) if column_hints else {}
@@ -520,6 +567,7 @@ def obtener_candidatas_detalles(
             "view_name": candidate["view_name"],
             "score": candidate["score"],
             "original_score": candidate["original_score"],
+            "raw_distance": candidate.get("raw_distance"),
             "metadata_boost": candidate["metadata_boost"],
             "purpose": metadata.get("purpose", ""),
             "grain": metadata.get("grain", "desconocido"),
@@ -540,23 +588,29 @@ def obtener_candidatas_detalles(
 
     detailed_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    logger.info(f"Top 3 candidatos para '{query}':")
-    for i, candidate in enumerate(detailed_candidates[:3]):
-        status = "✅" if candidate["can_answer"] else "❌"
-        logger.info(f"  {i+1}. {status} {candidate['view_name']} (score: {candidate['score']:.3f}) - {candidate['compatibility_reason']}")
+    # FIX 1: Log truthful — muestra conteo y diagnóstico si la colección está vacía
+    raw_count = len(candidates)
+    if not detailed_candidates:
+        logger.warning(
+            f"Retriever: 0 candidatas para '{query}' "
+            f"(docs crudos de Chroma: {raw_count} — si es 0, la colección está vacía "
+            f"o CHROMA_DIR no apunta al índice: {CHROMA_DIR})"
+        )
+    else:
+        logger.info(f"Top 3 candidatos para '{query}':")
+        for i, candidate in enumerate(detailed_candidates[:3]):
+            status = "✅" if candidate["can_answer"] else "❌"
+            logger.info(
+                f"  {i+1}. {status} {candidate['view_name']} "
+                f"(score: {candidate['score']:.3f}, sim: {candidate['original_score']:.3f}, boost: {candidate['metadata_boost']:+.2f}) "
+                f"- {candidate['compatibility_reason']}"
+            )
 
     return detailed_candidates
 
 
-# ============================================================================
-# FIX 4: Helper público para convertir SQLPayload → column_hints
-# ============================================================================
-
 def payload_to_column_hints(payload: Any, original_query: str = "") -> Dict[str, Any]:
-    """
-    Convierte un SQLPayload-like en column_hints para el semantic_retriever.
-    Lee atributos comunes sin importar el tipo concreto del payload.
-    """
+    """Convierte un SQLPayload-like en column_hints para el semantic_retriever."""
     metrics = getattr(payload, "metrics", None) or []
     dimensions = getattr(payload, "dimensions", None) or []
 
@@ -604,25 +658,30 @@ def seleccionar_vista_principal(
     column_hints: Optional[Dict[str, Any]] = None,
     allowed_views: Optional[List[str]] = None,
     min_score_threshold: float = 0.0,
+    precomputed_candidates: Optional[List[Dict[str, Any]]] = None,
+    biz_mem: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Selecciona la vista principal más relevante para una consulta.
-    CON VALIDACIÓN EXPLÍCITA DE COMPATIBILIDAD Y FALLBACKS.
+    Soporta `precomputed_candidates` para evitar doble cómputo de embeddings (FIX 4).
     """
-    candidates = obtener_candidatas_detalles(
-        query=query,
-        k=10,
-        allowed_views=allowed_views,
-        min_score_threshold=min_score_threshold,
-        column_hints=column_hints
-    )
+    if precomputed_candidates is not None:
+        candidates = precomputed_candidates
+    else:
+        candidates = obtener_candidatas_detalles(
+            query=query,
+            k=10,
+            allowed_views=allowed_views,
+            min_score_threshold=min_score_threshold,
+            column_hints=column_hints,
+            biz_mem=biz_mem,
+        )
 
     if not candidates:
         logger.info(f"No se encontraron vistas candidatas para: '{query}'")
         return None
 
     compatible = [c for c in candidates if c.get("can_answer")]
-    incompatible = [c for c in candidates if not c.get("can_answer")]
 
     if compatible:
         vista_principal = compatible[0]
@@ -639,9 +698,7 @@ def seleccionar_vista_principal(
         f"(score: {vista_principal['score']:.3f}) - {vista_principal['compatibility_reason']}"
     )
 
-    # ------------------------------------------------------------------------
-    # FIX 5: Fallbacks solo si la vista principal NO puede responder
-    # ------------------------------------------------------------------------
+    # Fallbacks solo si la vista principal NO puede responder
     if not vista_principal.get("can_answer"):
         temporal_context = _detect_temporal_context(query)
         required = _extract_required_columns(column_hints)
