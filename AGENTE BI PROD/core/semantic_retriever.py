@@ -6,9 +6,11 @@ import logging
 import re
 from datetime import datetime
 import os
+import hashlib
 
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
@@ -19,25 +21,332 @@ CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
 COLLECTION_NAME = "semantic_views"
 
 _embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-_vector_store = Chroma(
-    collection_name=COLLECTION_NAME,
-    embedding_function=_embeddings,
-    persist_directory=str(CHROMA_DIR),
-)
 
-# ----------------------------------------------------------------------------
-# FIX 2: Health probe al importar (Fail loud / Warn si el índice está vacío)
-# ----------------------------------------------------------------------------
+# Inicializar vector store con manejo de errores
+try:
+    _vector_store = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=_embeddings,
+        persist_directory=str(CHROMA_DIR),
+    )
+    logger.info(f"[Retriever] Chroma inicializado en {CHROMA_DIR}")
+except Exception as e:
+    logger.error(f"[Retriever] Error al inicializar Chroma: {e}")
+    raise
+
+
+# ============================================================================
+# AUTO-INICIALIZACIÓN DE LA COLECCIÓN
+# ============================================================================
+
+def _extract_field(text: str, field_name: str) -> str:
+    """Extrae un campo del markdown tipo **Campo**: valor."""
+    pattern = rf'(?:-\s*)?\*\*{re.escape(field_name)}\*\*[:：]\s*(.*?)(?=\n\s*(?:-\s*)?\*\*|\Z)'
+    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return ""
+
+
+def _extract_metrics_from_description(description: str) -> List[str]:
+    """Extrae métricas de las viñetas con formato - `nombre`: descripción."""
+    metrics = []
+    pattern = r'-\s*`([^`]+)`\s*:'
+    matches = re.findall(pattern, description)
+    
+    non_metric_words = {
+        'descripción', 'descripcion', 'tipo', 'granularidad', 'filtro fecha',
+        'grano', 'filas', 'nota', 'fecha', 'fecha_key', 'fecha_completa',
+        'fecha_venta', 'nombre_sede', 'sucursal', 'nombre_dia_semana',
+        'nombre_dia', 'hora', 'mes'
+    }
+    
+    for match in matches:
+        if match.lower() not in non_metric_words:
+            metrics.append(match)
+    
+    return metrics
+
+
+def _infer_dimensions_from_metrics(metrics: List[str], description: str) -> List[str]:
+    """Infiere dimensiones basándose en las métricas y la descripción."""
+    dimensions = set()
+    
+    # Palabras clave para dimensiones
+    dim_keywords = {
+        'sede': ['sede', 'sucursal', 'local', 'tienda', 'plaza', 'ubicacion', 'ubicación', 'store', 'branch'],
+        'producto': ['producto', 'sku', 'articulo', 'artículo', 'item', 'descripcion'],
+        'categoria': ['categoria', 'categoría', 'categoria_nueva', 'subcategoria'],
+        'fecha': ['fecha', 'fecha_completa', 'fecha_venta', 'fecha_key', 'mes', 'periodo'],
+        'hora': ['hora', 'franja_horaria', 'horario'],
+    }
+    
+    # Buscar en métricas
+    for metric in metrics:
+        metric_lower = metric.lower()
+        for dim, keywords in dim_keywords.items():
+            if any(kw in metric_lower for kw in keywords):
+                dimensions.add(dim)
+    
+    # Buscar en descripción
+    description_lower = description.lower()
+    for dim, keywords in dim_keywords.items():
+        if any(kw in description_lower for kw in keywords):
+            dimensions.add(dim)
+    
+    # Si no se encontraron dimensiones, usar 'general'
+    if not dimensions:
+        dimensions.add('general')
+    
+    return list(dimensions)
+
+
+def _infer_temporal_type(view_name: str, description: str) -> str:
+    """Determina el tipo temporal de la vista."""
+    combined = f"{view_name} {description}".lower()
+    
+    if any(w in combined for w in ["latest", "hoy", "actual", "today", "snapshot", "current"]):
+        return "current"
+    elif any(w in combined for w in ["histor", "history", "tendencia", "evolución", "time_series", "histórico"]):
+        return "historical"
+    elif any(w in combined for w in ["week", "semana", "comparativa", "compare"]):
+        return "periodic"
+    elif any(w in combined for w in ["dashboard"]):
+        return "dashboard"
+    else:
+        return "general"
+
+
+def _infer_time_scope(description: str) -> str:
+    """Determina el alcance temporal de la vista."""
+    desc_lower = description.lower()
+    
+    if any(w in desc_lower for w in ["hora", "horaria", "hourly"]):
+        return "hourly"
+    elif any(w in desc_lower for w in ["día", "diario", "fecha", "daily", "dia"]):
+        return "daily"
+    elif any(w in desc_lower for w in ["semana", "semanal", "weekly"]):
+        return "weekly"
+    elif any(w in desc_lower for w in ["mes", "mensual", "monthly"]):
+        return "monthly"
+    else:
+        return "unknown"
+
+
+def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
+    """Construye documentos a partir del archivo AGENTS.md."""
+    
+    VALID_VIEWS = {
+        'sales_review_day',
+        'sales_review_day_history',
+        'sales_review_locales_latest',
+        'sales_review_locales',
+        'sales_week',
+        'sales_producto_daily',
+        'mart_operacion_hora',
+        'dashboard_canjes_resumen',
+        'kpi_fidelizacion_detalle',
+        'dashboard_cortesias_resumen',
+        'kpi_cortesia_detalle',
+        'kpi_categorias_diario',
+        'dashboard_participacion_categorias',
+        'kpi_categorias_productos_sede'
+    }
+    
+    if not agents_path.exists():
+        logger.error(f"No se encontró AGENTS.md en: {agents_path}")
+        return []
+    
+    try:
+        raw = agents_path.read_text(encoding="utf-8-sig")
+    except Exception as e:
+        logger.error(f"Error al leer AGENTS.md: {e}")
+        return []
+    
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    
+    # Extraer sección 3
+    section_3_match = re.search(r'## 3\. Vistas Semánticas.*?(?=## 4\.|$)', raw, re.DOTALL)
+    if not section_3_match:
+        logger.error("No se encontró la sección 3 'Vistas Semánticas' en AGENTS.md")
+        return []
+    
+    section_3 = section_3_match.group(0)
+    parts = re.split(r'\n(?=###\s+)', section_3)
+    
+    documents = []
+    seen_views = set()
+    
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        
+        first_line = part.splitlines()[0].strip()
+        m_view = re.match(r'^###\s+([A-Za-z0-9_]+)', first_line)
+        if not m_view:
+            continue
+        
+        view_name = m_view.group(1).strip()
+        
+        # Validar y evitar duplicados
+        if view_name not in VALID_VIEWS:
+            logger.debug(f"Omitiendo sección no-vista: {view_name}")
+            continue
+        
+        if view_name in seen_views:
+            logger.warning(f"Vista duplicada encontrada: {view_name}. Omitiendo...")
+            continue
+        seen_views.add(view_name)
+        
+        description = "\n".join(part.splitlines()[1:]).strip()
+        
+        # Extraer campos
+        purpose = _extract_field(description, "Descripción") or _extract_field(description, "Propósito")
+        grain = _extract_field(description, "Granularidad") or _extract_field(description, "Grain")
+        
+        # Extraer métricas
+        metrics = _extract_metrics_from_description(description)
+        if not metrics:
+            metrics = [f"metrica_{view_name}"]
+        
+        # Inferir dimensiones
+        dimensions = _infer_dimensions_from_metrics(metrics, description)
+        
+        # Valores por defecto
+        if not purpose:
+            purpose = f"Vista {view_name}"
+        if not grain:
+            grain = "general"
+        
+        # Clasificación temporal
+        temporal_type = _infer_temporal_type(view_name, description)
+        time_scope = _infer_time_scope(description)
+        
+        # Detección de filtros
+        dims_lower = [d.lower() for d in dimensions]
+        supports_date_filter = any(d in dims_lower for d in ["fecha", "date", "periodo", "mes", "año", "dia", "día", "hora"])
+        supports_location_filter = any(d in dims_lower for d in ["sede", "local", "sucursal", "ubicacion", "ubicación", "store", "branch"])
+        
+        # Construir keywords
+        keywords_str = f"{view_name} {purpose} " + " ".join(metrics[:5])
+        
+        # Crear contenido
+        page_content = (
+            f"VISTA SEMÁNTICA: semantic.{view_name}\n"
+            f"NOMBRE TÉCNICO: {view_name}\n"
+            f"CONTEXTO DE NEGOCIO Y REGLAS:\n{description}\n"
+            f"KEYWORDS PARA BÚSQUEDA: {keywords_str}"
+        )
+        
+        # Crear ID único
+        doc_id = hashlib.sha256(f"semantic.{view_name}".encode()).hexdigest()
+        
+        # Crear documento
+        documents.append(Document(
+            page_content=page_content,
+            metadata={
+                "view_name": f"semantic.{view_name}",
+                "schema": "semantic",
+                "keywords": keywords_str,
+                "purpose": purpose[:500],
+                "grain": grain,
+                "metrics": metrics[:15],
+                "dimensions": dimensions[:10],
+                "notes": "",
+                "temporal_type": temporal_type,
+                "time_scope": time_scope,
+                "supports_date_filter": supports_date_filter,
+                "supports_location_filter": supports_location_filter,
+            },
+            id=doc_id
+        ))
+        
+        logger.debug(f"Documento creado: semantic.{view_name} | temporal: {temporal_type} | metrics: {len(metrics)} | dims: {len(dimensions)}")
+    
+    logger.info(f"Total de documentos creados: {len(documents)}")
+    return documents
+
+
+def _initialize_collection():
+    """Inicializa la colección si está vacía."""
+    try:
+        # Verificar si la colección tiene documentos
+        count = _vector_store._collection.count()
+        if count > 0:
+            logger.info(f"[Retriever] Colección ya inicializada con {count} documentos")
+            return True
+        
+        logger.info("[Retriever] Colección vacía. Iniciando indexación automática...")
+        
+        # Buscar AGENTS.md
+        agents_path = Path(os.getenv("AGENTS_MD_PATH", str(BASE_DIR / "AGENTS.md")))
+        
+        if not agents_path.exists():
+            # Buscar en rutas alternativas
+            alternative_paths = [
+                BASE_DIR / "AGENTS.md",
+                Path("/app/AGENTS.md"),
+                Path("/data/AGENTS.md"),
+                Path.cwd() / "AGENTS.md",
+            ]
+            
+            for alt_path in alternative_paths:
+                if alt_path.exists():
+                    agents_path = alt_path
+                    logger.info(f"AGENTS.md encontrado en: {agents_path}")
+                    break
+            else:
+                logger.error(f"No se encontró AGENTS.md en ninguna ruta conocida")
+                return False
+        
+        # Construir documentos
+        documents = _build_documents_from_agents_md(agents_path)
+        
+        if not documents:
+            logger.error("No se pudieron crear documentos para indexar")
+            return False
+        
+        # Indexar documentos
+        _vector_store.add_documents(documents=documents, ids=[d.id for d in documents])
+        
+        # Verificar
+        count = _vector_store._collection.count()
+        logger.info(f"✅ Indexación automática completada: {count} documentos")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error durante la indexación automática: {e}", exc_info=True)
+        return False
+
+
+# Ejecutar inicialización al importar
+_DOC_COUNT = -1
 try:
     _DOC_COUNT = _vector_store._collection.count()
-except Exception:
-    _DOC_COUNT = -1
+    logger.info(f"[Retriever] Documentos en colección: {_DOC_COUNT}")
+except Exception as e:
+    logger.warning(f"[Retriever] No se pudo obtener el conteo de documentos: {e}")
 
 if _DOC_COUNT <= 0:
     logger.warning(
         f"[Retriever] ⚠️ Colección '{COLLECTION_NAME}' vacía o inaccesible en {CHROMA_DIR}. "
-        f"La selección semántica está degradada: el sistema operará solo con fallback léxico."
+        f"Intentando auto-inicialización..."
     )
+    _initialize_collection()
+    # Actualizar conteo
+    try:
+        _DOC_COUNT = _vector_store._collection.count()
+    except Exception:
+        _DOC_COUNT = -1
+    
+    if _DOC_COUNT > 0:
+        logger.info(f"[Retriever] ✅ Colección inicializada correctamente: {_DOC_COUNT} documentos")
+    else:
+        logger.error(
+            f"[Retriever] ❌ No se pudo inicializar la colección. "
+            f"El sistema operará solo con fallback léxico."
+        )
 else:
     logger.info(f"[Retriever] Colección '{COLLECTION_NAME}' lista: {_DOC_COUNT} vistas indexadas.")
 
@@ -92,8 +401,6 @@ def _detect_temporal_context(query: str) -> Dict[str, Any]:
                 context["is_future"] = True
                 context["needs_specific_date"] = True
             else:
-                # FIX 5: Año explícito (incluido el en curso) ⇒ consulta de rango, no snapshot.
-                # "Ventas del año 2026" pide agregación anual, no el estado del día de hoy.
                 context["is_historical"] = True
                 context["needs_specific_date"] = True
 
@@ -245,7 +552,7 @@ def _apply_implicit_temporal_rules(
 
 def _distance_to_similarity(distance: float) -> float:
     """
-    FIX 3: Chroma devuelve DISTANCIA (menor = mejor). 
+    Chroma devuelve DISTANCIA (menor = mejor). 
     Convertimos a similitud ∈ (0, 1].
     """
     try:
@@ -256,7 +563,7 @@ def _distance_to_similarity(distance: float) -> float:
 
 
 def _backfill_metadata_from_catalog(metadata: Dict[str, Any], biz_mem: Any) -> Dict[str, Any]:
-    """FIX 6: Rellena campos faltantes del índice vectorial con el catálogo de BusinessMemory."""
+    """Rellena campos faltantes del índice vectorial con el catálogo de BusinessMemory."""
     view = biz_mem.get_view(metadata.get("view_name", ""))
     if not view:
         return metadata
@@ -487,18 +794,20 @@ def obtener_candidatas_vistas(
     except Exception as e:
         logger.warning(f"similarity_search_with_score falló: {e}")
         logger.info("Intentando con as_retriever...")
-        retriever = _vector_store.as_retriever(search_kwargs=search_kwargs)
-        docs = retriever.invoke(query)
-        docs_with_scores = [(doc, 0.0) for doc in docs]
+        try:
+            retriever = _vector_store.as_retriever(search_kwargs=search_kwargs)
+            docs = retriever.invoke(query)
+            docs_with_scores = [(doc, 0.0) for doc in docs]
+        except Exception as e2:
+            logger.error(f"Error completo en recuperación: {e2}")
+            return []
 
     temporal_context = _detect_temporal_context(query)
 
     candidates = []
     for doc, score in docs_with_scores:
-        # FIX 3: Conversión correcta de Distancia a Similitud ∈ (0, 1]
         similarity = _distance_to_similarity(score)
         
-        # Backfill opcional de metadata vacía
         meta = doc.metadata
         if biz_mem is not None:
             meta = _backfill_metadata_from_catalog(meta, biz_mem)
@@ -507,7 +816,6 @@ def obtener_candidatas_vistas(
             temporal_context, meta, query, column_hints
         )
         
-        # Escalar el boost para que sea proporcional a la similitud (0 a 1)
         adjusted_score = similarity + (metadata_boost * 0.25)
 
         if adjusted_score < min_score_threshold:
@@ -524,7 +832,6 @@ def obtener_candidatas_vistas(
             "view_metadata": meta
         })
 
-    # FIX 3: Orden descendente correcto (mayor similitud y boost primero)
     candidates.sort(key=lambda x: x["score"] or 0.0, reverse=True)
     logger.debug(f"Retornando {len(candidates)} candidatos después de ajuste de scores")
     return candidates
@@ -588,7 +895,6 @@ def obtener_candidatas_detalles(
 
     detailed_candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    # FIX 1: Log truthful — muestra conteo y diagnóstico si la colección está vacía
     raw_count = len(candidates)
     if not detailed_candidates:
         logger.warning(
@@ -663,7 +969,7 @@ def seleccionar_vista_principal(
 ) -> Optional[Dict[str, Any]]:
     """
     Selecciona la vista principal más relevante para una consulta.
-    Soporta `precomputed_candidates` para evitar doble cómputo de embeddings (FIX 4).
+    Soporta `precomputed_candidates` para evitar doble cómputo de embeddings.
     """
     if precomputed_candidates is not None:
         candidates = precomputed_candidates
@@ -736,4 +1042,3 @@ def seleccionar_vista_principal(
                             return candidate
 
     return vista_principal
-
