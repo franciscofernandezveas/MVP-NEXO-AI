@@ -72,7 +72,6 @@ def _infer_dimensions_from_metrics(metrics: List[str], description: str) -> List
     """Infiere dimensiones basándose en las métricas y la descripción."""
     dimensions = set()
     
-    # Palabras clave para dimensiones
     dim_keywords = {
         'sede': ['sede', 'sucursal', 'local', 'tienda', 'plaza', 'ubicacion', 'ubicación', 'store', 'branch'],
         'producto': ['producto', 'sku', 'articulo', 'artículo', 'item', 'descripcion'],
@@ -81,20 +80,17 @@ def _infer_dimensions_from_metrics(metrics: List[str], description: str) -> List
         'hora': ['hora', 'franja_horaria', 'horario'],
     }
     
-    # Buscar en métricas
     for metric in metrics:
         metric_lower = metric.lower()
         for dim, keywords in dim_keywords.items():
             if any(kw in metric_lower for kw in keywords):
                 dimensions.add(dim)
     
-    # Buscar en descripción
     description_lower = description.lower()
     for dim, keywords in dim_keywords.items():
         if any(kw in description_lower for kw in keywords):
             dimensions.add(dim)
     
-    # Si no se encontraron dimensiones, usar 'general'
     if not dimensions:
         dimensions.add('general')
     
@@ -189,7 +185,6 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
         
         view_name = m_view.group(1).strip()
         
-        # Validar y evitar duplicados
         if view_name not in VALID_VIEWS:
             logger.debug(f"Omitiendo sección no-vista: {view_name}")
             continue
@@ -242,7 +237,11 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
         # Crear ID único
         doc_id = hashlib.sha256(f"semantic.{view_name}".encode()).hexdigest()
         
-        # Crear documento
+        # *** CORRECCIÓN CRÍTICA: Convertir listas a strings ***
+        metrics_str = ", ".join(metrics[:15])
+        dimensions_str = ", ".join(dimensions[:10])
+        
+        # Crear documento con metadatos válidos para Chroma
         documents.append(Document(
             page_content=page_content,
             metadata={
@@ -251,8 +250,8 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
                 "keywords": keywords_str,
                 "purpose": purpose[:500],
                 "grain": grain,
-                "metrics": metrics[:15],
-                "dimensions": dimensions[:10],
+                "metrics": metrics_str,      # ✅ String
+                "dimensions": dimensions_str, # ✅ String
                 "notes": "",
                 "temporal_type": temporal_type,
                 "time_scope": time_scope,
@@ -271,7 +270,6 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
 def _initialize_collection():
     """Inicializa la colección si está vacía."""
     try:
-        # Verificar si la colección tiene documentos
         count = _vector_store._collection.count()
         if count > 0:
             logger.info(f"[Retriever] Colección ya inicializada con {count} documentos")
@@ -283,10 +281,10 @@ def _initialize_collection():
         agents_path = Path(os.getenv("AGENTS_MD_PATH", str(BASE_DIR / "AGENTS.md")))
         
         if not agents_path.exists():
-            # Buscar en rutas alternativas
             alternative_paths = [
                 BASE_DIR / "AGENTS.md",
                 Path("/app/AGENTS.md"),
+                Path("/app/AGENTE BI PROD/AGENTS.md"),
                 Path("/data/AGENTS.md"),
                 Path.cwd() / "AGENTS.md",
             ]
@@ -334,7 +332,6 @@ if _DOC_COUNT <= 0:
         f"Intentando auto-inicialización..."
     )
     _initialize_collection()
-    # Actualizar conteo
     try:
         _DOC_COUNT = _vector_store._collection.count()
     except Exception:
@@ -349,6 +346,26 @@ if _DOC_COUNT <= 0:
         )
 else:
     logger.info(f"[Retriever] Colección '{COLLECTION_NAME}' lista: {_DOC_COUNT} vistas indexadas.")
+
+
+# ============================================================================
+# FUNCIONES AUXILIARES PARA MANEJAR STRINGS Y LISTAS
+# ============================================================================
+
+def _get_metrics_list(metadata: Dict[str, Any]) -> List[str]:
+    """Convierte metrics de string a lista si es necesario."""
+    metrics = metadata.get("metrics", [])
+    if isinstance(metrics, str):
+        return [m.strip() for m in metrics.split(",") if m.strip()]
+    return metrics if isinstance(metrics, list) else []
+
+
+def _get_dimensions_list(metadata: Dict[str, Any]) -> List[str]:
+    """Convierte dimensions de string a lista si es necesario."""
+    dimensions = metadata.get("dimensions", [])
+    if isinstance(dimensions, str):
+        return [d.strip() for d in dimensions.split(",") if d.strip()]
+    return dimensions if isinstance(dimensions, list) else []
 
 
 # ============================================================================
@@ -551,10 +568,7 @@ def _apply_implicit_temporal_rules(
 
 
 def _distance_to_similarity(distance: float) -> float:
-    """
-    Chroma devuelve DISTANCIA (menor = mejor). 
-    Convertimos a similitud ∈ (0, 1].
-    """
+    """Convierte distancia de Chroma a similitud ∈ (0, 1]."""
     try:
         d = max(float(distance), 0.0)
     except (TypeError, ValueError):
@@ -569,9 +583,9 @@ def _backfill_metadata_from_catalog(metadata: Dict[str, Any], biz_mem: Any) -> D
         return metadata
     m = dict(metadata)
     if not m.get("metrics"):
-        m["metrics"] = list(view.metricas.keys())
+        m["metrics"] = ", ".join(list(view.metricas.keys()))
     if not m.get("dimensions"):
-        m["dimensions"] = list(view.columnas_fecha)
+        m["dimensions"] = ", ".join(list(view.columnas_fecha))
     if not m.get("temporal_type") or m.get("temporal_type") == "general":
         tipo = (view.tipo or "").lower()
         filtro = (view.filtro_fecha or "").lower()
@@ -625,8 +639,9 @@ def _calculate_metadata_score(
     requested_dims = required["dimensions"] or _detect_dimensions_in_query(query)
     requested_metrics = required["metrics"]
 
-    metrics = meta.get("metrics", []) or []
-    dimensions = meta.get("dimensions", []) or []
+    # Usar funciones auxiliares para manejar strings y listas
+    metrics = _get_metrics_list(meta)
+    dimensions = _get_dimensions_list(meta)
     available_columns = [str(d) for d in dimensions] + [str(m) for m in metrics]
 
     for dim in requested_dims:
@@ -636,9 +651,6 @@ def _calculate_metadata_score(
         )
         if not has_dim:
             score -= 2.0
-            logger.debug(
-                f"Penalizando vista '{meta.get('view_name')}' por falta de dimensión '{dim}'"
-            )
         else:
             score += 1.0
 
@@ -649,9 +661,6 @@ def _calculate_metadata_score(
         )
         if not has_metric:
             score -= 1.5
-            logger.debug(
-                f"Penalizando vista '{meta.get('view_name')}' por falta de métrica '{met}'"
-            )
         else:
             score += 0.8
 
@@ -675,8 +684,9 @@ def _calculate_compatibility_score(
     query_temporal = _detect_temporal_context(safe_hints.get("original_query", ""))
     adjusted_meta = _apply_implicit_temporal_rules(query_temporal, view_metadata)
 
-    metrics = adjusted_meta.get("metrics", []) or []
-    dimensions = adjusted_meta.get("dimensions", []) or []
+    # Usar funciones auxiliares para manejar strings y listas
+    metrics = _get_metrics_list(adjusted_meta)
+    dimensions = _get_dimensions_list(adjusted_meta)
     available_columns = [str(d).lower() for d in dimensions] + [str(m).lower() for m in metrics]
 
     required = _extract_required_columns(safe_hints)
@@ -685,7 +695,7 @@ def _calculate_compatibility_score(
 
     metric_hint = requested_metrics[0] if requested_metrics else safe_hints.get("metric", "")
     if metric_hint:
-        if isinstance(metrics, list) and metrics:
+        if metrics:
             metric_found = any(
                 isinstance(view_metric, str)
                 and (
@@ -704,7 +714,7 @@ def _calculate_compatibility_score(
         supports_location = adjusted_meta.get("supports_location_filter", False)
         if not supports_location:
             compatibility["location"] = "missing"
-        elif isinstance(dimensions, list):
+        elif dimensions:
             location_keywords = ["sucursal", "nombre_sede", "sede", "local", "tienda", "plaza", "ubicacion", "ubicación"]
             has_location = any(
                 any(keyword in str(dim).lower() for keyword in location_keywords)
@@ -743,7 +753,7 @@ def _calculate_compatibility_score(
         else:
             implicit_scope = adjusted_meta.get("implicit_date_scope", "none")
             if implicit_scope not in ("current_day", "historical_range"):
-                if isinstance(dimensions, list):
+                if dimensions:
                     time_keywords = ["fecha", "date", "time", "periodo", "mes", "año", "dia", "día", "hora"]
                     has_time = any(
                         any(keyword in str(dim).lower() for keyword in time_keywords)
@@ -862,8 +872,9 @@ def obtener_candidatas_detalles(
     for candidate in candidates:
         metadata = candidate["view_metadata"]
 
-        metrics = metadata.get("metrics", []) if isinstance(metadata.get("metrics"), list) else []
-        dimensions = metadata.get("dimensions", []) if isinstance(metadata.get("dimensions"), list) else []
+        # Usar funciones auxiliares para manejar strings y listas
+        metrics = _get_metrics_list(metadata)
+        dimensions = _get_dimensions_list(metadata)
         usage_examples = metadata.get("usage_examples", []) if isinstance(metadata.get("usage_examples"), list) else []
 
         compatibility = _calculate_compatibility_score(enriched_hints, metadata)
