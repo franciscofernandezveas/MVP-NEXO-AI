@@ -1,19 +1,41 @@
 version: "3.8"
 
 services:
-  api:
+  # Job one-shot: (re)indexa AGENTS.md ANTES de levantar la API.
+  # Solo hace trabajo si el sha256 del archivo cambió; si el índice
+  # está vigente termina en ~1 segundo sin llamar a OpenAI.
+  reindex:
     build: .
-    container_name: nexo-api
-    ports:
-      - "8000:8000"
+    container_name: nexo-reindex
     volumes:
       - ./data:/data
-      - ./AGENTE BI PROD/chroma_db:/data/chroma_db:ro
-
+      - "./AGENTE BI PROD/chroma_db:/data/chroma_db"      # rw: el job ESCRIBE el índice
+      - "./AGENTE BI PROD/AGENTS.md:/data/agents/AGENTS.md:ro"
     env_file:
       - .env
     environment:
       - CHROMA_DIR=/data/chroma_db
+      - AGENTS_MD_PATH=/data/agents/AGENTS.md
+    command: python -m core.rag reindex
+    restart: "no"
+
+  api:
+    build: .
+    container_name: nexo-api
+    depends_on:
+      reindex:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - "./AGENTE BI PROD/chroma_db:/data/chroma_db"      # rw: Chroma/SQLite lo requiere
+      - "./AGENTE BI PROD/AGENTS.md:/data/agents/AGENTS.md:ro"
+    env_file:
+      - .env
+    environment:
+      - CHROMA_DIR=/data/chroma_db
+      - AGENTS_MD_PATH=/data/agents/AGENTS.md
       - AGENTS_DIR=/data/agents
       - FILES_DIR=/data/files
       - VIZ_DIR=/data/visualizations

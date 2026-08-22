@@ -36,12 +36,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from core.llm import LLM
 from core.contracts import PlannerContract, SQLPayload
 from core.harness import BusinessMemory
-from core.semantic_retriever import (
-    obtener_candidatas_detalles,
-    payload_to_column_hints,
-    # NOTA (2.9): se elimina `seleccionar_vista_principal` de aquí — el fallback
-    # ahora pasa por el mismo pipeline `_select_view_for_task` que el resto de tareas.
-)
+
+from core.rag import obtener_candidatas_detalles
+
 
 logger = logging.getLogger(__name__)
 
@@ -505,9 +502,22 @@ def _select_view_for_task(
     allowed_views: List[str],
     original_query: str = "",
 ) -> tuple[Optional[str], List[str], List[str]]:
-    errors: List[str] = []
+    """
+    Selección de vista para una tarea del plan.
 
-    hints = payload_to_column_hints(task, original_query=original_query or task.task)
+    Cambios (migración a core.rag):
+      - payload_to_column_hints eliminado: el RAG ya no consume hints.
+      - min_score_threshold=0.20 (coseno): si nada supera el umbral, el
+        retriever devuelve [] y el control pasa al fallback unificado.
+      - Rama can_answer eliminada: era código muerto — rag.py devuelve
+        can_answer=True siempre; el ranking coseno ya ordenó, la mejor es [0].
+      - Fallback unificado FUERA del try/except: aplica igual si el retriever
+        lanza excepción que si devuelve lista vacía (antes, en el caso vacío
+        sin excepción, no se consideraban original_candidates).
+      - preferred se toma de retriever_candidates (ya filtrado por
+        allowed_views), no de detailed[0] crudo.
+    """
+    errors: List[str] = []
 
     original_candidates = [
         _ensure_semantic_prefix(cv)
@@ -523,25 +533,22 @@ def _select_view_for_task(
             query=task.task,
             k=5,
             allowed_views=allowed_views,
-            column_hints=hints,
+            min_score_threshold=0.20,
         )
         retriever_candidates = [
             _ensure_semantic_prefix(c["view_name"])
             for c in detailed
             if _ensure_semantic_prefix(c["view_name"]) in allowed_views
         ]
-        for c in detailed:
-            if c.get("can_answer"):
-                preferred = _ensure_semantic_prefix(c["view_name"])
-                break
-        if not preferred and detailed:
-            preferred = _ensure_semantic_prefix(detailed[0]["view_name"])
-            errors.append(
-                f"Tarea {task.task_id}: ninguna vista es completamente compatible; "
-                f"se usará la mejor disponible: {preferred}"
-            )
+        # El ranking coseno ya ordenó; la mejor candidata autorizada es la primera.
+        if retriever_candidates:
+            preferred = retriever_candidates[0]
     except Exception as e:
-        logger.warning(f"[Planner] semantic_retriever falló para tarea {task.task_id}: {e}")
+        logger.warning(f"[Planner] retriever falló para tarea {task.task_id}: {e}")
+
+    # Fallback unificado: retriever sin resultados sobre umbral, excepción,
+    # o resultados fuera de allowed_views.
+    if not preferred:
         preferred = _find_compatible_view(task, allowed_views) or (
             original_candidates[0] if original_candidates else None
         )
@@ -550,9 +557,6 @@ def _select_view_for_task(
                 f"Tarea {task.task_id}: no se pudo seleccionar vista "
                 f"(retriever y fallback léxico fallaron)."
             )
-
-    if not preferred:
-        preferred = _find_compatible_view(task, allowed_views)
 
     merged_candidates: List[str] = []
     seen: Set[str] = set()
@@ -579,7 +583,7 @@ def _select_view_for_task(
             else:
                 errors.extend([f"Tarea {task.task_id}: {err}" for err in lexical_errors])
         else:
-            # NUEVO (2.8): columnas no exactas → pista al SQL Agent vía assumptions,
+            # (2.8): columnas no exactas → pista al SQL Agent vía assumptions,
             # sin bloquear el plan ni pedir aclaraciones espurias al usuario.
             col_warnings = _collect_column_warnings(task)
             if col_warnings:

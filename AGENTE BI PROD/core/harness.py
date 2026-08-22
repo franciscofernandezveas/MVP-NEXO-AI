@@ -1,21 +1,36 @@
 # core/harness.py
 # -------------------------------------------------
-# Cambios aplicados (alineación temporal del harness):
+# Historial reciente:
 #  H1 Intención temporal estructurada compartida: _temporal_intent/_is_snapshot_view/
 #     _is_historical_view/_historical_variants_for — el detector y la escalada usan
 #     el mismo criterio (dejan de divergir)
-#  H2 Promoción de vista histórica al allowlist: la ambigüedad se RESUELVE
-#     (antes: nota "considera su versión _history" advisory-only que nadie ejecutaba).
+#  H2 Promoción de vista histórica al allowlist: la ambigüedad se RESUELVE.
 #     Si no existe variante documentada → capability_gap estructurado
 #  H3 Nota temporal silenciada cuando la promoción la resolvió; nota explícita de
 #     gap de capacidad cuando no hay vista histórica disponible
-#  H4 Fallbacks temporal-aware: _fallback_preferred_view prefiere _history cuando
-#     corresponde; trio mínimo (FIX 5) y fallback profundo ya no son ciegos al tiempo
-#  Salida: + capability_gap / temporal_intent (consumidos por planner_node, fragmento H5)
+#
+# Cambios de esta versión (migración a core.rag):
+#  R1 Retrieval ÚNICO por pregunta. Antes: obtener_candidatas_detalles(k=10) +
+#     seleccionar_vista_principal() SIN precomputed_candidates → 2ª búsqueda
+#     vectorial idéntica (latencia y costo duplicados). preferred_view ahora es
+#     directamente la mejor candidata del ranking coseno.
+#  R2 El umbral se aplica AQUÍ, en Python (MIN_SCORE_THRESHOLD=0.20, coseno
+#     ∈ [0,1], configurable vía HARNESS_MIN_SCORE). Antes: -5.0 desactivaba el
+#     filtrado que el nuevo RAG sí implementa.
+#  R3 Fallbacks sin reglas de negocio hardcodeadas:
+#       - sin matches sobre umbral → top-k vectorial SIN umbral
+#       - retriever vacío/error   → catálogo documentado (orden temporal-aware)
+#     _fallback_preferred_view y su keyword_map ELIMINADOS — era el mismo
+#     anti-patrón que VALID_VIEWS: nombres de vistas escritos a mano en código.
+#     Lo que sobrevive (promoción H2, orden temporal) se DERIVA del catálogo.
+#  R4 Caché claveado por firma sha256 de AGENTS.md. Antes: el índice reindexaba
+#     al cambiar el archivo, pero este lru_cache seguía sirviendo el contexto
+#     compilado viejo (BusinessMemory parseado incluido) hasta reiniciar.
 # -------------------------------------------------
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import os
@@ -24,10 +39,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 
-from core.semantic_retriever import (
-    obtener_candidatas_detalles,
-    seleccionar_vista_principal,
-)
+from core.rag import obtener_candidatas_detalles
+
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +49,11 @@ DEFAULT_AGENTS_MD_PATH = Path(
     os.getenv("DEFAULT_AGENTS_MD_PATH") or
     Path(__file__).resolve().parent.parent / "AGENTS.md"
 )
+
+# R2: umbral coseno ∈ [0,1]. Calibrar con el golden set (hit@k) del RAG.
+MIN_SCORE_THRESHOLD = float(os.getenv("HARNESS_MIN_SCORE", "0.20"))
+MAX_FALLBACK_VIEWS = 3
+MIN_CONTEXT_VIEWS = 3
 
 
 # ============================================================================
@@ -74,8 +92,8 @@ def _with_semantic_prefix(view_name: str) -> Optional[str]:
 
 
 # ============================================================================
-# NUEVO (H1): Intención temporal estructurada — criterio ÚNICO compartido
-# por AmbiguityDetector, la escalada histórica y los fallbacks.
+# (H1) Intención temporal estructurada — criterio ÚNICO compartido
+# por AmbiguityDetector, la escalada histórica y los ordenamientos de catálogo.
 # El año explícito ("2026") cuenta como histórico.
 # ============================================================================
 
@@ -125,8 +143,8 @@ def _is_historical_view(view_info: Optional["ViewInfo"]) -> bool:
 
 def _historical_variants_for(view_name: str, biz_mem: "BusinessMemory") -> List[str]:
     """
-    Deriva candidatas históricas documentadas a partir de una vista snapshot.
-    sales_review_day → sales_review_history / sales_review_day_history / sales_review_historical...
+    Deriva candidatas históricas documentadas a partir de una vista snapshot,
+    usando la CONVENCIÓN de nombres consultada contra el catálogo.
     """
     base = _clean_view_name(view_name)
     for suffix in ("_latest", "_current", "_day"):
@@ -135,6 +153,20 @@ def _historical_variants_for(view_name: str, biz_mem: "BusinessMemory") -> List[
             break
     candidatas = [f"{base}_history", f"{base}_historical", f"{_clean_view_name(view_name)}_history"]
     return [c for c in dict.fromkeys(candidatas) if biz_mem.get_view(c)]
+
+
+def _ordered_documented_views(biz_mem: "BusinessMemory", temporal: Optional[str]) -> List[str]:
+    """
+    Vistas documentadas, priorizando las compatibles con la intención temporal.
+    (R3) Derivado 100% del catálogo — reemplaza a los trios/listas hardcodeadas.
+    sorted() es estable: dentro de cada grupo se conserva el orden del archivo.
+    """
+    documented = biz_mem.list_views()
+    if temporal == "historical":
+        documented = sorted(documented, key=lambda v: not _is_historical_view(biz_mem.get_view(v)))
+    elif temporal == "snapshot":
+        documented = sorted(documented, key=lambda v: not _is_snapshot_view(biz_mem.get_view(v)))
+    return documented
 
 
 # ============================================================================
@@ -339,7 +371,7 @@ def validate_sql_views(sql: str, biz_mem: BusinessMemory) -> Tuple[bool, List[st
 
 
 # ============================================================================
-# Construcción de contexto con retriever vectorial
+# Construcción de contexto semántico (contenido desde BusinessMemory)
 # ============================================================================
 
 def build_harness_context(
@@ -349,6 +381,10 @@ def build_harness_context(
     include_rules: bool = True,
     rules_md: Optional[str] = None,
 ) -> str:
+    """
+    El RAG decide QUÉ vistas son relevantes; el catálogo (BusinessMemory)
+    dicta el CONTENIDO que se inyecta al prompt.
+    """
     if biz_mem is None:
         biz_mem = BusinessMemory.from_file()
 
@@ -463,8 +499,7 @@ class AmbiguityDetector:
         return notes
 
     def _temporal_ambiguity(self, user_question: str, candidatas: List[str]) -> List[str]:
-        """H1: usa el criterio compartido _temporal_intent/_is_*_view
-        (antes: listas locales divergentes de la escalada)."""
+        """H1: usa el criterio compartido _temporal_intent/_is_*_view."""
         notes: List[str] = []
         intent = _temporal_intent(user_question)
 
@@ -489,139 +524,63 @@ class AmbiguityDetector:
 
 
 # ============================================================================
-# Fallback por keywords para elegir vista principal
+# Contexto compilado por pregunta (cacheado, claveado por firma de AGENTS.md)
 # ============================================================================
 
-def _fallback_preferred_view(question: str, allowed_views: List[str]) -> Optional[str]:
+def _agents_md_signature() -> str:
     """
-    Si el retriever no elige una vista principal, usamos reglas de keyword simples.
-    H4: con intención histórica, las variantes _history/_historical van PRIMERO
-    (antes ganaba por orden fijo de lista → snapshot para preguntas históricas).
+    (R4) Firma del archivo fuente. Participa en la clave del lru_cache:
+    si AGENTS.md cambia, el contexto compilado se regenera junto con el índice.
     """
-    q = _normalize_question(question)
-    prefer_history = _temporal_intent(question) == "historical"
+    try:
+        return hashlib.sha256(DEFAULT_AGENTS_MD_PATH.read_bytes()).hexdigest()[:16]
+    except Exception:
+        return "na"
 
-    keyword_map = [
-        (["venta", "vendido", "vendidos", "unidades vendidas", "ingreso", "ingresos"], [
-            "sales_review_day",
-            "sales_review_day_history",
-            "kpi_categorias_diario",
-            "sales_week",
-        ]),
-        (["producto", "categoria", "categoría", "familia", "articulo", "artículo", "productos"], [
-            "sales_producto_daily",
-            "kpi_categorias_productos_sede",
-            "kpi_categorias_diario",
-        ]),
-        (["sede", "local", "tienda", "sucursal", "plaza"], [
-            "sales_review_locales",
-            "sales_review_locales_latest",
-        ]),
-        (["fidelizacion", "canje", "puntos", "fidelización"], [
-            "kpi_fidelizacion_detalle",
-            "dashboard_canjes_resumen",
-        ]),
-        (["cortesia", "cortesía", "gratis", "regalo"], [
-            "kpi_cortesia_detalle",
-            "dashboard_cortesias_resumen",
-        ]),
-        (["hora", "horario", "momento del dia", "picos"], [
-            "mart_operacion_hora",
-        ]),
-    ]
-
-    for keywords, candidate_views in keyword_map:
-        if any(k in q for k in keywords):
-            ordered = candidate_views
-            if prefer_history:
-                ordered = sorted(
-                    candidate_views,
-                    key=lambda v: ("_history" not in v and "_historical" not in v),
-                )
-            for cv in ordered:
-                clean_cv = _clean_view_name(cv)
-                if clean_cv in [_clean_view_name(v) for v in allowed_views]:
-                    return clean_cv
-
-    sales_views = [v for v in allowed_views if "sales" in v or "kpi" in v]
-    if prefer_history:
-        history_sales = [v for v in sales_views if "_history" in v or "_historical" in v]
-        if history_sales:
-            return _clean_view_name(history_sales[0])
-    if sales_views:
-        return _clean_view_name(sales_views[0])
-
-    return _clean_view_name(allowed_views[0]) if allowed_views else None
-
-
-# ============================================================================
-# Función cacheada que espera el orquestador
-# ============================================================================
 
 @lru_cache(maxsize=128)
-def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, Any]:
+def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) -> Dict[str, Any]:
     """
-    Implementación cacheada. Usa el retriever vectorial real.
+    Compila el paquete de contexto para una pregunta.
+    md_sig no se usa en el cuerpo: existe para formar parte de la clave de caché.
     """
+    logger.info(f"[Harness] Compilando contexto (md_sig={md_sig})")
     biz_mem = BusinessMemory.from_file()
 
-    # H1/H2: intención temporal computada UNA vez, reutilizada por
-    # fallback (FIX 4), trio mínimo (FIX 5) y escalada histórica (H2)
+    # H1/H2: intención temporal computada UNA vez, reutilizada por el
+    # fallback, el mínimo de contexto y la promoción histórica.
     temporal = _temporal_intent(normalized_question)
     capability_gap_historical = False
 
-    # FIX 1: Umbral razonable; no desactivar completamente la selección
-    MIN_SCORE_THRESHOLD = -5.0
-    MAX_FALLBACK_VIEWS = 3
-
-    candidatas_detalle: List[Dict[str, Any]] = []
-    preferred_view: Optional[str] = None
-
+    # --------------------------------------------------------------
+    # R1 + R2 + R3: Retrieval ÚNICO; el umbral se aplica aquí.
+    # --------------------------------------------------------------
     try:
-        # FIX 2: Una sola llamada al retriever con umbral proporcional
-        candidatas_detalle = obtener_candidatas_detalles(
+        hits = obtener_candidatas_detalles(
             query=normalized_question,
             k=10,
             allowed_views=None,
-            min_score_threshold=MIN_SCORE_THRESHOLD,
-            column_hints={"original_query": normalized_question},
+            min_score_threshold=0.0,  # traer todo; el umbral se aplica abajo
         )
-
-        # FIX 3: Seleccionar vista principal usando el mismo retriever
-        vista_principal_obj = seleccionar_vista_principal(
-            query=normalized_question,
-            column_hints={"original_query": normalized_question},
-            allowed_views=None,
-            min_score_threshold=MIN_SCORE_THRESHOLD,
-        )
-        if vista_principal_obj:
-            preferred_view = _clean_view_name(vista_principal_obj["view_name"])
-
     except Exception as e:
-        logger.warning(f"[Harness] Retriever falló: {e}. Usando fallback léxico.")
-        candidatas_detalle = []
+        logger.warning(f"[Harness] Retriever falló: {e}")
+        hits = []
 
-    # FIX 4: Fallback inteligente limitado (NO todas las vistas)
-    if not candidatas_detalle:
+    strong = [h for h in hits if h.get("score", 0.0) >= MIN_SCORE_THRESHOLD]
+
+    if strong:
+        candidatas_detalle: List[Dict[str, Any]] = strong
+    elif hits:
+        # R3: fallback vectorial suave (reemplaza al keyword_map hardcodeado)
         logger.warning(
-            "[Harness] Retriever no devolvió candidatas. Usando fallback léxico acotado."
+            f"[Harness] Sin matches sobre umbral {MIN_SCORE_THRESHOLD}; "
+            f"usando top-{MAX_FALLBACK_VIEWS} sin umbral como fallback."
         )
-        default_v = _fallback_preferred_view(normalized_question, biz_mem.list_views())
-        fallback_views = [default_v] if default_v else ["sales_producto_daily"]
-        fallback_views = [
-            v for v in fallback_views
-            if v and biz_mem.get_view(v)
-        ]
-        if not fallback_views:
-            # H4: el fallback profundo tampoco es ciego al tiempo
-            base_fallback = ["sales_producto_daily", "sales_review_day", "sales_week"]
-            if temporal == "historical":
-                base_fallback = ["sales_review_day_history"] + base_fallback
-            fallback_views = [
-                v for v in base_fallback
-                if biz_mem.get_view(v)
-            ][:MAX_FALLBACK_VIEWS]
-
+        candidatas_detalle = hits[:MAX_FALLBACK_VIEWS]
+    else:
+        # R3: último recurso derivado del catálogo documentado (orden temporal-aware)
+        logger.warning("[Harness] Retriever vacío; usando catálogo como último recurso.")
+        documented = _ordered_documented_views(biz_mem, temporal)
         candidatas_detalle = [
             {
                 "view_name": v,
@@ -630,11 +589,18 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
                 "metadata_boost": 0.0,
                 "can_answer": True,
             }
-            for v in fallback_views
+            for v in documented[:MAX_FALLBACK_VIEWS]
         ]
-        preferred_view = fallback_views[0] if fallback_views else None
 
-    # FIX 5: Construir allowed_views acotado y normalizado
+    # R1: la mejor candidata del ranking coseno ES la vista principal.
+    preferred_view: Optional[str] = (
+        _clean_view_name(candidatas_detalle[0]["view_name"])
+        if candidatas_detalle else None
+    )
+
+    # --------------------------------------------------------------
+    # allowed_views: acotado y normalizado (NO inyectar todo el catálogo)
+    # --------------------------------------------------------------
     allowed_views_set: Set[str] = set()
     for c in candidatas_detalle:
         vn = c.get("view_name")
@@ -644,29 +610,19 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
     if preferred_view:
         allowed_views_set.add(_clean_view_name(preferred_view))
 
-    # Asegurar un mínimo de contexto sin inyectar TODO el catálogo
-    # H4: el trio mínimo deja de ser ciego al tiempo
+    # Mínimo de contexto derivado del catálogo (R3; antes: trio hardcodeado)
     if len(allowed_views_set) < 2:
-        base_min = ["sales_producto_daily", "sales_review_day", "sales_review_locales_latest"]
-        if temporal == "historical":
-            base_min = ["sales_review_day_history", "sales_review_locales_history"] + base_min
-        for v in base_min:
-            if biz_mem.get_view(v):
-                allowed_views_set.add(v)
+        for v in _ordered_documented_views(biz_mem, temporal):
+            if len(allowed_views_set) >= MIN_CONTEXT_VIEWS:
+                break
+            allowed_views_set.add(v)
 
-    # FIX 6: NO agregar automáticamente todas las vistas documentadas a allowed_views
-    # El catálogo completo ya se expone en all_documented_views para referencia.
     allowed_views_clean = sorted(allowed_views_set)
 
-    # FIX 7: Si no hay vista principal, usar fallback por keywords (ya temporal-aware)
-    if not preferred_view:
-        preferred_view = _fallback_preferred_view(normalized_question, allowed_views_clean)
-        logger.info(f"[Harness] Fallback preferred_view: {preferred_view}")
-
-    # ------------------------------------------------------------------
-    # NUEVO (H2): promoción de vista histórica — la ambigüedad se RESUELVE,
-    # no solo se anota. Antes: nota "considera su versión _history" advisory-only.
-    # ------------------------------------------------------------------
+    # --------------------------------------------------------------
+    # (H2) Promoción de vista histórica — la ambigüedad se RESUELVE,
+    # no solo se anota. Si no existe variante documentada → capability_gap.
+    # --------------------------------------------------------------
     if temporal == "historical":
         has_historical = any(
             _is_historical_view(biz_mem.get_view(v)) for v in allowed_views_clean
@@ -692,17 +648,15 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
                     if _clean_view_name(c.get("view_name")) != preferred_view
                 ]
             else:
-                # Señal estructurada: no existe vista histórica documentada
                 capability_gap_historical = True
                 logger.warning(
                     "[Harness] Pregunta histórica sin vista _history/_historical documentada. "
                     "capability_gap=True"
                 )
 
-    # FIX 8: Contexto semántico solo sobre top relevantes
+    # Contexto semántico solo sobre top relevantes
     top_candidates = candidatas_detalle[:5]
 
-    # Si la mejor candidata no puede responder, preferimos la principal fallback
     if not top_candidates and preferred_view:
         top_candidates = [{"view_name": preferred_view, "score": 0.0}]
 
@@ -713,7 +667,7 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
         include_rules=True,
     )
 
-    # FIX 9: Ambigüedad solo sobre vistas relevantes
+    # Ambigüedad solo sobre vistas relevantes
     ambiguity_views = [
         _clean_view_name(c.get("view_name"))
         for c in top_candidates
@@ -733,9 +687,8 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
     detector = AmbiguityDetector(biz_mem)
     ambiguity_notes = detector.analyze(normalized_question, ambiguity_views)
 
-    # H3b: si hay gap REAL de capacidad, decirlo explícitamente — el planner (H5)
-    # lo convierte en aclaración honesta ("solo tengo datos del día en curso"),
-    # no en una petición genérica de "más detalles".
+    # H3b: gap REAL de capacidad explícito — el planner lo convierte en
+    # aclaración honesta, no en una petición genérica de "más detalles".
     if capability_gap_historical:
         ambiguity_notes.append(
             "La pregunta requiere un periodo histórico, pero NINGUNA vista documentada "
@@ -747,15 +700,17 @@ def _build_harness_context_cached_impl(normalized_question: str) -> Dict[str, An
         "allowed_views": [_with_semantic_prefix(v) for v in allowed_views_clean],
         "preferred_view": _with_semantic_prefix(preferred_view),
         "ambiguity_notes": ambiguity_notes,
-        "capability_gap": capability_gap_historical,          # H3: señal estructurada
-        "temporal_intent": temporal,                          # H1: disponible para planner
+        "capability_gap": capability_gap_historical,   # H3: señal estructurada
+        "temporal_intent": temporal,                   # H1: disponible para planner
         "all_documented_views": [_with_semantic_prefix(v) for v in biz_mem.list_views()],
     }
 
 
 def build_harness_context_cached(question: str) -> Dict[str, Any]:
-    normalized = _normalize_question(question)
-    return _build_harness_context_cached_impl(normalized)
+    return _build_harness_context_cached_impl(
+        _normalize_question(question),
+        _agents_md_signature(),
+    )
 
 
 # ============================================================================
