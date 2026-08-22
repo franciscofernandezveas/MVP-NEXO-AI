@@ -1,5 +1,14 @@
 # core/orchestrator.py
 # -------------------------------------------------
+# Cambios aplicados (alineación con sql_agent sin SEMANTIC_MAP):
+#  4a Conjuntos de éxito incluyen "no_data" (0 filas exitosas = respuesta terminal,
+#     ya no se reejecutan) — en is_successful y en los dos all_success
+#  4b B3: el subgrafo recibe previous_sql/error/row_count (corrección accionable);
+#     payload con model_dump() (era .dict(), deprecado en Pydantic v2)
+#  4c Early-return filtrado al plan vigente (sin resultados huérfanos de otros planes)
+#  4d Instrucción dinámica del sql_agent referencia la TAREA FALLIDA (no la última);
+#     el branch de "0 filas" queda eliminado (muerto tras status="no_data")
+# -------------------------------------------------
 import hashlib
 import logging
 import os
@@ -80,8 +89,6 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         return obj
     if hasattr(obj, "model_dump"):
         return obj.model_dump()
-    if hasattr(obj, "dict"):
-        return obj.dict()
     return vars(obj)
 
 
@@ -145,7 +152,6 @@ def _build_dynamic_instruction(state: "OrchestratorState", next_step: str) -> st
     plan = state.get("plan")
     question_type = _get(plan, "question_type", "general") if plan else "general"
     sql_results = state.get("sql_results", []) or []
-    last_sql = sql_results[-1] if sql_results else None
     progress = state.get("progress_ledger") or {}
 
     if next_step == "planner":
@@ -160,15 +166,19 @@ def _build_dynamic_instruction(state: "OrchestratorState", next_step: str) -> st
         )
 
     if next_step == "sql_agent":
-        if last_sql and _get(last_sql, "row_count", 0) == 0:
+        # (4d) con status="no_data", los 0-filas ya NO se reintentan:
+        # solo errores reales re-rutean aquí. Se referencia la tarea FALLIDA
+        # (no la última del lote, que es impreciso en multi-query).
+        failed_sql = next(
+            (r for r in reversed(sql_results) if _get(r, "status") == "error"),
+            None,
+        )
+        if failed_sql:
             return (
-                "La última consulta SQL devolvió 0 filas. Revisa los filtros, "
-                "el rango de fechas, la vista elegida o la granularidad de la agrupación."
-            )
-        if last_sql and _get(last_sql, "status") == "error":
-            return (
-                f"La última consulta SQL falló: {_get(last_sql, 'error_message', 'error desconocido')}. "
-                f"Corrige el SQL o elige otra vista."
+                f"La consulta de la tarea {_get(failed_sql, 'task_id', '?')} falló: "
+                f"{_get(failed_sql, 'error_message', 'error desconocido')}. "
+                f"Tienes el intento anterior como referencia en el contexto: NO lo repitas; "
+                f"corrige usando las columnas válidas del catálogo o elige otra vista."
             )
         return "Ejecuta las tareas SQL del plan actual y devuelve un contrato por cada una."
 
@@ -273,7 +283,7 @@ class OrchestratorState(TypedDict):
     progress_ledger: Optional[ProgressLedger]
     next_agent_instruction: Optional[str]
 
-    # Campos operativos existentes
+    # Campos operativos
     plan: Optional[Any]
     sql_results: List[SQLContract]
     viz_result: Optional[Any]
@@ -295,6 +305,10 @@ class OrchestratorState(TypedDict):
     render_attempts: int
     is_chitchat: Optional[bool]
 
+    # Señales estructuradas de control (2.2)
+    is_replan: Optional[bool]
+    replan_reason: Optional[str]
+
 
 # ------------------------------------------------------------------
 # Decorador de resiliencia para nodos worker
@@ -304,9 +318,9 @@ def resilient_node(node_name: str):
         fn: Callable[[OrchestratorState], OrchestratorState]
     ) -> Callable[[OrchestratorState], OrchestratorState]:
         @wraps(fn)
-        def wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:  # ← acepta kwargs
+        def wrapper(state: OrchestratorState, **kwargs) -> OrchestratorState:
             try:
-                return fn(state, **kwargs)  # ← pasa kwargs
+                return fn(state, **kwargs)
             except Exception as e:
                 logger.exception(f"[{node_name}] Nodo falló inesperadamente")
                 return {
@@ -358,9 +372,9 @@ def build_harness_context_node(state: OrchestratorState, **kwargs) -> Orchestrat
     }
 
 
-# core/orchestrator.py
-# Reemplaza la función sql_agent_wrapper por esta versión
-
+# ------------------------------------------------------------------
+# Ejecución de tareas SQL (multi-query) con reuse + intento previo
+# ------------------------------------------------------------------
 @traceable(name="Orchestrator: Execute SQL Tasks")
 def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorState":
     logger.info(f"[SQL Agent Wrapper] Iniciando. Plan presente: {state.get('plan') is not None}")
@@ -395,7 +409,7 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
         }
 
     # ------------------------------------------------------------------
-    # MULTI_QUERY: reutilizar resultados previos exitosos
+    # MULTI_QUERY: reutilizar resultados previos terminados con éxito
     # ------------------------------------------------------------------
     existing_results = state.get("sql_results", []) or []
     results_by_id: Dict[str, SQLContract] = {}
@@ -405,14 +419,18 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
         if tid:
             results_by_id[tid] = r
 
+    # IDs del plan vigente (versionados v{n}-t{i}) → filtro estricto (4c)
+    plan_ids = {str(_get(t, "task_id", "")) for t in tasks}
+
     tasks_to_run = []
     for t in tasks:
         tid = str(_get(t, "task_id", ""))
         res = results_by_id.get(tid)
 
+        # (4a) "no_data" cuenta como terminal-éxito: 0 filas != fallo
         is_successful = (
             res is not None
-            and _get(res, "status") in ("success", "partial")
+            and _get(res, "status") in ("success", "partial", "no_data")
             and _get(res, "can_answer", False)
         )
 
@@ -422,18 +440,21 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
     harness_ctx = state.get("harness_context", {})
     global_semantic_context = state.get("semantic_context", harness_ctx.get("semantic_context", ""))
 
-    # Si no hay nada pendiente, devolver los resultados existentes
+    # Si no hay nada pendiente, devolver SOLO los resultados del plan vigente
     if not tasks_to_run:
+        # (4c) antes devolvía TODOS los results_by_id (incl. huérfanos de otros planes)
+        current_results = [r for tid, r in results_by_id.items() if tid in plan_ids]
         all_success = all(
-            _get(r, "status") in ("success", "partial") and _get(r, "can_answer", False)
-            for r in results_by_id.values()
+            _get(r, "status") in ("success", "partial", "no_data")  # (4a)
+            and _get(r, "can_answer", False)
+            for r in current_results
         )
         summary = " | ".join([
-            f"T{tid}:{_get(r, 'status')}({_get(r, 'row_count', 0)})"
-            for tid, r in results_by_id.items()
+            f"T{_get(r, 'task_id')}:{_get(r, 'status')}({_get(r, 'row_count', 0)})"
+            for r in current_results
         ])
         return {
-            "sql_results": list(results_by_id.values()),
+            "sql_results": current_results,
             "last_agent": "sql_agent",
             "messages": [
                 AIMessage(content=f"[SQL Agent] 0 tareas nuevas. OK={all_success} | {summary}")
@@ -441,7 +462,7 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
         }
 
     for idx, task in enumerate(tasks_to_run):
-        payload = task.dict() if hasattr(task, "dict") else dict(task)
+        payload = task.model_dump() if hasattr(task, "model_dump") else dict(task)  # (4b) era .dict()
         candidate_views = getattr(task, "candidate_views", None) or state.get("allowed_views", [])
         preferred = getattr(task, "preferred_view", None) or state.get("preferred_view")
 
@@ -450,6 +471,10 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
         except Exception as e:
             logger.warning(f"[SQL Agent Wrapper] Error obteniendo schema: {e}")
             schema_info = state.get("schema_info", "")
+
+        # NUEVO (4b/B3): el subgrafo VE su intento anterior → corrección accionable
+        tid_str = str(_get(task, "task_id", "") or "")
+        prev_contract = results_by_id.get(tid_str)
 
         sub_input = {
             "question": state["question"],
@@ -465,6 +490,10 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
             "contract": None,
             "attempts": 0,
             "supervisor_instruction": instruction,
+            # B3: referencia del intento previo (vacía en la primera ejecución)
+            "previous_sql": _get(prev_contract, "generated_sql", "") or "",
+            "previous_error": _get(prev_contract, "error_message") or "",
+            "previous_row_count": _get(prev_contract, "row_count", 0) or 0,
         }
 
         try:
@@ -500,10 +529,15 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
             f"status={contract.status} can_answer={contract.can_answer} rows={contract.row_count}"
         )
 
-    final_results = [results_by_id[str(_get(t, "task_id"))] for t in tasks if str(_get(t, "task_id")) in results_by_id]
+    final_results = [
+        results_by_id[str(_get(t, "task_id"))]
+        for t in tasks
+        if str(_get(t, "task_id")) in results_by_id
+    ]
 
     all_success = all(
-        _get(r, "status") in ("success", "partial") and _get(r, "can_answer", False)
+        _get(r, "status") in ("success", "partial", "no_data")  # (4a)
+        and _get(r, "can_answer", False)
         for r in final_results
     )
     summary = " | ".join([f"T{r.task_id}:{r.status}({r.row_count})" for r in final_results])
@@ -515,7 +549,6 @@ def sql_agent_wrapper(state: "OrchestratorState", **kwargs) -> "OrchestratorStat
             AIMessage(content=f"[SQL Agent] {len(final_results)} tareas en total. OK={all_success} | {summary}")
         ]
     }
-
 
 
 def viz_agent_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
@@ -533,6 +566,7 @@ def viz_agent_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
             "messages": [AIMessage(content="[Viz Agent] Sin datos SQL para visualizar")]
         }
 
+    # "no_data" tiene row_count=0 → nunca se elige como primary (correcto: sin filas no hay gráfico)
     primary_result = next(
         (
             r for r in sql_results
@@ -566,7 +600,7 @@ def viz_agent_node(state: OrchestratorState, **kwargs) -> OrchestratorState:
         viz_result = VIZ_SUBGRAPH.invoke(viz_input)
         contract = viz_result.get("contract") if isinstance(viz_result, dict) else None
         if contract and not isinstance(contract, dict):
-            contract = contract.dict() if hasattr(contract, "dict") else vars(contract)
+            contract = contract.model_dump() if hasattr(contract, "model_dump") else vars(contract)
 
         if contract and contract.get("status") == "error":
             return {
@@ -670,6 +704,7 @@ def safe_supervisor_node(state: OrchestratorState, **kwargs) -> OrchestratorStat
     - Task Ledger y Progress Ledger
     - Stall detection real por hash de estado
     - Replanificación automática tras >2 stalls
+      (limpia artefactos del plan muerto + señal estructurada is_replan)
     - Educated guess como salida válida
     - Instrucciones dinámicas para el siguiente agente
     """
@@ -739,7 +774,9 @@ def safe_supervisor_node(state: OrchestratorState, **kwargs) -> OrchestratorStat
         f"stall_count={progress_ledger.stall_count} | last_agent={state.get('last_agent')}"
     )
 
+    # ------------------------------------------------------------------
     # Replanificación automática tras stall > 2
+    # ------------------------------------------------------------------
     if progress_ledger.stall_count > 2:
         stall_count_at_replan = progress_ledger.stall_count  # capturar antes de resetear
         logger.warning(f"[Ledger] Stall detectado ({stall_count_at_replan}). Replanificando...")
@@ -755,6 +792,25 @@ def safe_supervisor_node(state: OrchestratorState, **kwargs) -> OrchestratorStat
         return {
             "next": "planner",
             "plan": None,
+
+            # --- Limpieza de artefactos del plan muerto ------------------
+            "sql_results": [],
+            "viz_result": None,
+            "viz_approved": None,        # evita que un approval obsoleto salte el HITL
+            "viz_rendered": False,
+            "forecast_request": None,    # evita re-ejecutar un forecast ya fallido
+            "forecast_results": None,
+            # OJO: "forecast_error" SE CONSERVA deliberadamente — el planner
+            # lo necesita (fix 2.4): con is_replan=True + forecast_error presente,
+            # devuelve needs_followup con el motivo en vez de regenerar los
+            # mismos parámetros y caer en el mismo error.
+            # --------------------------------------------------------------
+
+            # --- Señal estructurada de replan (2.2) ----------------------
+            "is_replan": True,
+            "replan_reason": f"Stall x{stall_count_at_replan} sin progreso",
+            # --------------------------------------------------------------
+
             "next_agent_instruction": instruction,
             "iteration_count": current_count + 1,
             "last_agent": "supervisor",

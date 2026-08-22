@@ -16,6 +16,14 @@ def _get(obj: Any, attr: str, default: Any = None) -> Any:
     return getattr(obj, attr, default)
 
 
+def _sentence(text: str) -> str:
+    """Normaliza un fragmento a oración terminada en puntuación (para componer respuestas)."""
+    s = (text or "").strip()
+    if s and s[-1] not in ".!?":
+        return s + "."
+    return s
+
+
 def _is_new_topic(question: str, previous_question: Optional[str]) -> bool:
     if not previous_question:
         return False
@@ -149,7 +157,7 @@ def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
             messages=[AIMessage(content="[Supervisor] Render previo no aplicable, continuando.")]
         )
 
-    # === PREVENCIÓN DE REPLANIFICACIÓN ANTE ERROR DE VIZ AGENT (NUEVO) ===
+    # === PREVENCIÓN DE REPLANIFICACIÓN ANTE ERROR DE VIZ AGENT ===
     if viz_result and _get(viz_result, "status") == "error" and not viz_rendered:
         logger.warning("[Supervisor] Viz Agent devolvió error. Derivando directo a analyst.")
         return make_update(
@@ -170,6 +178,76 @@ def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         return make_update(
             "planner",
             next_agent_instruction="Genera un plan de ejecución para responder la pregunta del usuario."
+        )
+
+    # ------------------------------------------------------------------
+    # 1.5. NUEVO (P1): Plan con needs_followup → Analyst pide aclaración
+    # ------------------------------------------------------------------
+    # CONSUMIDOR del flag que ahora emite correctamente el planner (fix 2.6):
+    #   needs_followup + followup_reason + missing_information
+    #
+    # ORDEN CRÍTICO: va ANTES de la ruta de forecast (ruta 2). Un plan
+    # demand_forecast sin parámetros (needs_followup=True, forecast_request=None)
+    # no debe llegar jamás al forecaster.
+    #
+    # Terminación garantizada en los 3 estados:
+    #   a) sin respuesta aún      → analyst redacta la petición de aclaración
+    #   b) respuesta ya entregada → __end__ (evita caer en forecast/SQL con la
+    #                                misma pasada cuando final_answer ya existe)
+    #   c) analyst corrió pero no dejó final_answer → cierre determinista
+    #      (sin loop: nunca se vuelve a llamar al analyst por este motivo)
+    # ------------------------------------------------------------------
+    if _get(plan, "needs_followup", False):
+        followup_reason = (_get(plan, "followup_reason") or "").strip()
+        missing_info = _get(plan, "missing_information", []) or []
+
+        # (b) El analyst ya respondió la aclaración en la pasada anterior
+        if final_answer:
+            logger.info("[Supervisor] Followup ya respondido por el analyst. Finalizando.")
+            return make_update("__end__")
+
+        # (c) Guard anti-loop: analyst corrió pero no produjo respuesta
+        if last_agent == "analyst":
+            logger.warning(
+                "[Supervisor] needs_followup con analyst sin final_answer. "
+                "Cierre determinista con followup_reason."
+            )
+            fallback = "No pude generar un plan ejecutable para tu consulta."
+            if followup_reason:
+                fallback += f" Motivo: {_sentence(followup_reason)}"
+            if missing_info:
+                fallback += f" Información faltante: {', '.join(missing_info)}."
+            return make_update(
+                "__end__",
+                final_answer=fallback,
+                messages=[AIMessage(
+                    content="[Supervisor] Cierre determinista: needs_followup sin respuesta del analyst."
+                )]
+            )
+
+        # (a) Primera vez: derivar al analyst para pedir la aclaración
+        logger.info(
+            f"[Supervisor] Ruteando a Analyst - plan requiere clarificación: "
+            f"{followup_reason[:120]}"
+        )
+        instruction = (
+            "El planner determinó que la pregunta NO es ejecutable todavía y requiere "
+            "aclaración del usuario. "
+            f"Motivo: {_sentence(followup_reason) if followup_reason else 'no especificado'} "
+        )
+        if missing_info:
+            instruction += f"Información faltante: {', '.join(missing_info)}. "
+        instruction += (
+            "Redacta la respuesta final: breve, cordial y accionable, pidiendo exactamente "
+            "esa aclaración (si aplica, da ejemplos de consultas que sí se pueden responder). "
+            "NO inventes datos ni ejecutes supuestos."
+        )
+        return make_update(
+            "analyst",
+            next_agent_instruction=instruction,
+            messages=[AIMessage(
+                content="[Supervisor] Plan con needs_followup → analyst pedirá aclaración al usuario."
+            )]
         )
 
     # ------------------------------------------------------------------
@@ -236,7 +314,8 @@ def supervisor_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
                 pending_tasks.append(t)
                 continue
 
-            status_ok = _get(res, "status") in ("success", "partial")
+            status_ok = _get(res, "status") in ("success", "partial", "no_data")  # ← añade no_data
+
             useful = _get(res, "can_answer", False)
             if not (status_ok and useful):
                 pending_tasks.append(t)

@@ -65,12 +65,12 @@ class PlannerContract(BaseModel):
     chart_type_hint: Optional[str] = Field(default="auto")
     needs_followup: bool = Field(default=False)
     followup_reason: Optional[str] = Field(default=None)
-
+    plan_version: int = 1
 
 class SQLContract(BaseModel):
     """Contrato estricto de salida del SQL Agent."""
     task_id: str = Field(default="1")
-    status: Literal["success", "error", "partial", "needs_clarification"]
+    status: Literal["success", "no_data", "error", "partial", "needs_clarification"]    
     generated_sql: Optional[str] = None
     columns: List[str] = Field(default_factory=list)
     rows: List[Dict[str, Any]] = Field(default_factory=list)
@@ -103,6 +103,14 @@ class SQLContract(BaseModel):
     reason_for_view_choice: str = Field(
         default="",
         description="Explicación de por qué se eligió la vista o por qué falló"
+    )
+    views_used: List[str] = Field(
+        default_factory=list,
+        description="Vistas semantic. realmente referenciadas en el SQL ejecutado (auditoría de obediencia a allowed_views)"
+    )
+    attempts: int = Field(
+        default=0,
+        description="Generaciones que costó producir el SQL final"
     )
 
 
