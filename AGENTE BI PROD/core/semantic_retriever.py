@@ -83,7 +83,7 @@ def _ensure_collection_initialized() -> bool:
                 logger.error("No se encontró AGENTS.md")
                 return False
         
-        # Indexar documentos (función simple de parsing)
+        # Indexar documentos
         documents = _build_documents_from_agents_md(agents_path)
         if documents:
             _vector_store.add_documents(documents=documents, ids=[d.id for d in documents])
@@ -96,7 +96,7 @@ def _ensure_collection_initialized() -> bool:
 
 
 # ============================================================================
-# PARSING SIMPLE DE AGENTS.md (sin heurísticas complejas)
+# PARSING SIMPLE DE AGENTS.md
 # ============================================================================
 
 def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
@@ -113,7 +113,12 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
     if not agents_path.exists():
         return []
     
-    raw = agents_path.read_text(encoding="utf-8-sig")
+    try:
+        raw = agents_path.read_text(encoding="utf-8-sig")
+    except Exception as e:
+        logger.error(f"Error al leer AGENTS.md: {e}")
+        return []
+    
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     
     # Extraer sección 3
@@ -147,14 +152,14 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
         # Extraer métricas simples (formato: - `nombre`: descripción)
         metrics = re.findall(r'-\s*`([^`]+)`\s*:', description)
         
-        # Filtrar palabras que no son métricas (lista simple)
-        non_metrics = {'descripción', 'tipo', 'granularidad', 'filtro fecha', 'filas', 'nota'}
+        # Filtrar palabras que no son métricas
+        non_metrics = {'descripción', 'descripcion', 'tipo', 'granularidad', 'filtro fecha', 'filas', 'nota'}
         metrics = [m for m in metrics if m.lower() not in non_metrics]
         
         if not metrics:
             metrics = [f"metrica_{view_name}"]
         
-        # Crear documento con metadatos simples
+        # Crear documento
         doc_id = hashlib.sha256(f"semantic.{view_name}".encode()).hexdigest()
         
         documents.append(Document(
@@ -175,12 +180,12 @@ def _build_documents_from_agents_md(agents_path: Path) -> List[Document]:
     return documents
 
 
-# Inicialización al importar (con lazy loading)
+# Inicialización al importar
 _initialized = _ensure_collection_initialized()
 
 
 # ============================================================================
-# FUNCIONES DE RETRIEVAL (simples, sin heurísticas)
+# FUNCIONES DE RETRIEVAL
 # ============================================================================
 
 def _normalize_view_name(view: str) -> List[str]:
@@ -217,10 +222,13 @@ def obtener_candidatas_vistas(
     query: str,
     k: int = 5,
     allowed_views: Optional[List[str]] = None,
+    min_score_threshold: float = 0.0,
+    column_hints: Optional[Dict[str, Any]] = None,
+    biz_mem: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     Devuelve vistas candidatas basadas SOLO en similitud vectorial.
-    La inteligencia semántica la hace el Planner con el catálogo.
+    Los parámetros adicionales se aceptan por compatibilidad pero no se usan.
     """
     search_kwargs = {"k": k}
     filter_dict = _validate_chroma_filter(allowed_views)
@@ -241,6 +249,10 @@ def obtener_candidatas_vistas(
             "view_name": doc.metadata.get("view_name", ""),
             "context": doc.page_content,
             "score": similarity,
+            "original_score": similarity,
+            "raw_distance": float(score) if score is not None else None,
+            "metadata_boost": 0.0,
+            "temporal_context": {},
             "view_metadata": doc.metadata,
         })
 
@@ -256,31 +268,88 @@ def obtener_candidatas_vistas(
     return candidates
 
 
+def obtener_candidatas_detalles(
+    query: str,
+    k: int = 5,
+    allowed_views: Optional[List[str]] = None,
+    min_score_threshold: float = 0.0,
+    column_hints: Optional[Dict[str, Any]] = None,
+    biz_mem: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Alias de obtener_candidatas_vistas para compatibilidad con el resto del sistema.
+    Devuelve las mismas candidatas con estructura compatible.
+    """
+    candidates = obtener_candidatas_vistas(
+        query=query,
+        k=k,
+        allowed_views=allowed_views,
+        min_score_threshold=min_score_threshold,
+        column_hints=column_hints,
+        biz_mem=biz_mem,
+    )
+    
+    # Enriquecer con campos adicionales que espera el planner
+    detailed = []
+    for c in candidates:
+        detailed.append({
+            **c,
+            "purpose": c["view_metadata"].get("keywords", "")[:200],
+            "grain": "desconocido",
+            "metrics": c["view_metadata"].get("metrics", "").split(", "),
+            "dimensions": [],
+            "domain": "general",
+            "notes": "",
+            "keywords": c["view_metadata"].get("keywords", ""),
+            "temporal_type": "general",
+            "time_scope": "unknown",
+            "usage_examples": [],
+            "compatibility": {"metric": "ok", "date_range": "ok", "location": "ok", "product": "ok", "category": "ok"},
+            "compatibility_reason": f"La vista '{c['view_name']}' puede responder la consulta.",
+            "can_answer": True,  # El planner decide con el catálogo
+        })
+    
+    return detailed
+
+
 def payload_to_column_hints(payload: Any, original_query: str = "") -> Dict[str, Any]:
     """Convierte payload a hints simples para el retriever."""
     return {
         "metrics": getattr(payload, "metrics", None) or [],
         "dimensions": getattr(payload, "dimensions", None) or [],
-        "original_query": original_query or getattr(payload, "task", ""),
+        "original_query": original_query or getattr(payload, "task", "") or getattr(payload, "question", ""),
     }
 
 
 def seleccionar_vista_principal(
     query: str,
+    column_hints: Optional[Dict[str, Any]] = None,
     allowed_views: Optional[List[str]] = None,
+    min_score_threshold: float = 0.0,
     precomputed_candidates: Optional[List[Dict[str, Any]]] = None,
+    biz_mem: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Selecciona la vista con mayor similitud vectorial.
     El Planner decide si es realmente compatible usando el catálogo.
     """
-    candidates = precomputed_candidates or obtener_candidatas_vistas(
+    candidates = precomputed_candidates or obtener_candidatas_detalles(
         query=query,
         k=5,
         allowed_views=allowed_views,
+        min_score_threshold=min_score_threshold,
+        column_hints=column_hints,
+        biz_mem=biz_mem,
     )
     
     if not candidates:
+        logger.info(f"No se encontraron vistas candidatas para: '{query}'")
         return None
     
-    return candidates[0]
+    vista_principal = candidates[0]
+    logger.info(
+        f"Vista principal seleccionada: {vista_principal['view_name']} "
+        f"(score: {vista_principal['score']:.3f})"
+    )
+    
+    return vista_principal
