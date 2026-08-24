@@ -42,8 +42,12 @@ from core.llm import LLM
 from core.database import execute_sql_query
 from core.contracts import SQLContract
 from core.sql_utils import extract_views_used, extract_columns_used
-from core.harness import BusinessMemory, is_view_allowed, DEFAULT_AGENTS_MD_PATH
-
+from core.harness import (
+    BusinessMemory,
+    is_view_allowed,
+    get_biz_mem,
+    resolve_column_unambiguous,
+)
 # Extracción estructural (AST). Requerido en la práctica: sin él el validador
 # de columnas es propenso a falsos positivos con alias.
 try:
