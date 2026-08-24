@@ -9,21 +9,31 @@
 #  2.6 needs_followup respeta al LLM + gate de confidence + missing_information
 #  2.7 IDs deterministas versionados (v{plan_version}-t{i}) con remap de depends_on
 #  2.8 ALINEACIÓN: _column_exists EXACTO-only contra el catálogo (BusinessMemory =
-#      única verdad). SEMANTIC_MAP ELIMINADO — era anti-patrón: duplicaba la fuente
-#      de verdad y divergía del sql_agent. La resolución semántica (término→columna)
-#      la hacen el retriever y el LLM (que tiene el catálogo en el prompt).
-#      Severidades separadas:
-#        - _validate_task_integrity → errores DUROS (bloqueantes, solo nivel-vista)
-#        - _collect_column_warnings → NO bloqueante; mismatches de columna viajan
-#          como assumptions hacia el SQL Agent (autocorrección COLUMNAS_INVALIDAS)
+#      única verdad). SEMANTIC_MAP ELIMINADO — era anti-patrón.
 #  2.9 Menores: hints consistentes vía _select_view_for_task en el fallback,
-#      safeguard conserva tasks, PLANNER_LLM hoisted, días en palabras, _get() robusto
+#      safeguard conserva tasks, PLANNER_LLM hoisted, _get() robusto
+#
+#  3.x SIMETRÍA CON EL SQL AGENT REFACTORIZADO:
+#  3.1 Catálogo con DEFINICIONES: _build_view_catalog envía {nombre: significado},
+#      no solo claves — la resolución concepto→columna la hace el LLM con contexto.
+#  3.2 get_biz_mem() compartido (hot-reload por sha256 de AGENTS.md): se elimina
+#      _biz_mem de módulo. Antes: editar AGENTS.md dejaba al planner sirviendo
+#      vistas viejas mientras el sql_agent validaba contra las nuevas.
+#  3.3 _align_task_columns: normaliza metrics/dimensions del payload cuando el
+#      match por tokens es INEQUÍVOCO (mismo _resolve_by_tokens que el sql_agent);
+#      lo ambiguo sigue viajando como warning hacia el LLM del sql_agent.
+#  3.4 Prompt: regla 8 (elegir por DEFINICIÓN, escribir NOMBRE exacto) +
+#      regla 16 (top N por grupo = execution_strategy="top_n_per_group",
+#      NUNCA dividir por valor de dimensión — lo ejecuta el sql_agent con
+#      ROW_NUMBER() OVER (PARTITION BY ...)).
+#  3.5 Replan con memoria: consume state["replan_errors"] (evidencia que el
+#      orchestrator preserva antes de limpiar) y la marca como consumida;
+#      plan_version deriva del conteo de replans del ledger (antes: siempre v1).
 #
 # REQUIERE (cambios externos):
-#  - contracts.py:     PlannerContract.plan_version: int = 1  (ya aplicado)
-#  - orchestrator.py:  OrchestratorState.is_replan / replan_reason y set True en el
-#                      branch de stall de safe_supervisor_node
-#  - sql_agent:        validación exacta con retry COLUMNAS_INVALIDAS (archivo alineado)
+#  - harness.py:      get_biz_mem() (snippet al pie de esta migración)
+#  - orchestrator.py: OrchestratorState.replan_errors + stall branch poblándolo
+#  - sql_agent:       refactor con catálogo con definiciones (archivo alineado)
 # -------------------------------------------------
 from typing import Any, Dict, List, Optional, Set
 import json
@@ -35,15 +45,12 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from core.llm import LLM
 from core.contracts import PlannerContract, SQLPayload
-from core.harness import BusinessMemory
+from core.harness import get_biz_mem          # (3.2) antes: _biz_mem de módulo
 
 from core.rag import obtener_candidatas_detalles
 
 
 logger = logging.getLogger(__name__)
-
-# Cargar catálogo una sola vez al importar el módulo
-_biz_mem = BusinessMemory.from_file()
 
 # (2.9) Structured output hoisted: no se reconstruye en cada llamada al nodo
 PLANNER_LLM = LLM.with_structured_output(PlannerContract, method="function_calling")
@@ -77,11 +84,6 @@ def _build_conversational_context(
     current_question: str,
     max_turns: int = 4,
 ) -> str:
-    """
-    Construye contexto reciente SOLO con turnos reales de la conversación.
-    Los logs internos de agentes ("[SQL] ...", "[Harness] ...", etc.) se excluyen
-    para no contaminar al planificador con telemetría del pipeline.
-    """
     if not messages:
         return current_question
 
@@ -112,7 +114,7 @@ def _build_conversational_context(
 
 
 # ------------------------------------------------------------------
-# (2.9) _build_replan_context robusto a dict O modelo Pydantic
+# (2.9/3.5) _build_replan_context: ahora con evidencia técnica del fallo
 # ------------------------------------------------------------------
 def _build_replan_context(state: Dict[str, Any]) -> str:
     """
@@ -129,6 +131,15 @@ def _build_replan_context(state: Dict[str, Any]) -> str:
     replan_reason = state.get("replan_reason")
     if replan_reason:
         parts.append(f"Motivo de replanificación: {replan_reason}")
+
+    # (3.5) evidencia técnica preservada por el orchestrator ANTES de limpiar
+    # sql_results. Sin esto el replan era amnésico y repetía el mismo plan.
+    replan_errors = state.get("replan_errors") or []
+    if replan_errors:
+        parts.append(
+            "ERRORES TÉCNICOS DEL PLAN ANTERIOR (prohibido repetirlos):\n"
+            + "\n".join(replan_errors)
+        )
 
     original_question = _get(task_ledger, "original_question") or state.get("question", "")
     parts.append(f"Pregunta original: {original_question}")
@@ -186,7 +197,6 @@ _PRODUCTOS_FALLBACK = [
     "cortado", "flat white", "iced latte", "chai latte", "chocolate caliente",
 ]
 
-# (2.9) Días expresados en palabras — orden importa (multi-palabra primero)
 _PHRASE_DAYS = {
     "una semana": 7, "dos semanas": 14, "tres semanas": 21,
     "cuatro semanas": 28, "un mes": 30, "semana": 7,
@@ -196,8 +206,6 @@ _N_DIAS_MIN, _N_DIAS_MAX = 1, 30  # consistente con ForecastRequest(n_dias ge/le
 
 
 class _ForecastParamsInternal(BaseModel):
-    # Sin bounds duros aquí: preferimos parsear y clampear después a perder
-    # la extracción completa por un ValidationError.
     producto: Optional[str] = None
     sede: Optional[str] = None
     n_dias: int = 7
@@ -210,9 +218,9 @@ def _is_demand_forecast_question(question: str) -> bool:
 
 
 def _get_sedes_validas() -> List[str]:
-    """(2.3) Fuente única: BusinessMemory. Fallback a constante legacy."""
+    """(2.3/3.2) Fuente única: catálogo (hot-reload). Fallback a constante legacy."""
     for method in ("list_sedes", "get_sedes", "sedes"):
-        fn = getattr(_biz_mem, method, None)
+        fn = getattr(get_biz_mem(), method, None)
         try:
             sedes = fn() if callable(fn) else None
             if sedes:
@@ -223,9 +231,9 @@ def _get_sedes_validas() -> List[str]:
 
 
 def _get_productos_validos() -> List[str]:
-    """(2.3) Fuente única: BusinessMemory. Fallback a constante legacy."""
+    """(2.3/3.2) Fuente única: catálogo (hot-reload). Fallback a constante legacy."""
     for method in ("list_productos", "list_productos_frecuentes", "get_productos"):
-        fn = getattr(_biz_mem, method, None)
+        fn = getattr(get_biz_mem(), method, None)
         try:
             productos = fn() if callable(fn) else None
             if productos:
@@ -236,10 +244,6 @@ def _get_productos_validos() -> List[str]:
 
 
 def _match_to_catalog(value: Optional[str], valid_options: List[str]) -> Optional[str]:
-    """
-    Normaliza el output del LLM al nombre canónico del catálogo:
-    exacto (normalizado) → substring. Devuelve None si no hay match razonable.
-    """
     if not value:
         return None
     v = _normalize(value)
@@ -254,7 +258,6 @@ def _match_to_catalog(value: Optional[str], valid_options: List[str]) -> Optiona
 
 
 def _extract_n_dias(text_normalized: str) -> int:
-    """(2.9) Soporta palabras ('una semana') y números ('15 días', '2 semanas')."""
     for phrase, days in _PHRASE_DAYS.items():
         if phrase in text_normalized:
             return days
@@ -281,7 +284,6 @@ def _clamp_n_dias(n: Any) -> int:
 
 
 def _extract_forecast_params(question: str) -> Dict[str, Any]:
-    """(2.3) Extracción con catálogo inyectado + normalización a nombres exactos."""
     sedes = _get_sedes_validas()
     productos = _get_productos_validos()
 
@@ -302,7 +304,6 @@ def _extract_forecast_params(question: str) -> Dict[str, Any]:
         logger.warning(f"[Planner] Falló extracción estructurada de forecast: {e}")
         params = {}
 
-    # Normalización post-LLM al catálogo (2.3)
     params["sede"] = _match_to_catalog(params.get("sede"), sedes)
     params["producto"] = _match_to_catalog(params.get("producto"), productos) or params.get("producto")
     params["n_dias"] = _clamp_n_dias(params.get("n_dias", 7))
@@ -310,7 +311,6 @@ def _extract_forecast_params(question: str) -> Dict[str, Any]:
 
 
 def _fallback_extract_forecast_params(question: str) -> Dict[str, Any]:
-    """(2.3) Fallback léxico que comparte las MISMAS listas del catálogo."""
     qn = _normalize(question)
     sedes = _get_sedes_validas()
     productos = _get_productos_validos()
@@ -331,14 +331,6 @@ def _fallback_extract_forecast_params(question: str) -> Dict[str, Any]:
 # SEMANTIC_MAP eliminado (anti-patrón): cortafuegos, no resolver.
 # ------------------------------------------------------------------
 def _column_exists(view_info, column_name: str) -> bool:
-    """
-    Match EXACTO normalizado contra el catálogo (BusinessMemory = única verdad).
-    Sin sinónimos ni fuzzy. _normalize ya absorbe case/acentos/underscores vs
-    espacios, así que 'unidades vendidas' matchea la columna 'unidades_vendidas'.
-    Lo que NO sea match (ej. 'producto' vs columna 'descripcion') produce un
-    warning accionable con los nombres válidos (ver _collect_column_warnings);
-    la corrección final ocurre en el SQL Agent vía COLUMNAS_INVALIDAS + reintento.
-    """
     if not view_info:
         return False
 
@@ -348,10 +340,15 @@ def _column_exists(view_info, column_name: str) -> bool:
 
 
 def _build_view_catalog(allowed_views: List[str]) -> Dict[str, Any]:
+    """
+    (3.1) Catálogo CON DEFINICIONES — simétrico a _build_sql_catalog del
+    sql_agent refactorizado. La similitud concepto→columna la resuelve el LLM,
+    pero solo si ve el significado de cada métrica, no el identificador desnudo.
+    """
     catalog = {}
     for view_full_name in allowed_views:
         view_name = view_full_name.replace("semantic.", "").strip()
-        view_info = _biz_mem.get_view(view_name)
+        view_info = get_biz_mem().get_view(view_name)
         if not view_info:
             continue
         catalog[view_name] = {
@@ -359,7 +356,7 @@ def _build_view_catalog(allowed_views: List[str]) -> Dict[str, Any]:
             "descripcion": view_info.descripcion,
             "granularidad": view_info.granularidad,
             "filtro_fecha": view_info.filtro_fecha,
-            "metricas": list(view_info.metricas.keys()),
+            "metricas": dict(view_info.metricas),      # {nombre: definición}
             "columnas_fecha": view_info.columnas_fecha,
             "notas": view_info.notas,
         }
@@ -370,13 +367,6 @@ def _build_view_catalog(allowed_views: List[str]) -> Dict[str, Any]:
 # (2.5) Reglas del prompt generadas DESDE el catálogo, no hardcodeadas
 # ------------------------------------------------------------------
 def _build_dynamic_rules(view_catalog: Dict[str, Any]) -> str:
-    """
-    Genera reglas solo con vistas realmente disponibles en allowed_views.
-    Nunca instruye usar vistas ausentes (antes: mart_operacion_hora se mencionaba
-    aunque el harness no la hubiera autorizado → instrucción a violar la allowlist).
-    El dialecto SQL (ISODOW, CURRENT_DATE...) se movió al prompt del sql_agent:
-    el planner expresa INTENCIÓN temporal en lenguaje natural.
-    """
     rules: List[str] = []
 
     hourly = [
@@ -421,10 +411,6 @@ def _build_dynamic_rules(view_catalog: Dict[str, Any]) -> str:
 # (2.8) Severidades separadas: errores duros de vista vs warnings de columna
 # ------------------------------------------------------------------
 def _validate_task_integrity(task, allowed_views: List[str]) -> List[str]:
-    """
-    Errores DUROS (bloqueantes): la vista no existe, no está autorizada o no hay asignada.
-    Los nombres de columna YA NO bloquean aquí (ver _collect_column_warnings).
-    """
     errors: List[str] = []
     preferred = task.preferred_view
     if not preferred:
@@ -435,7 +421,7 @@ def _validate_task_integrity(task, allowed_views: List[str]) -> List[str]:
         return errors
 
     view_name = preferred.replace("semantic.", "").strip()
-    if not _biz_mem.get_view(view_name):
+    if not get_biz_mem().get_view(view_name):
         errors.append(f"La vista '{preferred}' no está documentada en AGENTS.md.")
 
     return errors
@@ -443,14 +429,12 @@ def _validate_task_integrity(task, allowed_views: List[str]) -> List[str]:
 
 def _collect_column_warnings(task) -> List[str]:
     """
-    Chequeo exacto NO bloqueante de nombres de columna contra el catálogo.
-    Un mismatch suele ser un concepto del LLM (no un nombre literal de columna):
-    se adjunta como assumption con los nombres válidos, y el SQL Agent hace la
-    corrección exacta con su retry COLUMNAS_INVALIDAS. No generar followups al
-    usuario por esto.
+    Chequeo exacto NO bloqueante post-alineación (3.3): lo que queda aquí es
+    genuinamente ambiguo o inexistente; viaja como assumption con los nombres
+    válidos y el SQL Agent decide con las definiciones del catálogo.
     """
     warnings: List[str] = []
-    view_info = _biz_mem.get_view((task.preferred_view or "").replace("semantic.", "").strip())
+    view_info = get_biz_mem().get_view((task.preferred_view or "").replace("semantic.", "").strip())
     if not view_info:
         return warnings
 
@@ -463,13 +447,49 @@ def _collect_column_warnings(task) -> List[str]:
     return warnings
 
 
+# ------------------------------------------------------------------
+# (3.3) Alineación inequívoca de columnas del payload
+# (mismo algoritmo que la autocorrección del sql_agent; derivado del catálogo)
+# ------------------------------------------------------------------
+def _resolve_by_tokens(concept: str, available: List[str]) -> Optional[str]:
+    """
+    Resolución determinista INEQUÍVOCA: 'unidades vendidas' → 'unidades_vendidas'
+    solo si es la ÚNICA columna compatible. 0 o 2+ candidatos → None: la
+    ambigüedad la resuelve el LLM con las definiciones, nunca una heurística.
+    """
+    tokens = {t for t in _normalize(concept).split() if len(t) > 2}
+    if not tokens:
+        return None
+    matches = [
+        col for col in available
+        if tokens <= set(_normalize(col).split()) or set(_normalize(col).split()) <= tokens
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _align_task_columns(task) -> None:
+    """Normaliza metrics/dimensions a nombres reales cuando el match es
+    inequívoco. Cada resolución queda trazada en assumptions."""
+    view_info = get_biz_mem().get_view((task.preferred_view or "").replace("semantic.", "").strip())
+    if not view_info:
+        return
+    available = list(view_info.metricas.keys()) + view_info.columnas_fecha
+    for attr in ("metrics", "dimensions"):
+        aligned = []
+        for col in getattr(task, attr, None) or []:
+            if col and str(col).strip() and not _column_exists(view_info, col):
+                resolved = _resolve_by_tokens(col, available)
+                if resolved:
+                    task.assumptions = [
+                        *(getattr(task, "assumptions", []) or []),
+                        f"'{col}' se resolvió a la columna '{resolved}' (match inequívoco).",
+                    ]
+                    col = resolved
+            aligned.append(col)
+        setattr(task, attr, aligned)
+
+
 def _find_compatible_view(task, allowed_views: List[str]) -> Optional[str]:
-    """
-    Fallback léxico unificado: reutiliza _column_exists (EXACTO-only tras 2.8).
-    Solo "encuentra" vista cuando el LLM usó nombres exactos de columna (los tiene
-    en el catálogo del prompt); con nombres conceptuales devuelve None y la
-    resolución queda delegada al SQL Agent.
-    """
     required = [*(getattr(task, "metrics", []) or []), *(getattr(task, "dimensions", []) or [])]
     required = [c for c in required if c and str(c).strip()]
     if not required:
@@ -478,7 +498,7 @@ def _find_compatible_view(task, allowed_views: List[str]) -> Optional[str]:
     for view_full_name in (getattr(task, "candidate_views", []) or allowed_views):
         if view_full_name not in allowed_views:
             continue
-        view_info = _biz_mem.get_view(view_full_name.replace("semantic.", "").strip())
+        view_info = get_biz_mem().get_view(view_full_name.replace("semantic.", "").strip())
         if not view_info:
             continue
         missing = [c for c in required if not _column_exists(view_info, c)]
@@ -503,19 +523,9 @@ def _select_view_for_task(
     original_query: str = "",
 ) -> tuple[Optional[str], List[str], List[str]]:
     """
-    Selección de vista para una tarea del plan.
-
-    Cambios (migración a core.rag):
-      - payload_to_column_hints eliminado: el RAG ya no consume hints.
-      - min_score_threshold=0.20 (coseno): si nada supera el umbral, el
-        retriever devuelve [] y el control pasa al fallback unificado.
-      - Rama can_answer eliminada: era código muerto — rag.py devuelve
-        can_answer=True siempre; el ranking coseno ya ordenó, la mejor es [0].
-      - Fallback unificado FUERA del try/except: aplica igual si el retriever
-        lanza excepción que si devuelve lista vacía (antes, en el caso vacío
-        sin excepción, no se consideraban original_candidates).
-      - preferred se toma de retriever_candidates (ya filtrado por
-        allowed_views), no de detailed[0] crudo.
+    Migrado a core.rag (umbral coseno 0.20; el ranking ordena y la mejor
+    candidata autorizada es [0]). Fallback unificado fuera del try/except.
+    (3.3): tras validar, _align_task_columns normaliza lo inequívoco.
     """
     errors: List[str] = []
 
@@ -540,14 +550,11 @@ def _select_view_for_task(
             for c in detailed
             if _ensure_semantic_prefix(c["view_name"]) in allowed_views
         ]
-        # El ranking coseno ya ordenó; la mejor candidata autorizada es la primera.
         if retriever_candidates:
             preferred = retriever_candidates[0]
     except Exception as e:
         logger.warning(f"[Planner] retriever falló para tarea {task.task_id}: {e}")
 
-    # Fallback unificado: retriever sin resultados sobre umbral, excepción,
-    # o resultados fuera de allowed_views.
     if not preferred:
         preferred = _find_compatible_view(task, allowed_views) or (
             original_candidates[0] if original_candidates else None
@@ -583,11 +590,12 @@ def _select_view_for_task(
             else:
                 errors.extend([f"Tarea {task.task_id}: {err}" for err in lexical_errors])
         else:
-            # (2.8): columnas no exactas → pista al SQL Agent vía assumptions,
-            # sin bloquear el plan ni pedir aclaraciones espurias al usuario.
+            # (3.3) primero lo inequívoco (determinista, con traza); luego (2.8)
+            # solo lo genuinamente ambiguo viaja como warning al SQL Agent.
+            _align_task_columns(task)
             col_warnings = _collect_column_warnings(task)
             if col_warnings:
-                logger.info(f"[Planner] Columnas no exactas en tarea {task.task_id}: {col_warnings}")
+                logger.info(f"[Planner] Columnas ambiguas/inexistentes en tarea {task.task_id}: {col_warnings}")
                 task.assumptions = [
                     *(getattr(task, "assumptions", []) or []),
                     "Verificación léxica: " + " | ".join(col_warnings),
@@ -598,12 +606,10 @@ def _select_view_for_task(
 
 # ------------------------------------------------------------------
 # (2.7) Versionado de plan + normalización determinista de IDs
+# (3.5): la versión deriva del conteo de replans del ledger — antes, al
+# limpiarse plan/sql_results en cada replan, la versión quedaba siempre en 1.
 # ------------------------------------------------------------------
 def _next_plan_version(state: Dict[str, Any]) -> int:
-    """
-    Versión del nuevo plan. Robusta incluso antes de persistirse
-    PlannerContract.plan_version: inspecciona IDs versionados en sql_results.
-    """
     versions: List[int] = []
     prev_plan = state.get("plan")
     v = _get(prev_plan, "plan_version", None) if prev_plan else None
@@ -613,21 +619,21 @@ def _next_plan_version(state: Dict[str, Any]) -> int:
         m = re.match(r"v(\d+)-", str(_get(r, "task_id", "") or ""))
         if m:
             versions.append(int(m.group(1)))
+    # (3.5) el ledger recuerda los replans aunque plan/results se hayan limpiado
+    progress = state.get("progress_ledger") or {}
+    replans = list(_get(progress, "completed_steps", []) or []).count("replan")
+    if replans:
+        versions.append(replans)
     return (max(versions) + 1) if versions else 1
 
 
 def _normalize_task_ids(plan: PlannerContract, plan_version: int) -> None:
-    """
-    IDs deterministas v{version}-t{i}. Elimina colisiones del LLM ("1","1")
-    y entre replanificaciones. Remapea depends_on; descarta dependencias rotas (con log).
-    """
     try:
-        plan.plan_version = plan_version  # requiere PlannerContract.plan_version
+        plan.plan_version = plan_version
     except Exception:
         logger.warning(
             "[Planner] PlannerContract no tiene campo plan_version — "
-            "los IDs se versionan igualmente, pero el contador no persistirá. "
-            "Añade `plan_version: int = 1` al contrato."
+            "los IDs se versionan igualmente, pero el contador no persistirá."
         )
 
     old_to_new: Dict[str, str] = {}
@@ -635,7 +641,7 @@ def _normalize_task_ids(plan: PlannerContract, plan_version: int) -> None:
     for i, t in enumerate(plan.tasks, 1):
         old = str(getattr(t, "task_id", "") or "").strip() or str(i)
         new = f"v{plan_version}-t{i}"
-        if old not in seen:  # duplicados del LLM: primer ocurrencia gana el mapeo
+        if old not in seen:
             old_to_new[old] = new
             seen.add(old)
         t.task_id = new
@@ -648,7 +654,7 @@ def _normalize_task_ids(plan: PlannerContract, plan_version: int) -> None:
 
 
 # ------------------------------------------------------------------
-# Helper de salida: garantiza consumo de la señal is_replan en TODAS las rutas
+# Helper de salida: consumo de señales en TODAS las rutas
 # ------------------------------------------------------------------
 def _planner_result(
     plan: PlannerContract,
@@ -661,6 +667,7 @@ def _planner_result(
         "messages": [AIMessage(content=log_msg)],
         "next_agent_instruction": None,  # instrucción ya consumida
         "is_replan": False,              # (2.2) señal ya consumida
+        "replan_errors": None,           # (3.5) evidencia ya consumida
     }
     if forecast_request is not None or _get(plan, "question_type") == "demand_forecast":
         out["forecast_request"] = forecast_request
@@ -679,10 +686,8 @@ def planner_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
 
     instruction = state.get("next_agent_instruction") or state.get("supervisor_instruction")
 
-    # (2.2) señal estructurada — reemplaza a _is_replan_instruction()
     is_replan = bool(state.get("is_replan", False))
 
-    # (2.1) contexto conversacional sin telemetría interna
     contextual_question = _build_conversational_context(messages, question)
 
     logger.info(f"[Planner] Pregunta contextual: {contextual_question[:200]}...")
@@ -716,7 +721,6 @@ def planner_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     if _is_demand_forecast_question(contextual_question):
         logger.info("[Planner] Detectada pregunta de demand forecast")
 
-        # (2.4) replan con forecast fallido: NO regenerar los mismos params
         if is_replan and state.get("forecast_error"):
             err = state["forecast_error"]
             logger.warning(f"[Planner] Replan tras error de forecast: {err}")
@@ -800,12 +804,12 @@ def planner_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     # ================================================================
     # Planificación normal de consultas SQL
     # ================================================================
-    view_catalog = _build_view_catalog(allowed_views)
-    dynamic_rules = _build_dynamic_rules(view_catalog)  # (2.5)
+    view_catalog = _build_view_catalog(allowed_views)   # (3.1) con definiciones
+    dynamic_rules = _build_dynamic_rules(view_catalog)
 
     replan_context = ""
     if is_replan:
-        replan_context = _build_replan_context(state)
+        replan_context = _build_replan_context(state)   # (3.5) incluye replan_errors
         logger.info(f"[Planner] Contexto de replanificación:\n{replan_context[:500]}...")
 
     replan_block = (
@@ -817,7 +821,7 @@ def planner_node(state: Dict[str, Any], **kwargs) -> Dict[str, Any]:
     system_prompt = f"""
 Eres un Planner BI avanzado. Transformas preguntas de negocio en planes operacionales estructurados.
 
-CATÁLOGO DE VISTAS PERMITIDAS (con columnas disponibles):
+CATÁLOGO DE VISTAS PERMITIDAS (columnas con su significado):
 {json.dumps(view_catalog, indent=2, ensure_ascii=False)}
 
 REGLAS DERIVADAS DEL CATÁLOGO DISPONIBLE:
@@ -837,15 +841,15 @@ REGLA DE PREDICCIÓN (FORECAST) - CRÍTICO:
 
 REGLAS CRÍTICAS DE SELECCIÓN DE VISTA:
 1. ANTES de asignar una vista a una tarea, verifica en el catálogo que contenga EXPLÍCITAMENTE
-   las columnas que la tarea requiere.
+   las columnas que la tarea requiere (por su DEFINICIÓN, no solo por el nombre).
 2. NUNCA asignes una vista si la columna requerida no aparece en sus métricas/columnas.
-3. Desglose por PRODUCTO → solo vistas con 'producto', 'descripcion' o similar.
-4. Desglose por SEDE/LOCAL → solo vistas con 'sucursal', 'nombre_sede' o similar.
-5. Desglose por CATEGORÍA → solo vistas con 'categoria'.
+3. Desglose por PRODUCTO → solo vistas cuya definición exponga producto.
+4. Desglose por SEDE/LOCAL → solo vistas cuya definición exponga sucursal/sede.
+5. Desglose por CATEGORÍA → solo vistas cuya definición exponga categoría.
 6. SEGURIDAD: usa ÚNICAMENTE vistas del catálogo. NO inventes vistas.
 7. Respeta las REGLAS DERIVADAS DEL CATÁLOGO de arriba (temporalidad y granularidad).
-8. En `metrics` y `dimensions` usa el NOMBRE EXACTO de la columna tal como aparece en
-   el catálogo de la vista elegida. No existen columnas equivalentes ni sinónimos.
+8. En `metrics` y `dimensions`: elige la columna por su DEFINICIÓN en el catálogo y
+   escribe su NOMBRE EXACTO. No existen columnas equivalentes ni sinónimos.
 
 REGLAS DE MULTI-QUERY / DESCOMPOSICIÓN:
 9. Si la pregunta compara métricas de distintas fuentes, cruza granularidades o requiere múltiples
@@ -868,7 +872,14 @@ REGLAS DE NEGOCIO:
 
 REPLANIFICACIÓN:
 15. Si arriba hay CONTEXTO DE REPLANIFICACIÓN, genera un plan ALTERNO: cambia de vista, simplifica
-    la pregunta o divide en subtareas más pequeñas. NO repitas el plan anterior.
+    la pregunta o divide en subtareas más pequeñas. NO repitas el plan anterior NI sus errores
+    técnicos (los "ERRORES TÉCNICOS DEL PLAN ANTERIOR" son prohibidos).
+
+TOP N POR GRUPO:
+16. "Top N por cada X" (ej. "5 productos más vendidos EN CADA sucursal") es UNA sola tarea
+    con execution_strategy="top_n_per_group". NUNCA la dividas por sucursal, categoría u
+    otro valor de la dimensión: el SQL Agent lo resuelve con ROW_NUMBER() OVER (PARTITION BY ...)
+    en una query. Divide solo si cambia la métrica, la vista o el periodo.
 
 REGLAS ADICIONALES:
 - "informe completo", "reporte detallado", "análisis profundo", "deep dive" → question_type="deep_research".
@@ -882,8 +893,7 @@ OUTPUT: JSON con schema PlannerContract.
     plan = PlannerContract(**plan_raw) if isinstance(plan_raw, dict) else plan_raw
 
     # ============================================================
-    # (2.9) SAFEGUARD: forecast alucinado en query histórica.
-    # Solo se corrige el tipo; las tasks del LLM se CONSERVAN (antes se descartaban).
+    # (2.9) SAFEGUARD: forecast alucinado en query histórica
     # ============================================================
     if plan.question_type == "demand_forecast" and not _is_demand_forecast_question(contextual_question):
         logger.warning(
@@ -892,14 +902,12 @@ OUTPUT: JSON con schema PlannerContract.
         )
         plan.question_type = "multi_query" if len(plan.tasks) > 1 else "aggregation"
 
-    # Defensivo (casi inalcanzable tras el early-return de forecast)
     if plan.question_type == "demand_forecast":
         plan.tasks = []
         plan.visualization_candidate = False
 
     # ============================================================
-    # (2.9) FALLBACK unificado: tarea genérica que pasa por el MISMO
-    # pipeline de selección (_select_view_for_task) → hints consistentes.
+    # (2.9) FALLBACK unificado: tarea genérica por el MISMO pipeline
     # ============================================================
     if not plan.tasks and plan.question_type not in ("demand_forecast", "unknown"):
         logger.warning("[Planner] LLM no generó tareas. Creando tarea fallback.")
@@ -912,21 +920,18 @@ OUTPUT: JSON con schema PlannerContract.
                 filters_description="",
                 execution_strategy="single_view",
                 candidate_views=list(allowed_views),
-                preferred_view=None,  # la asigna _select_view_for_task abajo
+                preferred_view=None,
             )
         ]
 
     # ============================================================
-    # (2.7) Versionado + IDs deterministas ANTES de validar
-    # (los errores de validación ya referencian IDs estables)
+    # (2.7)/(3.5) Versionado + IDs deterministas ANTES de validar
     # ============================================================
     plan_version = _next_plan_version(state)
     _normalize_task_ids(plan, plan_version)
 
     # ============================================================
     # VALIDACIÓN Y ENRIQUECIMIENTO SEMÁNTICO POST-LLM
-    # (2.8): validation_errors solo recibe errores DUROS de vista;
-    # los nombres de columna no exactos viajan como assumptions.
     # ============================================================
     validation_errors: List[str] = []
     for task in plan.tasks:
@@ -942,8 +947,7 @@ OUTPUT: JSON con schema PlannerContract.
             validation_errors.append(f"Tarea {task.task_id}: no se pudo asignar ninguna vista.")
 
     # ============================================================
-    # (2.6) FOLLOWUP: respetar al LLM + gate de confidence.
-    # Ya no se fuerza needs_followup=False a ciegas.
+    # (2.6) FOLLOWUP: respetar al LLM + gate de confidence
     # ============================================================
     llm_followup = bool(plan.needs_followup)
 
@@ -952,14 +956,12 @@ OUTPUT: JSON con schema PlannerContract.
         plan.followup_reason = " | ".join(validation_errors)
         logger.warning(f"[Planner] Errores de validación: {validation_errors}")
     elif llm_followup and plan.missing_information:
-        # Followup legítimo del LLM con información faltante explícita → se respeta
         plan.needs_followup = True
         plan.followup_reason = plan.followup_reason or (
             "Información faltante: " + ", ".join(plan.missing_information)
         )
         logger.info(f"[Planner] Followup del LLM respetado: {plan.followup_reason}")
     elif plan.confidence < 0.5:
-        # (2.6) confidence ahora tiene consumidor
         plan.needs_followup = True
         plan.followup_reason = plan.followup_reason or (
             "Baja confianza en la interpretación de la pregunta; "

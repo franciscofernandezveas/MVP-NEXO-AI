@@ -9,23 +9,26 @@
 #  H3 Nota temporal silenciada cuando la promoción la resolvió; nota explícita de
 #     gap de capacidad cuando no hay vista histórica disponible
 #
-# Cambios de esta versión (migración a core.rag):
-#  R1 Retrieval ÚNICO por pregunta. Antes: obtener_candidatas_detalles(k=10) +
-#     seleccionar_vista_principal() SIN precomputed_candidates → 2ª búsqueda
-#     vectorial idéntica (latencia y costo duplicados). preferred_view ahora es
-#     directamente la mejor candidata del ranking coseno.
-#  R2 El umbral se aplica AQUÍ, en Python (MIN_SCORE_THRESHOLD=0.20, coseno
-#     ∈ [0,1], configurable vía HARNESS_MIN_SCORE). Antes: -5.0 desactivaba el
-#     filtrado que el nuevo RAG sí implementa.
-#  R3 Fallbacks sin reglas de negocio hardcodeadas:
-#       - sin matches sobre umbral → top-k vectorial SIN umbral
-#       - retriever vacío/error   → catálogo documentado (orden temporal-aware)
-#     _fallback_preferred_view y su keyword_map ELIMINADOS — era el mismo
-#     anti-patrón que VALID_VIEWS: nombres de vistas escritos a mano en código.
-#     Lo que sobrevive (promoción H2, orden temporal) se DERIVA del catálogo.
-#  R4 Caché claveado por firma sha256 de AGENTS.md. Antes: el índice reindexaba
-#     al cambiar el archivo, pero este lru_cache seguía sirviendo el contexto
-#     compilado viejo (BusinessMemory parseado incluido) hasta reiniciar.
+# Migración a core.rag:
+#  R1 Retrieval ÚNICO por pregunta (antes: doble búsqueda vectorial idéntica;
+#     preferred_view = mejor candidata del ranking coseno)
+#  R2 Umbral coseno aplicado AQUÍ, en Python (MIN_SCORE_THRESHOLD=0.20,
+#     configurable vía HARNESS_MIN_SCORE). Antes: -5.0 desactivaba el filtrado
+#  R3 Fallbacks sin reglas de negocio hardcodeadas: top-k sin umbral, luego
+#     catálogo documentado (orden temporal-aware). keyword_map ELIMINADO
+#  R4 Caché claveado por firma sha256 de AGENTS.md
+#
+# Alineación del sistema (planner + sql_agent):
+#  A1 get_biz_mem(): punto de acceso ÚNICO al catálogo. harness, planner y
+#     sql_agent comparten UNA instancia por firma sha256 de AGENTS.md.
+#     Hot-reload coherente en los tres componentes (índice RAG vía manifiesto,
+#     contexto vía md_sig, catálogo vía este helper) — sin reiniciar el proceso.
+#  A2 El harness usa get_biz_mem() internamente (antes: BusinessMemory.from_file()
+#     por cada cache-miss → lectura y parseo duplicados del mismo archivo).
+#  A3 resolve_column_unambiguous(): implementación ÚNICA de la resolución
+#     determinista inequívoca concepto→columna. Antes existía duplicada en
+#     planner (_align_task_columns) y sql_agent (_validate_columns) → riesgo
+#     de divergencia, el mismo anti-patrón que el viejo SEMANTIC_MAP.
 # -------------------------------------------------
 
 from __future__ import annotations
@@ -347,6 +350,78 @@ class BusinessMemory:
 
 
 # ============================================================================
+# (A1) Instancia compartida del catálogo — punto de acceso ÚNICO del sistema
+# ============================================================================
+
+def _agents_md_signature() -> str:
+    """
+    (R4/A1) Firma del archivo fuente. Clavea tanto el caché del contexto
+    compilado como la instancia compartida de BusinessMemory: si AGENTS.md
+    cambia en disco, índice RAG, contexto y catálogo recargan juntos.
+    """
+    try:
+        return hashlib.sha256(DEFAULT_AGENTS_MD_PATH.read_bytes()).hexdigest()[:16]
+    except Exception:
+        return "na"
+
+
+@lru_cache(maxsize=8)
+def _load_biz_mem(sig: str) -> BusinessMemory:
+    # lru_cache NO cachea excepciones: si el archivo falta, falla ruidoso
+    # en cada llamada (correcto — el sistema no debe operar sin catálogo).
+    logger.info(f"[Harness] Cargando BusinessMemory (sig={sig})")
+    return BusinessMemory.from_file()
+
+
+def get_biz_mem() -> BusinessMemory:
+    """
+    Punto de acceso único al catálogo para harness, planner y sql_agent.
+    Hot-reload: si AGENTS.md cambia, la firma cambia y el siguiente llamado
+    recarga el parseo — sin reiniciar el proceso.
+    """
+    return _load_biz_mem(_agents_md_signature())
+
+
+# ============================================================================
+# (A3) Resolución inequívoca concepto→columna — implementación ÚNICA
+# (importada por planner y sql_agent; antes duplicada en ambos)
+# ============================================================================
+
+def _normalize_column_text(text: str) -> str:
+    """
+    Higiene para nombres de columna/conceptos. NO es _normalize_question:
+    aquel quita puntuación para keyword matching de preguntas; este mapea
+    "_" → espacio para comparar tokens de identificadores.
+    """
+    if not text:
+        return ""
+    return (
+        text.lower().strip().replace("_", " ")
+        .replace("á", "a").replace("é", "e").replace("í", "i")
+        .replace("ó", "o").replace("ú", "u")
+    )
+
+
+def resolve_column_unambiguous(concept: str, available: List[str]) -> Optional[str]:
+    """
+    Resolución determinista INEQUÍVOCA derivada del catálogo.
+    'total unidades' → 'unidades' solo si es la ÚNICA columna compatible
+    (todos los tokens del concepto contenidos en la columna, o viceversa).
+    0 o 2+ candidatos → None: la ambigüedad la resuelve el LLM con las
+    definiciones del catálogo; nunca una heurística silenciosa.
+    """
+    tokens = {t for t in _normalize_column_text(concept).split() if len(t) > 2}
+    if not tokens:
+        return None
+    matches = [
+        col for col in available
+        if tokens <= set(_normalize_column_text(col).split())
+        or set(_normalize_column_text(col).split()) <= tokens
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+# ============================================================================
 # Seguridad dinámica basada en BusinessMemory
 # ============================================================================
 
@@ -386,7 +461,7 @@ def build_harness_context(
     dicta el CONTENIDO que se inyecta al prompt.
     """
     if biz_mem is None:
-        biz_mem = BusinessMemory.from_file()
+        biz_mem = get_biz_mem()   # (A2) antes: BusinessMemory.from_file()
 
     default_rules = (
         "Eres un asistente BI que consulta el esquema 'semantic' en PostgreSQL (Supabase).\n"
@@ -527,17 +602,6 @@ class AmbiguityDetector:
 # Contexto compilado por pregunta (cacheado, claveado por firma de AGENTS.md)
 # ============================================================================
 
-def _agents_md_signature() -> str:
-    """
-    (R4) Firma del archivo fuente. Participa en la clave del lru_cache:
-    si AGENTS.md cambia, el contexto compilado se regenera junto con el índice.
-    """
-    try:
-        return hashlib.sha256(DEFAULT_AGENTS_MD_PATH.read_bytes()).hexdigest()[:16]
-    except Exception:
-        return "na"
-
-
 @lru_cache(maxsize=128)
 def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) -> Dict[str, Any]:
     """
@@ -545,7 +609,7 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
     md_sig no se usa en el cuerpo: existe para formar parte de la clave de caché.
     """
     logger.info(f"[Harness] Compilando contexto (md_sig={md_sig})")
-    biz_mem = BusinessMemory.from_file()
+    biz_mem = get_biz_mem()   # (A2) antes: BusinessMemory.from_file()
 
     # H1/H2: intención temporal computada UNA vez, reutilizada por el
     # fallback, el mínimo de contexto y la promoción histórica.
