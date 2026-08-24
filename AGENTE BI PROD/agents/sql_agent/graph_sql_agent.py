@@ -1,4 +1,4 @@
-# core/graph_sql_agent.py
+# agents/sql_agent/graph_sql_agent.py
 # -------------------------------------------------
 # Refactor de producción. Principios:
 #
@@ -7,17 +7,14 @@
 #  2. La validación de columnas cubre SOLO referencias externas a la vista.
 #     Los alias definidos por la propia query (AS, CTEs, subqueries) son
 #     nombres nuevos y legítimos — nunca son "columnas inválidas".
-#  3. Autocorrección determinista INEQUÍVOCA: una columna inválida se
-#     reescribe solo si exactamente UNA columna del catálogo es compatible
-#     por tokens. 0 o 2+ candidatos → error accionable y reintento LLM.
-#     Sin sinónimos hardcodeados, sin fuzzy silencioso.
+#  3. Autocorrección determinista INEQUÍVOCA vía resolve_column_unambiguous
+#     (implementación ÚNICA en core.harness — antes duplicada aquí = riesgo
+#     de divergencia tipo SEMANTIC_MAP).
 #  4. La similitud semántica la hace el LLM con DEFINICIONES en el catálogo
 #     (metricas llega como {nombre: definición}, no como lista de claves).
-#  5. Errores clasificados por categoría con política explícita:
-#       terminal:    security_view | unsolvable | cap de intentos
-#       recuperable: columns | dml | db_recoverable | empty_output
+#  5. Errores clasificados por categoría con política explícita terminal/recoverable.
 #  6. Guardarraíl de extracción: LIMIT por defecto si la query no lo trae.
-#  7. Catálogo con hot-reload por firma sha256 de AGENTS.md.
+#  7. Catálogo vía get_biz_mem() (hot-reload por sha256, implementado en harness).
 #
 # Compatibilidad (consumidos por orchestrator/supervisor):
 #  - COL_ERR_PREFIX exportado; marcadores "SECURITY:", "Ninguna vista
@@ -25,12 +22,11 @@
 # -------------------------------------------------
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Dict, List, Literal, NotRequired, Optional, Set, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -42,14 +38,8 @@ from core.llm import LLM
 from core.database import execute_sql_query
 from core.contracts import SQLContract
 from core.sql_utils import extract_views_used, extract_columns_used
-from core.harness import (
-    BusinessMemory,
-    is_view_allowed,
-    get_biz_mem,
-    resolve_column_unambiguous,
-)
-# Extracción estructural (AST). Requerido en la práctica: sin él el validador
-# de columnas es propenso a falsos positivos con alias.
+from core.harness import is_view_allowed, get_biz_mem, resolve_column_unambiguous
+
 try:
     import sqlglot
     from sqlglot import exp as sqlglot_exp
@@ -60,6 +50,8 @@ except ImportError:
 logger = logging.getLogger("bi_orchestrator")
 
 if not _HAS_SQLGLOT:
+    if os.getenv("SQL_REQUIRE_SQLGLOT", "0") == "1":
+        raise RuntimeError("[SQL] sqlglot es OBLIGATORIO en producción (validación AST).")
     logger.warning("[SQL] sqlglot no instalado (pip install sqlglot). Fallback léxico activo.")
 
 
@@ -67,30 +59,9 @@ if not _HAS_SQLGLOT:
 # Configuración (todo por env; nada de negocio aquí)
 # ------------------------------------------------------------------
 MAX_ATTEMPTS = int(os.getenv("SQL_AGENT_MAX_ATTEMPTS", "3"))
-SQL_MAX_ROWS = int(os.getenv("SQL_MAX_ROWS", "5000"))   # guardarraíl anti-extracción masiva
+SQL_MAX_ROWS = int(os.getenv("SQL_MAX_ROWS", "5000"))
 
 COL_ERR_PREFIX = "COLUMNAS_INVALIDAS"   # exportado: lo consume el orchestrator
-
-
-# ------------------------------------------------------------------
-# Catálogo con hot-reload (firma del archivo como clave de caché)
-# ------------------------------------------------------------------
-def _agents_md_sig() -> str:
-    try:
-        return hashlib.sha256(DEFAULT_AGENTS_MD_PATH.read_bytes()).hexdigest()[:16]
-    except Exception:
-        return "na"
-
-
-@lru_cache(maxsize=8)
-def _load_biz_mem(sig: str) -> BusinessMemory:
-    logger.info(f"[SQL] Cargando BusinessMemory (sig={sig})")
-    return BusinessMemory.from_file()
-
-
-def get_biz_mem() -> BusinessMemory:
-    """Si AGENTS.md cambia en disco, el siguiente llamado recarga el catálogo."""
-    return _load_biz_mem(_agents_md_sig())
 
 
 # ------------------------------------------------------------------
@@ -125,9 +96,8 @@ _DB_DIALECT_RECOVERABLE = (
 def _classify_db_error(error: str) -> str:
     """
     Clasifica por texto de psycopg. MEJORA FUTURA: si core.database expone el
-    SQLSTATE de psycopg (42703=undefined_column, 42P01=undefined_table,
-    42601=syntax_error, 42803=grouping_error...), clasificar por código y
-    eliminar este string-matching.
+    SQLSTATE (42703=undefined_column, 42P01=undefined_table, 42601=syntax_error,
+    42803=grouping_error...), clasificar por código y eliminar el string-matching.
     """
     e = (error or "").lower()
     if "column" in e and "does not exist" in e:
@@ -168,7 +138,6 @@ class SQLAgentState(TypedDict):
     previous_row_count: NotRequired[int]
     query_columns: NotRequired[List[str]]
 
-    # Nuevos: resultados estructurados de la validación
     error_category: NotRequired[Optional[str]]
     invalid_columns: NotRequired[List[str]]
     validation_warnings: NotRequired[List[str]]
@@ -178,6 +147,7 @@ class SQLAgentState(TypedDict):
 # Helpers genéricos
 # ------------------------------------------------------------------
 def _normalize(text: str) -> str:
+    """Higiene local de strings para comparación exacta (no es lógica de negocio)."""
     if not text:
         return ""
     return (
@@ -226,7 +196,7 @@ def _available_columns(view_name: str) -> List[str]:
 
 
 # ------------------------------------------------------------------
-# Extracción de columnas EXTERNAS (Fix A: alias nunca son inválidas)
+# Extracción de columnas EXTERNAS (los alias nunca son "inválidas")
 # ------------------------------------------------------------------
 _SQL_KEYWORDS_LEGACY = {
     "as", "by", "on", "and", "or", "not", "in", "is", "like", "ilike", "between",
@@ -273,24 +243,8 @@ def _extract_external_columns(sql: str) -> List[str]:
 
 
 # ------------------------------------------------------------------
-# Autocorrección determinista inequívoca (derivada del catálogo)
+# Reescritura AST + validación (autocorrección inequívoca del harness)
 # ------------------------------------------------------------------
-def _resolve_by_tokens(concept: str, available: List[str]) -> Optional[str]:
-    """
-    'total_unidades' → 'unidades' si es la ÚNICA columna compatible.
-    0 o 2+ candidatos → None (ambigüedad: decide el LLM, nunca el azar).
-    """
-    tokens = {t for t in _normalize(concept).split() if len(t) > 2}
-    if not tokens:
-        return None
-    matches = []
-    for col in available:
-        col_tokens = set(_normalize(col).split())
-        if tokens <= col_tokens or col_tokens <= tokens:
-            matches.append(col)
-    return matches[0] if len(matches) == 1 else None
-
-
 def _rewrite_columns(sql: str, mapping: Dict[str, str]) -> str:
     """Reescritura AST de referencias externas. Los alias de salida nunca
     entran al mapping (fueron excluidos en la extracción)."""
@@ -319,19 +273,16 @@ def _validate_columns(sql: str) -> ValidationOutcome:
         invalid = [c for c in cols if _normalize(c) not in available]
 
         if invalid and _HAS_SQLGLOT:
-            # Autocorrección inequívoca: no consume intento LLM
+            # Autocorrección inequívoca (implementación única en core.harness):
+            # no consume intento LLM; ambigüedad → se abstiene y reporta
             real_cols = _available_columns(view_name)
-            mapping = {
-                c: _resolve_by_tokens(c, real_cols)
-                for c in invalid
-            }
+            mapping = {c: resolve_column_unambiguous(c, real_cols) for c in invalid}
             resolved = {k: v for k, v in mapping.items() if v}
             still_invalid = [c for c in invalid if c not in resolved]
             if resolved and not still_invalid:
-                # Señal para que el nodo validate aplique la reescritura
                 return ValidationOutcome(
                     ok=False,
-                    category="autofix",          # categoría interna del nodo
+                    category="autofix",          # categoría interna del nodo validate
                     message=json.dumps(resolved, ensure_ascii=False),
                     invalid_columns=invalid,
                 )
@@ -339,10 +290,6 @@ def _validate_columns(sql: str) -> ValidationOutcome:
 
         if invalid:
             view_info = biz_mem.get_view(view_name.replace("semantic.", "").strip())
-            available_list = (
-                list(view_info.metricas.keys()) + view_info.columnas_fecha
-                if view_info else []
-            )
             return ValidationOutcome(
                 ok=False,
                 category=ErrCategory.COLUMNS,
@@ -350,7 +297,7 @@ def _validate_columns(sql: str) -> ValidationOutcome:
                 message=(
                     f"{COL_ERR_PREFIX}: La vista '{view_name}' no contiene las columnas "
                     f"{invalid}. Columnas VÁLIDAS (con su significado): "
-                    f"{json.dumps(dict(view_info.metricas), ensure_ascii=False) if view_info else available_list}. "
+                    f"{json.dumps(dict(view_info.metricas), ensure_ascii=False) if view_info else []}. "
                     f"Columnas de fecha: {view_info.columnas_fecha if view_info else []}. "
                     f"Elige la columna cuya DEFINICIÓN coincida con lo pedido y usa su "
                     f"nombre EXACTO."
@@ -378,7 +325,7 @@ def _enforce_row_limit(sql: str) -> Tuple[str, Optional[str]]:
 
 
 # ------------------------------------------------------------------
-# Generación con salida estructurada (adiós regex de bloques ```sql)
+# Generación con salida estructurada
 # ------------------------------------------------------------------
 class _SQLGeneration(BaseModel):
     """Salida estructurada del LLM: SQL o declaración de imposibilidad."""
@@ -501,8 +448,10 @@ ERROR PREVIO / INSTRUCCIÓN DE CORRECCIÓN:
 """
     human = HumanMessage(content=ctx)
 
-    # Historial truncado: solo texto (jamás AIMessages con tool_calls pendientes).
-    messages = [m for m in state.get("messages", []) if isinstance(m, (SystemMessage, HumanMessage, AIMessage)) and getattr(m, "content", "")]
+    messages = [
+        m for m in state.get("messages", [])
+        if isinstance(m, (SystemMessage, HumanMessage, AIMessage)) and getattr(m, "content", "")
+    ]
     if len(messages) > 4:
         messages = messages[-4:]
 
@@ -735,12 +684,12 @@ def _route_after_validate(state: SQLAgentState) -> Literal["generate_query", "ex
     attempts = state.get("attempts", 0)
 
     if not err:
-        return "execute_query"                       # SQL validado → ejecutar
+        return "execute_query"
     if category in _TERMINAL_CATEGORIES:
-        return "validate_package"                    # terminal por diseño
+        return "validate_package"
     if attempts >= MAX_ATTEMPTS:
         return "validate_package"
-    return "generate_query"                          # columns/dml/empty → regenerar
+    return "generate_query"
 
 
 def _route_after_execute(state: SQLAgentState) -> Literal["generate_query", "validate_package"]:
