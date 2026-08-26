@@ -25,7 +25,9 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 import re
+import sys
 import threading
 from collections import defaultdict
 from pathlib import Path
@@ -338,6 +340,12 @@ def get_rag() -> BusinessRAG:
     if _INSTANCE is None:
         with _LOCK:
             if _INSTANCE is None:
+                if not os.getenv("OPENAI_API_KEY"):
+                    logger.error(
+                        "[RAG] OPENAI_API_KEY no está configurada. "
+                        "El lector de embeddings requiere la misma API key que el indexer. "
+                        "Actívala con: set OPENAI_API_KEY=... (PowerShell) o agrégala al .env."
+                    )
                 rag = BusinessRAG.from_env()
                 health = rag.index_health()
                 if health["doc_count"] == 0:
@@ -410,7 +418,7 @@ def obtener_candidatas_vistas(
     candidates: List[Dict[str, Any]] = []
     for name, slot in sorted(per_view.items(), key=lambda kv: kv[1]["rrf"], reverse=True)[:k]:
         # Si el chunk de la vista no rankeó, recuperar su definición canónica:
-        # la evidencia la seleccionó y el agente necesita sus columnas.
+        # la evidencia la seleccionó y el agente SQL necesita sus columnas.
         doc = (slot["view_doc"]
                or rag.fetch_view_document(f"semantic.{name}")
                or (slot["evidence"][0] if slot["evidence"] else None))
@@ -535,6 +543,17 @@ def buscar_conocimiento_negocio(
 #    (la indexación se hace con indexer.py, NO desde aquí)
 # ------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> None:
+    """
+    CLI standalone. Carga .env para poder correr fuera de la app principal.
+    La app en producción carga sus variables de entorno por su propio entrypoint.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env",
+                    override=True)
+    except ImportError:
+        pass
+
     parser = argparse.ArgumentParser(
         description="Consulta del índice RAG (solo lectura). "
                     "Para indexar: python indexer.py")

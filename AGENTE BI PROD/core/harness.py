@@ -1,49 +1,35 @@
 # core/harness.py
 # -------------------------------------------------
-# Historial reciente:
-#  H1 Intención temporal estructurada compartida: _temporal_intent/_is_snapshot_view/
-#     _is_historical_view/_historical_variants_for — el detector y la escalada usan
-#     el mismo criterio (dejan de divergir)
-#  H2 Promoción de vista histórica al allowlist: la ambigüedad se RESUELVE.
-#     Si no existe variante documentada → capability_gap estructurado
-#  H3 Nota temporal silenciada cuando la promoción la resolvió; nota explícita de
-#     gap de capacidad cuando no hay vista histórica disponible
+# Harness alineado al RAG (recuperación única).
 #
-# Migración a core.rag:
-#  R1 Retrieval ÚNICO por pregunta (antes: doble búsqueda vectorial idéntica;
-#     preferred_view = mejor candidata del ranking coseno)
-#  R2 Umbral coseno aplicado AQUÍ, en Python (MIN_SCORE_THRESHOLD=0.20,
-#     configurable vía HARNESS_MIN_SCORE). Antes: -5.0 desactivaba el filtrado
-#  R3 Fallbacks sin reglas de negocio hardcodeadas: top-k sin umbral, luego
-#     catálogo documentado (orden temporal-aware). keyword_map ELIMINADO
-#  R4 Caché claveado por firma sha256 de AGENTS.md
-#
-# Alineación del sistema (planner + sql_agent):
-#  A1 get_biz_mem(): punto de acceso ÚNICO al catálogo. harness, planner y
-#     sql_agent comparten UNA instancia por firma sha256 de AGENTS.md.
-#     Hot-reload coherente en los tres componentes (índice RAG vía manifiesto,
-#     contexto vía md_sig, catálogo vía este helper) — sin reiniciar el proceso.
-#  A2 El harness usa get_biz_mem() internamente (antes: BusinessMemory.from_file()
-#     por cada cache-miss → lectura y parseo duplicados del mismo archivo).
-#  A3 resolve_column_unambiguous(): implementación ÚNICA de la resolución
-#     determinista inequívoca concepto→columna. Antes existía duplicada en
-#     planner (_align_task_columns) y sql_agent (_validate_columns) → riesgo
-#     de divergencia, el mismo anti-patrón que el viejo SEMANTIC_MAP.
+# Cambios frente a la versión anterior:
+#  - El RAG ya parseó, clasificó y enriqueció AGENTS.md. El harness usa
+#    directamente el contexto recuperado (c["context"]) en lugar de reconstruir
+#    un bloque paralelo desde BusinessMemory.
+#  - Se inyecta conocimiento de negocio relevante (reglas, taxonomía,
+#    definiciones de métricas) vía buscar_conocimiento_negocio().
+#  - La caché del contexto compuesto depende de la firma del manifiesto del RAG,
+#    no solo del sha de AGENTS.md. Si el indexer reindexa (cambio de embeddings,
+#    chunker, etc.), el harness invalida su caché automáticamente.
+#  - BusinessMemory sigue disponible como utilidad de post-proceso:
+#    detección temporal, promoción histórica, resolución de columnas y
+#    validación de vistas usadas en SQL.
 # -------------------------------------------------
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
-import re
 import os
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 
-from core.rag import obtener_candidatas_detalles
-
+from core.rag import obtener_candidatas_detalles, buscar_conocimiento_negocio
+from core.rag_store import read_manifest, CHROMA_DIR, COLLECTION_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +82,6 @@ def _with_semantic_prefix(view_name: str) -> Optional[str]:
 
 # ============================================================================
 # (H1) Intención temporal estructurada — criterio ÚNICO compartido
-# por AmbiguityDetector, la escalada histórica y los ordenamientos de catálogo.
-# El año explícito ("2026") cuenta como histórico.
 # ============================================================================
 
 _SNAPSHOT_KEYWORDS = ["hoy", "ayer", "actual", "snapshot", "dia actual", "en curso"]
@@ -161,7 +145,6 @@ def _historical_variants_for(view_name: str, biz_mem: "BusinessMemory") -> List[
 def _ordered_documented_views(biz_mem: "BusinessMemory", temporal: Optional[str]) -> List[str]:
     """
     Vistas documentadas, priorizando las compatibles con la intención temporal.
-    (R3) Derivado 100% del catálogo — reemplaza a los trios/listas hardcodeadas.
     sorted() es estable: dentro de cada grupo se conserva el orden del archivo.
     """
     documented = biz_mem.list_views()
@@ -350,15 +333,11 @@ class BusinessMemory:
 
 
 # ============================================================================
-# (A1) Instancia compartida del catálogo — punto de acceso ÚNICO del sistema
+# (A1) Instancia compartida del catálogo
 # ============================================================================
 
 def _agents_md_signature() -> str:
-    """
-    (R4/A1) Firma del archivo fuente. Clavea tanto el caché del contexto
-    compilado como la instancia compartida de BusinessMemory: si AGENTS.md
-    cambia en disco, índice RAG, contexto y catálogo recargan juntos.
-    """
+    """Firma del archivo AGENTS.md. Clavea el caché de BusinessMemory."""
     try:
         return hashlib.sha256(DEFAULT_AGENTS_MD_PATH.read_bytes()).hexdigest()[:16]
     except Exception:
@@ -367,32 +346,19 @@ def _agents_md_signature() -> str:
 
 @lru_cache(maxsize=8)
 def _load_biz_mem(sig: str) -> BusinessMemory:
-    # lru_cache NO cachea excepciones: si el archivo falta, falla ruidoso
-    # en cada llamada (correcto — el sistema no debe operar sin catálogo).
     logger.info(f"[Harness] Cargando BusinessMemory (sig={sig})")
     return BusinessMemory.from_file()
 
 
 def get_biz_mem() -> BusinessMemory:
-    """
-    Punto de acceso único al catálogo para harness, planner y sql_agent.
-    Hot-reload: si AGENTS.md cambia, la firma cambia y el siguiente llamado
-    recarga el parseo — sin reiniciar el proceso.
-    """
     return _load_biz_mem(_agents_md_signature())
 
 
 # ============================================================================
-# (A3) Resolución inequívoca concepto→columna — implementación ÚNICA
-# (importada por planner y sql_agent; antes duplicada en ambos)
+# (A3) Resolución inequívoca concepto→columna
 # ============================================================================
 
 def _normalize_column_text(text: str) -> str:
-    """
-    Higiene para nombres de columna/conceptos. NO es _normalize_question:
-    aquel quita puntuación para keyword matching de preguntas; este mapea
-    "_" → espacio para comparar tokens de identificadores.
-    """
     if not text:
         return ""
     return (
@@ -403,13 +369,6 @@ def _normalize_column_text(text: str) -> str:
 
 
 def resolve_column_unambiguous(concept: str, available: List[str]) -> Optional[str]:
-    """
-    Resolución determinista INEQUÍVOCA derivada del catálogo.
-    'total unidades' → 'unidades' solo si es la ÚNICA columna compatible
-    (todos los tokens del concepto contenidos en la columna, o viceversa).
-    0 o 2+ candidatos → None: la ambigüedad la resuelve el LLM con las
-    definiciones del catálogo; nunca una heurística silenciosa.
-    """
     tokens = {t for t in _normalize_column_text(concept).split() if len(t) > 2}
     if not tokens:
         return None
@@ -446,7 +405,7 @@ def validate_sql_views(sql: str, biz_mem: BusinessMemory) -> Tuple[bool, List[st
 
 
 # ============================================================================
-# Construcción de contexto semántico (contenido desde BusinessMemory)
+# Construcción de contexto semántico ALINEADA AL RAG
 # ============================================================================
 
 def build_harness_context(
@@ -455,23 +414,32 @@ def build_harness_context(
     user_question: Optional[str] = None,
     include_rules: bool = True,
     rules_md: Optional[str] = None,
+    business_knowledge: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
-    El RAG decide QUÉ vistas son relevantes; el catálogo (BusinessMemory)
-    dicta el CONTENIDO que se inyecta al prompt.
+    El RAG decide QUÉ vistas son relevantes Y nos entrega su contexto enriquecido
+    (incluye definición, métricas, reglas y taxonomía asociada en c["context"]).
+    El harness solo estructura el prompt final.
+
+    BusinessMemory actúa como fallback/normalización cuando un candidato no
+    trae contexto (p. ej. fallback al catálogo documentado).
     """
     if biz_mem is None:
-        biz_mem = get_biz_mem()   # (A2) antes: BusinessMemory.from_file()
+        biz_mem = get_biz_mem()
 
     default_rules = (
         "Eres un asistente BI que consulta el esquema 'semantic' en PostgreSQL (Supabase).\n"
         "Reglas de oro:\n"
-        "- NO recalcular métricas que la vista ya expone.\n"
+        "- NO recalcular métricas que la vista ya expone; usa la columna directamente.\n"
         "- Usar el formato 'YYYY-MM-DD' para filtros de fecha.\n"
-        "- '_latest' / '_day' son snapshots actuales: NO filtrar por fecha.\n"
-        "- '_history' / '_historical' requieren rango de fechas.\n"
-        "- 'dashboard_*' traen periodos predefinidos; verificar antes de filtrar.\n"
+        "- '_latest' / '_day' / 'current' son snapshots del día en curso: NO filtrar por fecha.\n"
+        "- '_history' / '_historical' requieren rango de fechas obligatorio.\n"
+        "- 'dashboard_*' traen periodos predefinidos; verificar si fijan el periodo.\n"
         "- 'compare_periods' ya calcula la comparativa; no agregar filtros ni joins manuales.\n"
+        "- Si el usuario menciona un rango explícito (mes, año, 'últimos X días', 'ayer'), "
+        "usa obligatoriamente una vista historical; PROHIBIDO usar _latest/_day/_week.\n"
+        "- Métricas de transacciones (transacciones, ventas_hoy) vienen de fact_transacciones; "
+        "métricas de productos/unidades vienen de fact_ventas.\n"
         "- Nunca inventar columnas. Si hay duda, validar con information_schema.columns."
     )
 
@@ -482,31 +450,55 @@ def build_harness_context(
         view_name = c.get("view_name") if isinstance(c, dict) else str(c)
         if not view_name:
             continue
-        view_name = _clean_view_name(view_name)
-        view_names.append(view_name)
+        view_name_clean = _clean_view_name(view_name)
+        view_names.append(view_name_clean)
 
-        view_info = biz_mem.get_view(view_name)
+        # ✅ USAR EL CONTEXTO ENRIQUECIDO DEL RAG si existe
+        rag_context = c.get("context") if isinstance(c, dict) else None
+        if rag_context:
+            semantic_parts.append(rag_context.strip())
+            continue
+
+        # Fallback al BusinessMemory (p. ej. cuando candidatas vienen del catálogo documentado)
+        view_info = biz_mem.get_view(view_name_clean)
         if view_info:
             semantic_parts.append(view_info.to_context_block())
         else:
             semantic_parts.append(
-                f"Vista: {view_name}\n"
+                f"Vista: {view_name_clean}\n"
                 "Descripción: (no documentada en AGENTS.md)\n"
                 "Métricas: (no definidas)"
             )
 
     semantic_context = "\n\n".join(semantic_parts)
 
+    # ✅ Inyectar conocimiento de negocio recuperado (reglas, taxonomía, definiciones)
+    knowledge_block = ""
+    if business_knowledge:
+        kb_parts = [
+            item.get("content", "")
+            for item in business_knowledge
+            if item.get("content")
+        ]
+        if kb_parts:
+            knowledge_block = (
+                "CONOCIMIENTO DE NEGOCIO RELEVANTE (reglas, taxonomía, definiciones):\n\n"
+                + "\n\n".join(kb_parts)
+            )
+
     ambiguity_notes: List[str] = []
     if user_question and view_names:
         detector = AmbiguityDetector(biz_mem)
         ambiguity_notes = detector.analyze(user_question, view_names)
 
-    if include_rules:
-        rules_text = rules_md.strip() if rules_md else default_rules
-        context = f"{rules_text}\n\n---\n\nMEMORIA SEMÁNTICA (vistas relevantes):\n\n{semantic_context}"
-    else:
-        context = f"MEMORIA SEMÁNTICA (vistas relevantes):\n\n{semantic_context}"
+    rules_text = rules_md.strip() if rules_md else default_rules
+
+    sections: List[str] = [rules_text]
+    if knowledge_block:
+        sections.append(knowledge_block)
+    sections.append(f"MEMORIA SEMÁNTICA (vistas relevantes):\n\n{semantic_context}")
+
+    context = "\n\n---\n\n".join(sections)
 
     if ambiguity_notes:
         notes_block = "\n".join(f"- {n}" for n in ambiguity_notes)
@@ -574,7 +566,6 @@ class AmbiguityDetector:
         return notes
 
     def _temporal_ambiguity(self, user_question: str, candidatas: List[str]) -> List[str]:
-        """H1: usa el criterio compartido _temporal_intent/_is_*_view."""
         notes: List[str] = []
         intent = _temporal_intent(user_question)
 
@@ -599,26 +590,49 @@ class AmbiguityDetector:
 
 
 # ============================================================================
-# Contexto compilado por pregunta (cacheado, claveado por firma de AGENTS.md)
+# Firma del manifiesto del RAG — para hot-reload coherente
+# ============================================================================
+
+def _rag_manifest_sig() -> str:
+    """
+    Firma del manifiesto generado por indexer.py.
+    Cuando el indexer reindexa, este valor cambia y el caché del harness
+    se invalida automáticamente.
+    """
+    try:
+        m = read_manifest(CHROMA_DIR, COLLECTION_NAME)
+        if not m:
+            return "no_manifest"
+        return hashlib.sha1(json.dumps(m, sort_keys=True).encode()).hexdigest()[:16]
+    except Exception:
+        return "no_manifest"
+
+
+# ============================================================================
+# Contexto compilado por pregunta (cacheado)
 # ============================================================================
 
 @lru_cache(maxsize=128)
-def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) -> Dict[str, Any]:
+def _build_harness_context_cached_impl(
+    normalized_question: str,
+    md_sig: str,
+    rag_sig: str,
+) -> Dict[str, Any]:
     """
     Compila el paquete de contexto para una pregunta.
-    md_sig no se usa en el cuerpo: existe para formar parte de la clave de caché.
+    La caché depende de:
+      - la pregunta normalizada,
+      - la firma de AGENTS.md,
+      - la firma del manifiesto del RAG (reindex externo invalida el caché).
     """
-    logger.info(f"[Harness] Compilando contexto (md_sig={md_sig})")
-    biz_mem = get_biz_mem()   # (A2) antes: BusinessMemory.from_file()
+    logger.info(f"[Harness] Compilando contexto (md_sig={md_sig}, rag_sig={rag_sig})")
+    biz_mem = get_biz_mem()
 
-    # H1/H2: intención temporal computada UNA vez, reutilizada por el
-    # fallback, el mínimo de contexto y la promoción histórica.
+    # H1/H2: intención temporal computada UNA vez
     temporal = _temporal_intent(normalized_question)
     capability_gap_historical = False
 
-    # --------------------------------------------------------------
-    # R1 + R2 + R3: Retrieval ÚNICO; el umbral se aplica aquí.
-    # --------------------------------------------------------------
+    # -------------------------------------------------------------- R1 + R2 + R3
     try:
         hits = obtener_candidatas_detalles(
             query=normalized_question,
@@ -635,14 +649,12 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
     if strong:
         candidatas_detalle: List[Dict[str, Any]] = strong
     elif hits:
-        # R3: fallback vectorial suave (reemplaza al keyword_map hardcodeado)
         logger.warning(
             f"[Harness] Sin matches sobre umbral {MIN_SCORE_THRESHOLD}; "
             f"usando top-{MAX_FALLBACK_VIEWS} sin umbral como fallback."
         )
         candidatas_detalle = hits[:MAX_FALLBACK_VIEWS]
     else:
-        # R3: último recurso derivado del catálogo documentado (orden temporal-aware)
         logger.warning("[Harness] Retriever vacío; usando catálogo como último recurso.")
         documented = _ordered_documented_views(biz_mem, temporal)
         candidatas_detalle = [
@@ -656,15 +668,12 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
             for v in documented[:MAX_FALLBACK_VIEWS]
         ]
 
-    # R1: la mejor candidata del ranking coseno ES la vista principal.
     preferred_view: Optional[str] = (
         _clean_view_name(candidatas_detalle[0]["view_name"])
         if candidatas_detalle else None
     )
 
-    # --------------------------------------------------------------
-    # allowed_views: acotado y normalizado (NO inyectar todo el catálogo)
-    # --------------------------------------------------------------
+    # -------------------------------------------------------------- allowed_views
     allowed_views_set: Set[str] = set()
     for c in candidatas_detalle:
         vn = c.get("view_name")
@@ -674,7 +683,6 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
     if preferred_view:
         allowed_views_set.add(_clean_view_name(preferred_view))
 
-    # Mínimo de contexto derivado del catálogo (R3; antes: trio hardcodeado)
     if len(allowed_views_set) < 2:
         for v in _ordered_documented_views(biz_mem, temporal):
             if len(allowed_views_set) >= MIN_CONTEXT_VIEWS:
@@ -683,10 +691,7 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
 
     allowed_views_clean = sorted(allowed_views_set)
 
-    # --------------------------------------------------------------
-    # (H2) Promoción de vista histórica — la ambigüedad se RESUELVE,
-    # no solo se anota. Si no existe variante documentada → capability_gap.
-    # --------------------------------------------------------------
+    # -------------------------------------------------------------- H2 Promoción histórica
     if temporal == "historical":
         has_historical = any(
             _is_historical_view(biz_mem.get_view(v)) for v in allowed_views_clean
@@ -704,7 +709,6 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
                 allowed_views_clean = sorted(set(allowed_views_clean) | set(promoted))
                 preferred_view = promoted[0]
                 logger.info(f"[Harness] Vistas históricas promovidas al allowlist: {promoted}")
-                # Re-inyectar al top para que el contexto semántico documente la vista promovida
                 candidatas_detalle = [
                     {"view_name": preferred_view, "score": 1.0, "can_answer": True}
                 ] + [
@@ -718,17 +722,29 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
                     "capability_gap=True"
                 )
 
-    # Contexto semántico solo sobre top relevantes
+    # -------------------------------------------------------------- Conocimiento de negocio
+    business_knowledge: List[Dict[str, Any]] = []
+    try:
+        business_knowledge = buscar_conocimiento_negocio(
+            query=normalized_question,
+            k=6,
+            min_score=0.0,
+        )
+    except Exception as e:
+        logger.warning(f"[Harness] buscar_conocimiento_negocio falló: {e}")
+
+    # -------------------------------------------------------------- Contexto semántico
     top_candidates = candidatas_detalle[:5]
 
     if not top_candidates and preferred_view:
-        top_candidates = [{"view_name": preferred_view, "score": 0.0}]
+        top_candidates = [{"view_name": preferred_view, "score": 0.0, "can_answer": True}]
 
     semantic_context = build_harness_context(
         candidatas=top_candidates,
         biz_mem=biz_mem,
         user_question=normalized_question,
         include_rules=True,
+        business_knowledge=business_knowledge,
     )
 
     # Ambigüedad solo sobre vistas relevantes
@@ -740,8 +756,6 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
     if preferred_view and preferred_view not in ambiguity_views:
         ambiguity_views.append(preferred_view)
 
-    # H3a: si la promoción resolvió la temporalidad, excluir los snapshots
-    # del análisis → la nota "considera _history" deja de dispararse (ya resuelto)
     if temporal == "historical" and not capability_gap_historical:
         ambiguity_views = [
             v for v in ambiguity_views
@@ -751,8 +765,6 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
     detector = AmbiguityDetector(biz_mem)
     ambiguity_notes = detector.analyze(normalized_question, ambiguity_views)
 
-    # H3b: gap REAL de capacidad explícito — el planner lo convierte en
-    # aclaración honesta, no en una petición genérica de "más detalles".
     if capability_gap_historical:
         ambiguity_notes.append(
             "La pregunta requiere un periodo histórico, pero NINGUNA vista documentada "
@@ -764,8 +776,8 @@ def _build_harness_context_cached_impl(normalized_question: str, md_sig: str) ->
         "allowed_views": [_with_semantic_prefix(v) for v in allowed_views_clean],
         "preferred_view": _with_semantic_prefix(preferred_view),
         "ambiguity_notes": ambiguity_notes,
-        "capability_gap": capability_gap_historical,   # H3: señal estructurada
-        "temporal_intent": temporal,                   # H1: disponible para planner
+        "capability_gap": capability_gap_historical,
+        "temporal_intent": temporal,
         "all_documented_views": [_with_semantic_prefix(v) for v in biz_mem.list_views()],
     }
 
@@ -774,6 +786,7 @@ def build_harness_context_cached(question: str) -> Dict[str, Any]:
     return _build_harness_context_cached_impl(
         _normalize_question(question),
         _agents_md_signature(),
+        _rag_manifest_sig(),
     )
 
 
@@ -793,4 +806,4 @@ if __name__ == "__main__":
     print("allowed_views:", context_pack["allowed_views"])
     print("ambiguity_notes:", context_pack["ambiguity_notes"])
     print("\n--- SEMANTIC CONTEXT ---\n")
-    print(context_pack["semantic_context"][:2000], "...")
+    print(context_pack["semantic_context"][:2500], "...")
