@@ -1,323 +1,219 @@
 # indexer.py
-# Ubicación: AGENTE BI PROD\indexer.py
+# Ubicación: AGENTE BI PROD/indexer.py
+# -------------------------------------------------
+# Indexador del business memory — ÚNICO componente autorizado a ESCRIBIR el índice.
+#
+#   python indexer.py                 → indexa solo si hay cambios (idempotente)
+#   python indexer.py reindex --force → rebuild completo
+#   python indexer.py status          → estado del índice (sin API key)
+#   python indexer.py verify          → inspección de contenido (sin API key)
+#
+# Flujo recomendado: correr en deploy/CI o tras editar AGENTS.md.
+# core/rag.py NUNCA reindexa: en runtime solo lee y advierte si está stale.
+# -------------------------------------------------
+from __future__ import annotations
 
-import hashlib
+import argparse
+import json
+import logging
 import os
-import re
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
-from dotenv import load_dotenv
+from core.chunking import CHUNKING_VERSION, build_chunks, chunk_stats
+from core.rag_store import (
+    CHROMA_DIR,
+    COLLECTION_NAME,
+    DEFAULT_AGENTS_MD_PATH,
+    EMBEDDING_MODEL,
+    HNSW_SPACE,
+    desired_manifest,
+    manifest_mismatches,
+    read_manifest,
+    write_manifest,
+)
 
-# CARGA EXPLÍCITA DEL .ENV (override=True fuerza recarga)
-env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=env_path, override=True)
-
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-
-# === CONFIGURACIÓN DE RUTAS ===
-BASE_DIR = Path(__file__).resolve().parent
-DATA_PATH = Path(os.getenv("AGENTS_MD_PATH", str(BASE_DIR / "AGENTS.md")))
-CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(BASE_DIR / "chroma_db")))
-COLLECTION_NAME = "semantic_views"
-
-# Lista de vistas válidas según la taxonomía del AGENTS.md
-VALID_VIEWS = {
-    'sales_review_day',
-    'sales_review_day_history',
-    'sales_review_locales_latest',
-    'sales_review_locales',
-    'sales_week',
-    'sales_producto_daily',
-    'mart_operacion_hora',
-    'dashboard_canjes_resumen',
-    'kpi_fidelizacion_detalle',
-    'dashboard_cortesias_resumen',
-    'kpi_cortesia_detalle',
-    'kpi_categorias_diario',
-    'dashboard_participacion_categorias',
-    'kpi_categorias_productos_sede'
-}
+logger = logging.getLogger(__name__)
 
 
-def _make_id(view_name: str) -> str:
-    """Genera un ID único usando SHA-256 completo."""
-    return hashlib.sha256(view_name.encode()).hexdigest()
+def _load_env() -> None:
+    """Carga .env solo cuando se ejecuta como indexador (sin side-effects al importar)."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
+    except ImportError:
+        pass  # las variables pueden venir del entorno
 
 
-def _extract_field(text: str, field_name: str) -> str:
-    """Extrae un campo del markdown tipo **Campo**: valor."""
-    pattern = rf'(?:-\s*)?\*\*{re.escape(field_name)}\*\*[:：]\s*(.*?)(?=\n\s*(?:-\s*)?\*\*|\Z)'
-    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return ""
-
-
-def _extract_metrics_from_bullets(description: str) -> list[str]:
-    """Extrae métricas de las viñetas que tienen formato - `nombre_metrica`: descripción"""
-    metrics = []
-    # Buscar patrones como: - `ventas_hoy`: descripción
-    pattern = r'-\s*`([^`]+)`\s*:'
-    matches = re.findall(pattern, description)
-    
-    # Filtrar palabras que no son métricas
-    non_metric_words = {
-        'descripción', 'descripcion', 'tipo', 'granularidad', 'filtro fecha',
-        'grano', 'filas', 'nota', 'fecha', 'fecha_key', 'fecha_completa',
-        'fecha_venta', 'nombre_sede', 'sucursal', 'nombre_dia_semana',
-        'nombre_dia', 'hora', 'mes'
-    }
-    
-    for match in matches:
-        if match.lower() not in non_metric_words:
-            metrics.append(match)
-    
-    return metrics
-
-
-def _infer_dimensions(metrics: list[str], description: str) -> list[str]:
-    """Infiere dimensiones basándose en métricas y descripción."""
-    dimensions = set()
-    
-    # Palabras clave para dimensiones
-    dim_keywords = {
-        'sede': ['sede', 'sucursal', 'local', 'tienda', 'plaza', 'ubicacion', 'ubicación', 'store', 'branch'],
-        'producto': ['producto', 'sku', 'articulo', 'artículo', 'item', 'descripcion'],
-        'categoria': ['categoria', 'categoría', 'categoria_nueva', 'subcategoria'],
-        'fecha': ['fecha', 'fecha_completa', 'fecha_venta', 'fecha_key', 'mes', 'periodo'],
-        'hora': ['hora', 'franja_horaria', 'horario'],
-    }
-    
-    # Buscar en métricas
-    for metric in metrics:
-        metric_lower = metric.lower()
-        for dim, keywords in dim_keywords.items():
-            if any(kw in metric_lower for kw in keywords):
-                dimensions.add(dim)
-    
-    # Buscar en descripción
-    description_lower = description.lower()
-    for dim, keywords in dim_keywords.items():
-        if any(kw in description_lower for kw in keywords):
-            dimensions.add(dim)
-    
-    # Si no se encontraron dimensiones, usar 'general'
-    if not dimensions:
-        dimensions.add('general')
-    
-    return list(dimensions)
-
-
-def _infer_temporal_type(view_name: str, description: str) -> str:
-    """Determina el tipo temporal de la vista."""
-    combined = f"{view_name} {description}".lower()
-    
-    if any(w in combined for w in ["latest", "hoy", "actual", "today", "snapshot", "current"]):
-        return "current"
-    elif any(w in combined for w in ["histor", "history", "tendencia", "evolución", "time_series", "histórico"]):
-        return "historical"
-    elif any(w in combined for w in ["week", "semana", "comparativa", "compare"]):
-        return "periodic"
-    elif any(w in combined for w in ["dashboard"]):
-        return "dashboard"
-    else:
-        return "general"
-
-
-def _infer_time_scope(description: str) -> str:
-    """Determina el alcance temporal de la vista."""
-    desc_lower = description.lower()
-    
-    if any(w in desc_lower for w in ["hora", "horaria", "hourly"]):
-        return "hourly"
-    elif any(w in desc_lower for w in ["día", "diario", "fecha", "daily", "dia"]):
-        return "daily"
-    elif any(w in desc_lower for w in ["semana", "semanal", "weekly"]):
-        return "weekly"
-    elif any(w in desc_lower for w in ["mes", "mensual", "monthly"]):
-        return "monthly"
-    else:
-        return "unknown"
-
-
-def _parse_agents_md(file_path: Path) -> list[Document]:
-    """Parsea el archivo AGENTS.md y crea documentos para Chroma."""
-    if not file_path.exists():
-        raise FileNotFoundError(f"No se encontró el archivo de catálogo: {file_path}")
-
-    raw = file_path.read_text(encoding="utf-8-sig")
-    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
-    
-    # Extraer solo la sección 3 (Vistas Semánticas)
-    section_3_match = re.search(r'## 3\. Vistas Semánticas.*?(?=## 4\.|$)', raw, re.DOTALL)
-    if not section_3_match:
-        raise ValueError("No se encontró la sección 3 'Vistas Semánticas' en AGENTS.md")
-    
-    section_3 = section_3_match.group(0)
-    
-    # Dividir por bloques de encabezados de nivel 3 (###)
-    parts = re.split(r'\n(?=###\s+)', section_3)
-    documents = []
-    seen_views = set()
-
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        
-        first_line = part.splitlines()[0].strip()
-        m_view = re.match(r'^###\s+([A-Za-z0-9_]+)', first_line)
-        if not m_view:
-            continue
-            
-        view_name = m_view.group(1).strip()
-        
-        # Verificar si es una vista válida
-        if view_name not in VALID_VIEWS:
-            print(f"[SKIP] No es una vista válida: {view_name}")
-            continue
-        
-        # Verificar si ya vimos esta vista
-        if view_name in seen_views:
-            print(f"[WARN] Vista duplicada encontrada: {view_name}. Omitiendo...")
-            continue
-        seen_views.add(view_name)
-        
-        description = "\n".join(part.splitlines()[1:]).strip()
-        
-        # Extraer campos
-        purpose = _extract_field(description, "Descripción") or _extract_field(description, "Propósito")
-        grain = _extract_field(description, "Granularidad") or _extract_field(description, "Grain")
-        
-        # Extraer métricas de las viñetas
-        metrics = _extract_metrics_from_bullets(description)
-        
-        # Si no hay métricas, usar un placeholder
-        if not metrics:
-            metrics = [f"metrica_{view_name}"]
-        
-        # Inferir dimensiones
-        dimensions = _infer_dimensions(metrics, description)
-        
-        # Valores por defecto
-        if not purpose:
-            purpose = f"Vista {view_name}"
-        if not grain:
-            grain = "general"
-        
-        # Clasificación temporal
-        temporal_type = _infer_temporal_type(view_name, description)
-        time_scope = _infer_time_scope(description)
-        
-        # Detección de filtros
-        dims_lower = [d.lower() for d in dimensions]
-        supports_date_filter = any(d in dims_lower for d in ["fecha", "date", "periodo", "mes", "año", "dia", "día", "hora"])
-        supports_location_filter = any(d in dims_lower for d in ["sede", "local", "sucursal", "ubicacion", "ubicación", "store", "branch"])
-        
-        # Construir keywords
-        keywords_str = f"{view_name} {purpose} " + " ".join(metrics[:5])
-        
-        # Crear contenido
-        page_content = (
-            f"VISTA SEMÁNTICA: semantic.{view_name}\n"
-            f"NOMBRE TÉCNICO: {view_name}\n"
-            f"CONTEXTO DE NEGOCIO Y REGLAS:\n{description}\n"
-            f"KEYWORDS PARA BÚSQUEDA: {keywords_str}"
-        )
-        
-        # *** IMPORTANTE: Convertir listas a strings para Chroma ***
-        metrics_str = ", ".join(metrics[:15])
-        dimensions_str = ", ".join(dimensions[:10])
-        
-        # Crear ID único
-        doc_id = _make_id(f"semantic.{view_name}")
-        
-        # Crear documento con metadatos válidos
-        documents.append(Document(
-            page_content=page_content,
-            metadata={
-                "view_name": f"semantic.{view_name}",
-                "schema": "semantic",
-                "keywords": keywords_str,
-                "purpose": purpose[:500],
-                "grain": grain,
-                "metrics": metrics_str,  # String en lugar de lista
-                "dimensions": dimensions_str,  # String en lugar de lista
-                "notes": "",
-                "temporal_type": temporal_type,
-                "time_scope": time_scope,
-                "supports_date_filter": supports_date_filter,
-                "supports_location_filter": supports_location_filter,
-            },
-            id=doc_id
-        ))
-        print(f"[DEBUG] Indexada: semantic.{view_name} | temporal: {temporal_type} | scope: {time_scope} | metrics: {len(metrics)} | dims: {len(dimensions)}")
-    
-    if not documents:
-        raise ValueError(
-            f"No se parseó ninguna vista desde {file_path}. Revisa la estructura del archivo AGENTS.md."
-        )
-    
-    print(f"\n✅ Total de vistas parseadas: {len(documents)}")
-    return documents
-
-
-def indexar():
-    """Función principal para indexar las vistas semánticas en Chroma."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+def _require_api_key() -> None:
+    if not os.getenv("OPENAI_API_KEY"):
         raise EnvironmentError(
-            "OPENAI_API_KEY no encontrada. Revisa que tu archivo .env tenga:\n"
-            'OPENAI_API_KEY=sk-...\n'
-            f"O defínela como variable de entorno antes de ejecutar. (Buscando en: {env_path})"
+            "OPENAI_API_KEY no encontrada. Define la variable de entorno o "
+            "agrégala al .env junto a indexer.py."
         )
 
-    print(f"📖 Leyendo catálogo desde: {DATA_PATH}")
-    print(f"📁 Directorio Chroma: {CHROMA_DIR}")
-    
-    docs = _parse_agents_md(DATA_PATH)
-    print(f"🧩 Vistas parseadas: {len(docs)}")
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+def _raw_count_and_space() -> Tuple[Optional[int], Optional[str]]:
+    """Count + hnsw:space leídos con cliente crudo (no requiere OPENAI_API_KEY)."""
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        col = client.get_collection(COLLECTION_NAME)
+        return col.count(), (col.metadata or {}).get("hnsw:space")
+    except Exception:
+        return None, None
+
+
+def index_status(source: Optional[Path] = None) -> Dict[str, Any]:
+    """Estado del índice vs lo requerido. Usable desde CLI, CI o healthchecks."""
+    agents_md = Path(source) if source else DEFAULT_AGENTS_MD_PATH
+    count, space = _raw_count_and_space()
+    current = read_manifest(CHROMA_DIR, COLLECTION_NAME)
+    if agents_md.exists():
+        desired = desired_manifest(agents_md, EMBEDDING_MODEL)
+        mismatches = manifest_mismatches(current, desired)
+    else:
+        desired = None
+        mismatches = [f"AGENTS.md no encontrado (buscado en {agents_md})"]
+    if space != HNSW_SPACE:
+        mismatches.append(f"hnsw:space de la colección: '{space}' ≠ '{HNSW_SPACE}'")
+    if not count:
+        mismatches.append("colección vacía o inexistente")
+    return {
+        "collection": COLLECTION_NAME,
+        "chroma_dir": str(CHROMA_DIR),
+        "source": str(agents_md),
+        "doc_count": count,
+        "hnsw_space": space,
+        "manifest": current,
+        "desired": desired,
+        "is_current": not mismatches,
+        "stale_reasons": mismatches,
+        "fix": "python indexer.py reindex --force",
+    }
+
+
+def index_documents(force: bool = False, source: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Pipeline de escritura (idempotente):
+      1. Si manifest vigente == requerido y colección sana → skip.
+      2. Si no → build_chunks → recrear colección (espacio coseno garantizado)
+         → add_documents → escribir manifiesto.
+    Devuelve stats consumibles programáticamente.
+    """
+    _load_env()
+    _require_api_key()
+
+    agents_md = Path(source) if source else DEFAULT_AGENTS_MD_PATH
+    if not agents_md.exists():
+        raise FileNotFoundError(f"No se encontró AGENTS.md (buscado en {agents_md})")
+
+    status = index_status(source=agents_md)
+    if not force and status["is_current"]:
+        logger.info(f"[Indexer] Índice vigente ({status['doc_count']} chunks). Sin cambios.")
+        return {"action": "skipped", "reason": "índice vigente", **status}
+
+    logger.info(f"[Indexer] Reindexando. Motivos: {status['stale_reasons'] or ['--force']}")
+    logger.info(f"[Indexer] Fuente: {agents_md} | Colección: {COLLECTION_NAME} | "
+                f"Modelo: {EMBEDDING_MODEL} | Chunker: {CHUNKING_VERSION}")
+
+    docs = build_chunks(agents_md.read_text(encoding="utf-8-sig"))
+    if not docs:
+        logger.error("[Indexer] build_chunks devolvió 0 documentos.")
+        return {"action": "error", "reason": "0 chunks generados", **status}
+
+    from langchain_chroma import Chroma
+    from langchain_openai import OpenAIEmbeddings
+
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    
-    vector_store = Chroma(
+
+    # Recreación completa: garantiza hnsw:space correcto y cero basura obsoleta
+    # (collection_metadata solo aplica al CREAR la colección).
+    store = Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
-        persist_directory=str(CHROMA_DIR)
+        persist_directory=str(CHROMA_DIR),
+        collection_metadata={"hnsw:space": HNSW_SPACE},
     )
-    
-    # Agregar documentos
-    vector_store.add_documents(documents=docs, ids=[d.id for d in docs])
-    
-    # Limpieza de obsoletos
-    current_ids = {d.id for d in docs}
     try:
-        all_ids = set(vector_store._collection.get()["ids"])
-        to_delete = list(all_ids - current_ids)
-        if to_delete:
-            vector_store._collection.delete(ids=to_delete)
-            print(f"🗑️ Vistas obsoletas eliminadas: {len(to_delete)}")
+        store.delete_collection()
     except Exception as e:
-        print(f"[WARN] No se pudo limpiar obsoletos: {e}")
-    
-    count = vector_store._collection.count()
-    print(f"✅ Indexación completada. Total documentos en Chroma: {count}")
-    
-    # Verificación rápida
-    if count > 0:
-        print("\n📊 Verificación de documentos indexados:")
+        logger.debug(f"[Indexer] delete_collection: {e}")
+    store = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+        persist_directory=str(CHROMA_DIR),
+        collection_metadata={"hnsw:space": HNSW_SPACE},
+    )
+    store.add_documents(documents=docs, ids=[d.id for d in docs])
+
+    manifest = {
+        **desired_manifest(agents_md, EMBEDDING_MODEL),
+        "doc_count": len(docs),
+        "indexed_at": datetime.now(timezone.utc).isoformat(),
+        "chunk_stats": chunk_stats(docs),
+    }
+    write_manifest(CHROMA_DIR, COLLECTION_NAME, manifest)
+
+    stats = {"action": "reindexed", "doc_count": len(docs), "manifest": manifest}
+    logger.info(f"[Indexer] Indexación completada: {len(docs)} chunks.")
+    return stats
+
+
+# Compat retro: hooks/scripts que llamaban indexar() del indexer anterior
+def indexar(force: bool = False) -> Dict[str, Any]:
+    return index_documents(force=force)
+
+
+def _cmd_verify() -> None:
+    """Inspección del contenido indexado (sin API key)."""
+    import chromadb
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    col = client.get_collection(COLLECTION_NAME)
+    print(f"Colección '{COLLECTION_NAME}': {col.count()} chunks | "
+          f"hnsw:space={((col.metadata or {}).get('hnsw:space'))}")
+    for doc_type in ("view", "metric", "table_row", "section"):
         try:
-            all_docs = vector_store._collection.get()
-            for i, (doc_id, metadata) in enumerate(zip(all_docs["ids"], all_docs["metadatas"])):
-                view_name = metadata.get("view_name", "unknown")
-                metrics_count = len(metadata.get("metrics", "").split(",")) if metadata.get("metrics") else 0
-                print(f"  {i+1}. {view_name} | ID: {doc_id[:12]}... | métricas: {metrics_count}")
+            res = col.get(where={"doc_type": doc_type},
+                          include=["metadatas", "documents"], limit=1)
+            if res["ids"]:
+                md = res["metadatas"][0] or {}
+                label = md.get("view_name") or md.get("column") or md.get("section") or "?"
+                preview = (res["documents"][0] or "")[:120].replace("\n", " ")
+                print(f"  · {doc_type:10s} ej: {label}")
+                print(f"      {preview}…")
         except Exception as e:
-            print(f"  [WARN] No se pudo verificar: {e}")
+            print(f"  · {doc_type:10s} (sin datos o error: {e})")
+
+
+def main(argv: Optional[list] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Indexador del business memory (único que escribe el índice)")
+    sub = parser.add_subparsers(dest="command")
+
+    p_re = sub.add_parser("reindex", help="Indexa si hay cambios (o siempre con --force)")
+    p_re.add_argument("--force", action="store_true", help="Rebuild completo")
+    p_re.add_argument("--source", type=Path, default=None,
+                      help="Ruta alternativa de AGENTS.md")
+    sub.add_parser("status", help="Estado del índice vs lo requerido")
+    sub.add_parser("verify", help="Inspección del contenido indexado")
+
+    args = parser.parse_args(argv)
+    command = args.command or "reindex"  # default retro-compatible: `python indexer.py`
+
+    if command == "reindex":
+        stats = index_documents(force=getattr(args, "force", False),
+                                source=getattr(args, "source", None))
+        print(json.dumps(stats, indent=2, ensure_ascii=False, default=str))
+    elif command == "status":
+        print(json.dumps(index_status(), indent=2, ensure_ascii=False, default=str))
+    elif command == "verify":
+        _cmd_verify()
 
 
 if __name__ == "__main__":
-    indexar()
+    logging.basicConfig(level=logging.INFO)
+    sys.exit(main())

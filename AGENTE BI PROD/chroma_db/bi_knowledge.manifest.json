@@ -1,0 +1,14 @@
+{
+  "source_sha256": "219af233b7c32a22836d6323f95b4745503d7d3a115245e06a80aa5e6dd93108",
+  "embedding_model": "text-embedding-3-small",
+  "chunking_version": "v2",
+  "hnsw_space": "cosine",
+  "doc_count": 82,
+  "indexed_at": "2026-08-26T02:22:27.772425+00:00",
+  "chunk_stats": {
+    "metric": 45,
+    "section": 9,
+    "table_row": 14,
+    "view": 14
+  }
+}
